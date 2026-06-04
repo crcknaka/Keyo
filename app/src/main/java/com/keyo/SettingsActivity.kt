@@ -200,17 +200,66 @@ class SettingsActivity : ComponentActivity() {
                     )
                 }
 
+                // ===== Keyboard size (visual editor) =====
+                SectionLabel("Keyboard size")
+                var keyH by remember { mutableStateOf(KeyboardPrefs.getKeyHeight(this@SettingsActivity)) }
+                var vGap by remember { mutableStateOf(KeyboardPrefs.getVGap(this@SettingsActivity)) }
+                var hGap by remember { mutableStateOf(KeyboardPrefs.getHGap(this@SettingsActivity)) }
+                var testText by remember { mutableStateOf("") }
+                Group {
+                    SliderRow("Key height", keyH, "dp", KeyboardPrefs.KEY_HEIGHT_RANGE) {
+                        keyH = it; KeyboardPrefs.setKeyHeight(this@SettingsActivity, it)
+                    }
+                    Divider(color = divider, thickness = 1.dp)
+                    SliderRow("Vertical spacing", vGap, "dp", KeyboardPrefs.GAP_RANGE) {
+                        vGap = it; KeyboardPrefs.setVGap(this@SettingsActivity, it)
+                    }
+                    Divider(color = divider, thickness = 1.dp)
+                    SliderRow("Horizontal spacing", hGap, "dp", KeyboardPrefs.GAP_RANGE) {
+                        hGap = it; KeyboardPrefs.setHGap(this@SettingsActivity, it)
+                    }
+                }
+                OutlinedTextField(
+                    value = testText,
+                    onValueChange = { testText = it },
+                    placeholder = { Text("Tap here and type to preview…", color = textFaint) },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = textPrimary,
+                        unfocusedTextColor = textPrimary,
+                        focusedBorderColor = accent,
+                        unfocusedBorderColor = border,
+                        cursorColor = accent
+                    )
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        "Type in the field while dragging the sliders — the keyboard resizes live.",
+                        fontSize = 12.sp, color = textFaint, modifier = Modifier.weight(1f).padding(end = 8.dp)
+                    )
+                    Text(
+                        "Reset",
+                        fontSize = 13.sp, color = accent, fontWeight = FontWeight.Medium,
+                        modifier = Modifier.clickable {
+                            KeyboardPrefs.resetSize(this@SettingsActivity)
+                            keyH = KeyboardPrefs.getKeyHeight(this@SettingsActivity)
+                            vGap = KeyboardPrefs.getVGap(this@SettingsActivity)
+                            hGap = KeyboardPrefs.getHGap(this@SettingsActivity)
+                        }
+                    )
+                }
+
                 // ===== Appearance =====
                 SectionLabel("Appearance")
-                var kbSize by remember { mutableStateOf(KeyboardPrefs.getKeyboardSize(this@SettingsActivity)) }
                 var numberRow by remember { mutableStateOf(KeyboardPrefs.isNumberRowEnabled(this@SettingsActivity)) }
                 var selectedTheme by remember { mutableStateOf(KeyboardPrefs.getTheme(this@SettingsActivity)) }
 
                 Group {
-                    ChoiceRow("Keyboard height", KeyboardPrefs.KEYBOARD_SIZES, kbSize) {
-                        kbSize = it; KeyboardPrefs.setKeyboardSize(this@SettingsActivity, it)
-                    }
-                    Divider(color = divider, thickness = 1.dp)
                     ToggleRow("Number row", "Show the 1–0 row above the letters", numberRow) {
                         numberRow = it; KeyboardPrefs.setNumberRowEnabled(this@SettingsActivity, it)
                     }
@@ -393,6 +442,28 @@ class SettingsActivity : ComponentActivity() {
                     }
                 }
             }
+        }
+    }
+
+    /** A labelled integer slider (used by the visual keyboard-size editor). */
+    @Composable
+    private fun SliderRow(title: String, value: Int, unit: String, range: IntRange, onChange: (Int) -> Unit) {
+        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text(title, fontSize = 15.sp, fontWeight = FontWeight.Medium, color = textPrimary)
+                Text("$value $unit", fontSize = 13.sp, color = accent)
+            }
+            Slider(
+                value = value.toFloat(),
+                onValueChange = { f -> val v = Math.round(f); if (v != value) onChange(v) },
+                valueRange = range.first.toFloat()..range.last.toFloat(),
+                steps = (range.last - range.first - 1).coerceAtLeast(0),
+                colors = SliderDefaults.colors(
+                    thumbColor = accent,
+                    activeTrackColor = accent,
+                    inactiveTrackColor = border
+                )
+            )
         }
     }
 

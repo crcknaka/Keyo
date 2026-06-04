@@ -57,11 +57,32 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private var keyboardMode = mutableStateOf("abc") // "abc", "123", "symbols", "numpad"
     private var imeActionId = mutableIntStateOf(android.view.inputmethod.EditorInfo.IME_ACTION_NONE)
     private var showNumberRow = mutableStateOf(true)
-    private var keyboardSize = mutableStateOf("normal")     // compact / normal / large / xlarge
+    // Visual sizing (tunable live via the Settings sliders)
+    private var keyHeightDp = mutableIntStateOf(KeyboardPrefs.DEFAULT_KEY_HEIGHT)
+    private var keyHGapDp = mutableIntStateOf(KeyboardPrefs.DEFAULT_HGAP)
+    private var keyVGapDp = mutableIntStateOf(KeyboardPrefs.DEFAULT_VGAP)
     private var hapticStrength = mutableStateOf("light")    // off / light / medium / strong
     private var currentTheme = KeyboardPrefs.KeyboardTheme("catppuccin","",0xFF1E1E2E,0xFF313244,0xFFBB86FC,0xFFCDD6F4)
     private var soundEnabled = mutableStateOf(false)
     private var themeId = mutableStateOf("catppuccin")
+
+    // Reapply settings live while the user drags the size sliders in the Settings screen.
+    private val prefListener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
+        handler.post { reloadPrefs() }
+    }
+
+    private fun reloadPrefs() {
+        GroqApi.model = KeyboardPrefs.getModel(this)
+        GroqApi.aiModel = KeyboardPrefs.getAiModel(this)
+        showNumberRow.value = KeyboardPrefs.isNumberRowEnabled(this)
+        keyHeightDp.intValue = KeyboardPrefs.getKeyHeight(this)
+        keyHGapDp.intValue = KeyboardPrefs.getHGap(this)
+        keyVGapDp.intValue = KeyboardPrefs.getVGap(this)
+        hapticStrength.value = KeyboardPrefs.getHapticStrength(this)
+        soundEnabled.value = KeyboardPrefs.isSoundEnabled(this)
+        themeId.value = KeyboardPrefs.getTheme(this)
+        enabledLangs.value = KeyboardPrefs.getEnabledLanguages(this)
+    }
 
     // Max content rows any mode shows — keeps the keyboard a fixed height so it never
     // jumps when switching between abc / 123 / symbols / numpad.
@@ -76,6 +97,8 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         super.onCreate()
         savedStateRegistryController.performRestore(null)
         lifecycleRegistry.currentState = Lifecycle.State.CREATED
+        reloadPrefs()
+        KeyboardPrefs.registerChangeListener(this, prefListener)
     }
 
     private fun installLifecycleOwnerOnDecorView() {
@@ -146,14 +169,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         super.onStartInputView(info, restarting)
         lifecycleRegistry.currentState = Lifecycle.State.RESUMED
         // Load user preferences
-        GroqApi.model = KeyboardPrefs.getModel(this)
-        GroqApi.aiModel = KeyboardPrefs.getAiModel(this)
-        showNumberRow.value = KeyboardPrefs.isNumberRowEnabled(this)
-        keyboardSize.value = KeyboardPrefs.getKeyboardSize(this)
-        hapticStrength.value = KeyboardPrefs.getHapticStrength(this)
-        soundEnabled.value = KeyboardPrefs.isSoundEnabled(this)
-        themeId.value = KeyboardPrefs.getTheme(this)
-        enabledLangs.value = KeyboardPrefs.getEnabledLanguages(this)
+        reloadPrefs()
         currentLang.value = KeyboardPrefs.getCurrentLanguage(this)
         // Store IME action for enter key behavior
         imeActionId.intValue = info?.imeOptions?.and(android.view.inputmethod.EditorInfo.IME_MASK_ACTION)
@@ -176,6 +192,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     }
 
     override fun onDestroy() {
+        KeyboardPrefs.unregisterChangeListener(this, prefListener)
         lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
         super.onDestroy()
     }
@@ -188,8 +205,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         val shift by isShift
         val mode by keyboardMode
         val numberRow by showNumberRow
-        val size by keyboardSize
-        val keyHeight = KeyboardPrefs.rowHeightDp(size).dp
+        val keyHeight = keyHeightDp.intValue.dp
 
         // Read the theme reactively so changing it in settings applies on the next keyboard open
         val theme = KeyboardPrefs.THEMES.find { it.id == themeId.value } ?: KeyboardPrefs.THEMES[0]
@@ -394,7 +410,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     modifier = Modifier
                         .weight(0.9f)
                         .height(keyHeight)
-                        .padding(1.dp)
+                        .padding(horizontal = keyHGapDp.intValue.dp, vertical = keyVGapDp.intValue.dp)
                         .background(
                             when {
                                 recordingAI && aiDragX < -cancelThreshold -> Color(0xFF666666)
@@ -496,7 +512,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     modifier = Modifier
                         .weight(3.5f)
                         .height(keyHeight)
-                        .padding(1.dp)
+                        .padding(horizontal = keyHGapDp.intValue.dp, vertical = keyVGapDp.intValue.dp)
                         .background(
                             when {
                                 recording && micDragX < -cancelThreshold -> Color(0xFF666666)
@@ -623,7 +639,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         Box(
             modifier = modifier
                 .height(height)
-                .padding(2.dp)
+                .padding(horizontal = keyHGapDp.intValue.dp, vertical = keyVGapDp.intValue.dp)
                 .background(if (active) accentColor else keyColor, RoundedCornerShape(6.dp))
                 .clickable {
                     performKeyFeedback()
@@ -653,12 +669,12 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     fun BackspaceKey(bgColor: Color, textColor: Color, modifier: Modifier) {
         var isPressed by remember { mutableStateOf(false) }
         var swipedClear by remember { mutableStateOf(false) }
-        val bsHeight = KeyboardPrefs.rowHeightDp(keyboardSize.value).dp
+        val bsHeight = keyHeightDp.intValue.dp
 
         Box(
             modifier = modifier
                 .height(bsHeight)
-                .padding(1.dp)
+                .padding(horizontal = keyHGapDp.intValue.dp, vertical = keyVGapDp.intValue.dp)
                 .background(
                     if (swipedClear) Color(0xFFFF5555) else bgColor,
                     RoundedCornerShape(6.dp)
@@ -771,8 +787,8 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         bgColor: Color,
         textColor: Color,
         modifier: Modifier,
-        height: androidx.compose.ui.unit.Dp = KeyboardPrefs.rowHeightDp(keyboardSize.value).dp,
-        fontSize: androidx.compose.ui.unit.TextUnit = KeyboardPrefs.fontSizeSp(keyboardSize.value).sp,
+        height: androidx.compose.ui.unit.Dp = keyHeightDp.intValue.dp,
+        fontSize: androidx.compose.ui.unit.TextUnit = KeyboardPrefs.fontSizeSp(keyHeightDp.intValue, keyVGapDp.intValue).sp,
         onClick: () -> Unit
     ) {
         var pressed by remember { mutableStateOf(false) }
@@ -781,7 +797,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         val alts = altChars[label]
         val hasAlts = alts != null && alts.isNotEmpty()
 
-        Box(modifier = modifier.height(height).padding(2.dp)) {
+        Box(modifier = modifier.height(height).padding(horizontal = keyHGapDp.intValue.dp, vertical = keyVGapDp.intValue.dp)) {
             // Main key
             Box(
                 modifier = Modifier

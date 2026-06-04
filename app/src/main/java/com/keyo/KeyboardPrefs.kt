@@ -10,7 +10,9 @@ object KeyboardPrefs {
     private const val KEY_AUTOCORRECT = "autocorrect_enabled"
     private const val KEY_SPELLCHECK = "spellcheck_enabled"
     private const val KEY_NUMBER_ROW = "number_row_enabled"
-    private const val KEY_KB_SIZE = "keyboard_size"
+    private const val KEY_KEY_HEIGHT = "key_height"   // row height in dp
+    private const val KEY_HGAP = "key_hgap"           // horizontal gap between keys, dp
+    private const val KEY_VGAP = "key_vgap"           // vertical gap between rows, dp
     private const val KEY_HAPTIC_STRENGTH = "haptic_strength"
     private const val KEY_SOUND = "sound_enabled"
     private const val KEY_THEME = "theme"
@@ -18,9 +20,22 @@ object KeyboardPrefs {
     private const val KEY_CUR_LANG = "current_language"
     private const val KEY_API_KEY = "groq_api_key"
 
+    // Defaults / ranges for the visual size editor. Default height matches the stock keyboard.
+    const val DEFAULT_KEY_HEIGHT = 39
+    const val DEFAULT_HGAP = 3
+    const val DEFAULT_VGAP = 3
+    val KEY_HEIGHT_RANGE = 28..64
+    val GAP_RANGE = 0..10
+
     private fun prefs(context: Context): SharedPreferences {
         return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     }
+
+    fun registerChangeListener(context: Context, l: android.content.SharedPreferences.OnSharedPreferenceChangeListener) =
+        prefs(context).registerOnSharedPreferenceChangeListener(l)
+
+    fun unregisterChangeListener(context: Context, l: android.content.SharedPreferences.OnSharedPreferenceChangeListener) =
+        prefs(context).unregisterOnSharedPreferenceChangeListener(l)
 
     fun getModel(context: Context): String {
         return prefs(context).getString(KEY_MODEL, "llama-3.3-70b-versatile") ?: "llama-3.3-70b-versatile"
@@ -62,37 +77,41 @@ object KeyboardPrefs {
         prefs(context).edit().putBoolean(KEY_NUMBER_ROW, enabled).apply()
     }
 
-    // --- Keyboard size (controls how much vertical space the keyboard takes) ---
-    // Values: "compact" | "normal" | "large" | "xlarge"
-    val KEYBOARD_SIZES = listOf(
-        "compact" to "Compact",
-        "normal" to "Normal",
-        "large" to "Large",
-        "xlarge" to "Extra large"
-    )
+    // --- Visual keyboard sizing (user-tunable via sliders in Settings) ---
 
-    fun getKeyboardSize(context: Context): String {
-        return prefs(context).getString(KEY_KB_SIZE, "normal") ?: "normal"
+    /** Row height in dp (the vertical pitch of each key row). */
+    fun getKeyHeight(context: Context): Int =
+        prefs(context).getInt(KEY_KEY_HEIGHT, DEFAULT_KEY_HEIGHT).coerceIn(KEY_HEIGHT_RANGE.first, KEY_HEIGHT_RANGE.last)
+
+    fun setKeyHeight(context: Context, dp: Int) =
+        prefs(context).edit().putInt(KEY_KEY_HEIGHT, dp.coerceIn(KEY_HEIGHT_RANGE.first, KEY_HEIGHT_RANGE.last)).apply()
+
+    /** Horizontal gap between keys, dp. */
+    fun getHGap(context: Context): Int =
+        prefs(context).getInt(KEY_HGAP, DEFAULT_HGAP).coerceIn(GAP_RANGE.first, GAP_RANGE.last)
+
+    fun setHGap(context: Context, dp: Int) =
+        prefs(context).edit().putInt(KEY_HGAP, dp.coerceIn(GAP_RANGE.first, GAP_RANGE.last)).apply()
+
+    /** Vertical gap between rows, dp (carved from the row height, so it shortens the keys). */
+    fun getVGap(context: Context): Int =
+        prefs(context).getInt(KEY_VGAP, DEFAULT_VGAP).coerceIn(GAP_RANGE.first, GAP_RANGE.last)
+
+    fun setVGap(context: Context, dp: Int) =
+        prefs(context).edit().putInt(KEY_VGAP, dp.coerceIn(GAP_RANGE.first, GAP_RANGE.last)).apply()
+
+    fun resetSize(context: Context) {
+        prefs(context).edit()
+            .putInt(KEY_KEY_HEIGHT, DEFAULT_KEY_HEIGHT)
+            .putInt(KEY_HGAP, DEFAULT_HGAP)
+            .putInt(KEY_VGAP, DEFAULT_VGAP)
+            .apply()
     }
 
-    fun setKeyboardSize(context: Context, size: String) {
-        prefs(context).edit().putString(KEY_KB_SIZE, size).apply()
-    }
-
-    /** Height (dp) of a single key row for the given size. Drives the fixed key-area height.
-     *  "normal" (39dp) is calibrated to match the stock keyboard's key height. */
-    fun rowHeightDp(size: String): Int = when (size) {
-        "compact" -> 34
-        "large" -> 46
-        "xlarge" -> 53
-        else -> 39 // normal — matches the stock keyboard
-    }
-
-    fun fontSizeSp(size: String): Int = when (size) {
-        "compact" -> 15
-        "large" -> 19
-        "xlarge" -> 21
-        else -> 17 // normal
+    /** Key glyph size derived from the visible key height (row height minus vertical gaps). */
+    fun fontSizeSp(keyHeight: Int, vGap: Int): Int {
+        val visible = (keyHeight - 2 * vGap).coerceAtLeast(18)
+        return (visible * 0.5f).toInt().coerceIn(13, 24)
     }
 
     // --- Haptics ---
