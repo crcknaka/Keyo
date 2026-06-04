@@ -117,6 +117,25 @@ app/src/main/java/com/keyo/
 └── tools/                  AI assistant tools (call, SMS, alarm, timer, app, …)
 ```
 
+## Privacy
+
+Keyo's AI features rely on the Groq cloud API, so some data leaves the device:
+
+- **Voice dictation / AI assistant** — the recorded audio is sent to Groq for transcription
+  and processing.
+- **Live spellcheck & auto-correction** — when enabled, the text being edited is sent to Groq
+  to be corrected.
+
+What stays on device / what's protected:
+
+- In **password fields and "no personalized learning" (incognito) fields**, Keyo disables
+  spellcheck, voice and AI entirely — nothing is sent to the network there.
+- **Clipboard history** is stored locally on the device only.
+- Your **Groq API key** is stored locally (in `SharedPreferences` / `local.properties`) and is
+  only sent to Groq as the request authorization.
+- Disable **Live spellcheck** in Settings if you don't want edited text sent for correction;
+  voice and AI only run when you explicitly hold the mic / 🤖 key.
+
 ## License
 
 Released under the [MIT License](LICENSE).

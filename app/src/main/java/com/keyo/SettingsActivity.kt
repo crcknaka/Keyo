@@ -30,19 +30,43 @@ import androidx.core.content.ContextCompat
 
 class SettingsActivity : ComponentActivity() {
 
+    // Bumped on resume so the Setup statuses re-evaluate after returning from system screens.
+    private val resumeTick = mutableStateOf(0)
+
     private val requestPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) {}
+    ) { resumeTick.value++ }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-            != PackageManager.PERMISSION_GRANTED) {
-            requestPermission.launch(Manifest.permission.RECORD_AUDIO)
-        }
-
         setContent { SettingsScreen() }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        resumeTick.value++
+    }
+
+    // ---- Setup status helpers ----
+    private fun isMicGranted() =
+        ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
+    private fun isKeyboardEnabled(): Boolean = try {
+        (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager)
+            .enabledInputMethodList.any { it.packageName == packageName }
+    } catch (_: Exception) { false }
+
+    private fun isDefaultIme(): Boolean = try {
+        Settings.Secure.getString(contentResolver, Settings.Secure.DEFAULT_INPUT_METHOD)
+            ?.startsWith("$packageName/") == true
+    } catch (_: Exception) { false }
+
+    private fun openAppSettings() {
+        try {
+            startActivity(
+                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, android.net.Uri.parse("package:$packageName"))
+            )
+        } catch (_: Exception) {}
     }
 
     // ---- Linear / Vercel inspired palette: strict, mostly monochrome, single accent ----
@@ -72,35 +96,123 @@ class SettingsActivity : ComponentActivity() {
                 Text("AI voice keyboard", fontSize = 14.sp, color = textMuted)
                 Spacer(Modifier.height(12.dp))
 
-                // ===== Setup =====
+                // ===== Setup ===== (re-evaluated on resume via resumeTick)
+                @Suppress("UNUSED_VARIABLE") val refresh = resumeTick.value
+                val kbEnabled = isKeyboardEnabled()
+                val isDefault = isDefaultIme()
+                val micOk = isMicGranted()
                 SectionLabel("Setup")
                 Group {
-                    NavRow("Enable keyboard", "System Settings → Languages & input") {
+                    SetupRow("Enable keyboard", if (kbEnabled) "Enabled" else "Turn Keyo on in system settings", kbEnabled) {
                         startActivity(Intent(Settings.ACTION_INPUT_METHOD_SETTINGS))
                     }
                     Divider(color = divider, thickness = 1.dp)
-                    NavRow("Switch to Keyo", "Open the input method picker") {
+                    SetupRow("Switch to Keyo", if (isDefault) "Currently active" else "Pick Keyo as the keyboard", isDefault) {
                         (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager).showInputMethodPicker()
                     }
                     Divider(color = divider, thickness = 1.dp)
-                    NavRow("Grant microphone", "Required for voice input") {
-                        requestPermission.launch(Manifest.permission.RECORD_AUDIO)
+                    SetupRow("Microphone", if (micOk) "Granted" else "Required for voice input", micOk) {
+                        if (micOk) openAppSettings() else requestPermission.launch(Manifest.permission.RECORD_AUDIO)
                     }
                 }
 
                 // ===== Languages =====
                 SectionLabel("Languages")
+                val flags = mapOf("en" to "🇬🇧", "ru" to "🇷🇺", "lv" to "🇱🇻")
                 var enabledLangs by remember { mutableStateOf(KeyboardPrefs.getEnabledLanguages(this@SettingsActivity)) }
                 Group {
                     KeyboardPrefs.SUPPORTED_LANGUAGES.forEachIndexed { i, (code, name) ->
                         if (i > 0) Divider(color = divider, thickness = 1.dp)
-                        CheckRow(name, enabledLangs.contains(code)) { want ->
+                        CheckRow("${flags[code] ?: "🏳"}   $name", enabledLangs.contains(code)) { want ->
                             KeyboardPrefs.setLanguageEnabled(this@SettingsActivity, code, want)
                             enabledLangs = KeyboardPrefs.getEnabledLanguages(this@SettingsActivity)
                         }
                     }
                 }
-                Hint("Swipe the space bar to cycle between enabled languages.")
+                Hint("Switch with the 🌐 key or by swiping the space bar.")
+
+                // ===== Keyboard size (collapsible visual editor) =====
+                var keyH by remember { mutableStateOf(KeyboardPrefs.getKeyHeight(this@SettingsActivity)) }
+                var vGap by remember { mutableStateOf(KeyboardPrefs.getVGap(this@SettingsActivity)) }
+                var hGap by remember { mutableStateOf(KeyboardPrefs.getHGap(this@SettingsActivity)) }
+                var testText by remember { mutableStateOf("") }
+                ExpandableSection("Keyboard size", "Height ${keyH}dp · spacing ${vGap}/${hGap}") {
+                    SliderRow("Key height", keyH, "dp", KeyboardPrefs.KEY_HEIGHT_RANGE) {
+                        keyH = it; KeyboardPrefs.setKeyHeight(this@SettingsActivity, it)
+                    }
+                    Divider(color = divider, thickness = 1.dp)
+                    SliderRow("Vertical spacing", vGap, "dp", KeyboardPrefs.GAP_RANGE) {
+                        vGap = it; KeyboardPrefs.setVGap(this@SettingsActivity, it)
+                    }
+                    Divider(color = divider, thickness = 1.dp)
+                    SliderRow("Horizontal spacing", hGap, "dp", KeyboardPrefs.GAP_RANGE) {
+                        hGap = it; KeyboardPrefs.setHGap(this@SettingsActivity, it)
+                    }
+                    Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
+                        OutlinedTextField(
+                            value = testText,
+                            onValueChange = { testText = it },
+                            placeholder = { Text("Tap here and type to preview…", color = textFaint) },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedTextColor = textPrimary,
+                                unfocusedTextColor = textPrimary,
+                                focusedBorderColor = accent,
+                                unfocusedBorderColor = border,
+                                cursorColor = accent
+                            )
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                "Type here while dragging — the keyboard resizes live.",
+                                fontSize = 12.sp, color = textFaint, modifier = Modifier.weight(1f).padding(end = 8.dp)
+                            )
+                            Text(
+                                "Reset",
+                                fontSize = 13.sp, color = accent, fontWeight = FontWeight.Medium,
+                                modifier = Modifier.clickable {
+                                    KeyboardPrefs.resetSize(this@SettingsActivity)
+                                    keyH = KeyboardPrefs.getKeyHeight(this@SettingsActivity)
+                                    vGap = KeyboardPrefs.getVGap(this@SettingsActivity)
+                                    hGap = KeyboardPrefs.getHGap(this@SettingsActivity)
+                                }
+                            )
+                        }
+                    }
+                }
+
+                // ===== Appearance =====
+                SectionLabel("Appearance")
+                var numberRow by remember { mutableStateOf(KeyboardPrefs.isNumberRowEnabled(this@SettingsActivity)) }
+                var selectedTheme by remember { mutableStateOf(KeyboardPrefs.getTheme(this@SettingsActivity)) }
+
+                Group {
+                    ToggleRow("Number row", "Show the 1–0 row above the letters", numberRow) {
+                        numberRow = it; KeyboardPrefs.setNumberRowEnabled(this@SettingsActivity, it)
+                    }
+                }
+                ThemePicker(selectedTheme) {
+                    selectedTheme = it; KeyboardPrefs.setTheme(this@SettingsActivity, it)
+                }
+
+                // ===== Typing feel =====
+                SectionLabel("Typing feel")
+                var haptic by remember { mutableStateOf(KeyboardPrefs.getHapticStrength(this@SettingsActivity)) }
+                var sound by remember { mutableStateOf(KeyboardPrefs.isSoundEnabled(this@SettingsActivity)) }
+                Group {
+                    ChoiceRow("Haptics", KeyboardPrefs.HAPTIC_LEVELS, haptic) {
+                        haptic = it; KeyboardPrefs.setHapticStrength(this@SettingsActivity, it)
+                    }
+                    Divider(color = divider, thickness = 1.dp)
+                    ToggleRow("Key sound", "Play a click on every key", sound) {
+                        sound = it; KeyboardPrefs.setSoundEnabled(this@SettingsActivity, it)
+                    }
+                }
 
                 // ===== Voice & AI =====
                 SectionLabel("Voice & AI")
@@ -137,11 +249,14 @@ class SettingsActivity : ComponentActivity() {
                     }
                 }
 
-                // ===== API key =====
-                SectionLabel("Groq API key")
+                // ===== Groq API key (collapsible) =====
                 var apiKey by remember { mutableStateOf(KeyboardPrefs.getApiKey(this@SettingsActivity)) }
                 var keyVisible by remember { mutableStateOf(false) }
-                Group {
+                var testing by remember { mutableStateOf(false) }
+                ExpandableSection(
+                    "Groq API key",
+                    if (apiKey.isBlank()) "Using built-in default key" else "Custom key set"
+                ) {
                     Column(Modifier.padding(16.dp)) {
                         OutlinedTextField(
                             value = apiKey,
@@ -170,127 +285,63 @@ class SettingsActivity : ComponentActivity() {
                             )
                         )
                         Spacer(Modifier.height(10.dp))
-                        Button(
-                            onClick = {
-                                KeyboardPrefs.setApiKey(this@SettingsActivity, apiKey)
-                                GroqApi.apiKey = apiKey.ifBlank { BuildConfig.GROQ_API_KEY }
-                                android.widget.Toast.makeText(this@SettingsActivity, "API key saved", android.widget.Toast.LENGTH_SHORT).show()
-                            },
-                            modifier = Modifier.fillMaxWidth(),
-                            shape = RoundedCornerShape(10.dp),
-                            colors = ButtonDefaults.buttonColors(containerColor = accent)
-                        ) {
-                            Text("Save key", color = Color.White, fontWeight = FontWeight.SemiBold)
-                        }
-                    }
-                }
-                Column(Modifier.padding(start = 4.dp, top = 6.dp)) {
-                    Text("Leave empty to use the built-in default.", fontSize = 12.sp, color = textFaint)
-                    Text(
-                        "Get a free key at console.groq.com/keys ↗",
-                        fontSize = 12.sp,
-                        color = accent,
-                        modifier = Modifier
-                            .padding(top = 2.dp)
-                            .clickable {
-                                try {
-                                    startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse("https://console.groq.com/keys")))
-                                } catch (_: Exception) {}
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Button(
+                                onClick = {
+                                    KeyboardPrefs.setApiKey(this@SettingsActivity, apiKey)
+                                    GroqApi.apiKey = apiKey.ifBlank { BuildConfig.GROQ_API_KEY }
+                                    android.widget.Toast.makeText(this@SettingsActivity, "API key saved", android.widget.Toast.LENGTH_SHORT).show()
+                                },
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(10.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = accent)
+                            ) {
+                                Text("Save key", color = Color.White, fontWeight = FontWeight.SemiBold)
                             }
-                    )
-                }
-
-                // ===== Keyboard size (visual editor) =====
-                SectionLabel("Keyboard size")
-                var keyH by remember { mutableStateOf(KeyboardPrefs.getKeyHeight(this@SettingsActivity)) }
-                var vGap by remember { mutableStateOf(KeyboardPrefs.getVGap(this@SettingsActivity)) }
-                var hGap by remember { mutableStateOf(KeyboardPrefs.getHGap(this@SettingsActivity)) }
-                var testText by remember { mutableStateOf("") }
-                Group {
-                    SliderRow("Key height", keyH, "dp", KeyboardPrefs.KEY_HEIGHT_RANGE) {
-                        keyH = it; KeyboardPrefs.setKeyHeight(this@SettingsActivity, it)
-                    }
-                    Divider(color = divider, thickness = 1.dp)
-                    SliderRow("Vertical spacing", vGap, "dp", KeyboardPrefs.GAP_RANGE) {
-                        vGap = it; KeyboardPrefs.setVGap(this@SettingsActivity, it)
-                    }
-                    Divider(color = divider, thickness = 1.dp)
-                    SliderRow("Horizontal spacing", hGap, "dp", KeyboardPrefs.GAP_RANGE) {
-                        hGap = it; KeyboardPrefs.setHGap(this@SettingsActivity, it)
-                    }
-                }
-                OutlinedTextField(
-                    value = testText,
-                    onValueChange = { testText = it },
-                    placeholder = { Text("Tap here and type to preview…", color = textFaint) },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedTextColor = textPrimary,
-                        unfocusedTextColor = textPrimary,
-                        focusedBorderColor = accent,
-                        unfocusedBorderColor = border,
-                        cursorColor = accent
-                    )
-                )
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        "Type in the field while dragging the sliders — the keyboard resizes live.",
-                        fontSize = 12.sp, color = textFaint, modifier = Modifier.weight(1f).padding(end = 8.dp)
-                    )
-                    Text(
-                        "Reset",
-                        fontSize = 13.sp, color = accent, fontWeight = FontWeight.Medium,
-                        modifier = Modifier.clickable {
-                            KeyboardPrefs.resetSize(this@SettingsActivity)
-                            keyH = KeyboardPrefs.getKeyHeight(this@SettingsActivity)
-                            vGap = KeyboardPrefs.getVGap(this@SettingsActivity)
-                            hGap = KeyboardPrefs.getHGap(this@SettingsActivity)
+                            OutlinedButton(
+                                onClick = {
+                                    GroqApi.apiKey = apiKey.ifBlank { BuildConfig.GROQ_API_KEY }
+                                    testing = true
+                                    GroqApi.testKey { ok, err ->
+                                        runOnUiThread {
+                                            testing = false
+                                            android.widget.Toast.makeText(
+                                                this@SettingsActivity,
+                                                if (ok) "✅ Key works" else "❌ ${err ?: "Failed"}",
+                                                android.widget.Toast.LENGTH_SHORT
+                                            ).show()
+                                        }
+                                    }
+                                },
+                                enabled = !testing,
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(10.dp),
+                                border = androidx.compose.foundation.BorderStroke(1.dp, border)
+                            ) {
+                                Text(if (testing) "Testing…" else "Test", color = textPrimary)
+                            }
                         }
-                    )
-                }
-
-                // ===== Appearance =====
-                SectionLabel("Appearance")
-                var numberRow by remember { mutableStateOf(KeyboardPrefs.isNumberRowEnabled(this@SettingsActivity)) }
-                var selectedTheme by remember { mutableStateOf(KeyboardPrefs.getTheme(this@SettingsActivity)) }
-
-                Group {
-                    ToggleRow("Number row", "Show the 1–0 row above the letters", numberRow) {
-                        numberRow = it; KeyboardPrefs.setNumberRowEnabled(this@SettingsActivity, it)
-                    }
-                }
-                ThemePicker(selectedTheme) {
-                    selectedTheme = it; KeyboardPrefs.setTheme(this@SettingsActivity, it)
-                }
-
-                // ===== Typing feel =====
-                SectionLabel("Typing feel")
-                var haptic by remember { mutableStateOf(KeyboardPrefs.getHapticStrength(this@SettingsActivity)) }
-                var sound by remember { mutableStateOf(KeyboardPrefs.isSoundEnabled(this@SettingsActivity)) }
-                Group {
-                    ChoiceRow("Haptics", KeyboardPrefs.HAPTIC_LEVELS, haptic) {
-                        haptic = it; KeyboardPrefs.setHapticStrength(this@SettingsActivity, it)
-                    }
-                    Divider(color = divider, thickness = 1.dp)
-                    ToggleRow("Key sound", "Play a click on every key", sound) {
-                        sound = it; KeyboardPrefs.setSoundEnabled(this@SettingsActivity, it)
+                        Spacer(Modifier.height(10.dp))
+                        Text("Leave empty to use the built-in default.", fontSize = 12.sp, color = textFaint)
+                        Text(
+                            "Get a free key at console.groq.com/keys ↗",
+                            fontSize = 12.sp,
+                            color = accent,
+                            modifier = Modifier
+                                .padding(top = 2.dp)
+                                .clickable {
+                                    try {
+                                        startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse("https://console.groq.com/keys")))
+                                    } catch (_: Exception) {}
+                                }
+                        )
                     }
                 }
 
-                // ===== AI tools =====
-                SectionLabel("AI tools")
-                Group {
-                    Text(
-                        "Hold the 🤖 key and say:",
-                        fontSize = 13.sp,
-                        color = textMuted,
-                        modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 6.dp)
-                    )
+                // ===== AI tools (collapsible) =====
+                val toolCount = com.keyo.tools.ToolRegistry.all().count { it.uiExample.isNotEmpty() }
+                ExpandableSection("AI tools", "$toolCount voice commands — hold 🤖 and say…") {
+                    Spacer(Modifier.height(6.dp))
                     com.keyo.tools.ToolRegistry.all().forEach { tool ->
                         if (tool.uiExample.isNotEmpty()) {
                             Row(
@@ -348,6 +399,42 @@ class SettingsActivity : ComponentActivity() {
     @Composable
     private fun Hint(text: String) {
         Text(text, fontSize = 12.sp, color = textFaint, modifier = Modifier.padding(start = 4.dp, top = 6.dp))
+    }
+
+    // A collapsible section: a labelled card whose body is revealed by tapping the header.
+    @Composable
+    private fun ExpandableSection(
+        label: String,
+        summary: String,
+        initiallyExpanded: Boolean = false,
+        content: @Composable ColumnScope.() -> Unit
+    ) {
+        var expanded by remember { mutableStateOf(initiallyExpanded) }
+        SectionLabel(label)
+        Group {
+            Row(
+                modifier = Modifier.fillMaxWidth().clickable { expanded = !expanded }
+                    .padding(horizontal = 16.dp, vertical = 14.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(summary, fontSize = 14.sp, color = textMuted, modifier = Modifier.weight(1f))
+                Text(if (expanded) "⌃" else "⌄", fontSize = 16.sp, color = textFaint)
+            }
+            if (expanded) {
+                Divider(color = divider, thickness = 1.dp)
+                content()
+            }
+        }
+    }
+
+    // A Setup step row: shows a green check when done, otherwise a chevron.
+    @Composable
+    private fun SetupRow(title: String, status: String, done: Boolean, onClick: () -> Unit) {
+        RowScaffold(onClick = onClick) {
+            TitleBlock(title, status, Modifier.weight(1f))
+            if (done) Text("✓", color = accent, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+            else Text("›", color = textFaint, fontSize = 20.sp)
+        }
     }
 
     @Composable

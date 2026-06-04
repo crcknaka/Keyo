@@ -2,6 +2,7 @@ package com.keyo
 
 import android.content.Context
 import android.content.SharedPreferences
+import org.json.JSONArray
 
 object KeyboardPrefs {
     private const val PREFS_NAME = "keyo_prefs"
@@ -19,11 +20,13 @@ object KeyboardPrefs {
     private const val KEY_LANGS = "enabled_languages"
     private const val KEY_CUR_LANG = "current_language"
     private const val KEY_API_KEY = "groq_api_key"
+    private const val KEY_CLIPS = "clip_history"
+    private const val MAX_CLIPS = 25
 
-    // Defaults / ranges for the visual size editor. Default height matches the stock keyboard.
-    const val DEFAULT_KEY_HEIGHT = 39
-    const val DEFAULT_HGAP = 3
-    const val DEFAULT_VGAP = 3
+    // Defaults / ranges for the visual size editor.
+    const val DEFAULT_KEY_HEIGHT = 48
+    const val DEFAULT_HGAP = 1
+    const val DEFAULT_VGAP = 2
     val KEY_HEIGHT_RANGE = 28..64
     val GAP_RANGE = 0..10
 
@@ -162,6 +165,38 @@ object KeyboardPrefs {
 
     fun setApiKey(context: Context, key: String) {
         prefs(context).edit().putString(KEY_API_KEY, key.trim()).apply()
+    }
+
+    // --- Clipboard history (most-recent first) ---
+    fun getClipHistory(context: Context): List<String> {
+        val raw = prefs(context).getString(KEY_CLIPS, "[]") ?: "[]"
+        return try {
+            val arr = JSONArray(raw)
+            List(arr.length()) { arr.getString(it) }
+        } catch (_: Exception) { emptyList() }
+    }
+
+    fun addClip(context: Context, text: String) {
+        if (text.isBlank()) return
+        val cur = getClipHistory(context).toMutableList()
+        cur.remove(text)            // de-duplicate
+        cur.add(0, text)
+        while (cur.size > MAX_CLIPS) cur.removeAt(cur.size - 1)
+        saveClips(context, cur)
+    }
+
+    fun removeClip(context: Context, text: String) {
+        val cur = getClipHistory(context).toMutableList()
+        cur.remove(text)
+        saveClips(context, cur)
+    }
+
+    fun clearClips(context: Context) = prefs(context).edit().remove(KEY_CLIPS).apply()
+
+    private fun saveClips(context: Context, list: List<String>) {
+        val arr = JSONArray()
+        list.forEach { arr.put(it) }
+        prefs(context).edit().putString(KEY_CLIPS, arr.toString()).apply()
     }
 
     fun getTheme(context: Context): String {

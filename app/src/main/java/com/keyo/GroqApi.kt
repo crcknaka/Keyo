@@ -15,7 +15,11 @@ import java.io.File
 import java.io.IOException
 
 object GroqApi {
-    private val client = OkHttpClient()
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+        .writeTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+        .build()
     // API key: user-supplied value (from settings) overrides the build-time default.
     var apiKey: String = BuildConfig.GROQ_API_KEY
     var model: String = "llama-3.3-70b-versatile"        // for 🎤 transcription cleanup + spellcheck
@@ -29,6 +33,36 @@ object GroqApi {
 
     fun clearAiHistory() {
         aiHistory.clear()
+    }
+
+    /** Validate the current API key with a tiny request. callback(ok, errorMessage). */
+    fun testKey(callback: (Boolean, String?) -> Unit) {
+        if (apiKey.isBlank()) { callback(false, "No API key set"); return }
+        val json = JSONObject().apply {
+            put("model", aiModel)
+            put("messages", JSONArray().apply {
+                put(JSONObject().apply { put("role", "user"); put("content", "ping") })
+            })
+            put("max_tokens", 1)
+        }
+        val request = Request.Builder()
+            .url("https://api.groq.com/openai/v1/chat/completions")
+            .addHeader("Authorization", "Bearer $apiKey")
+            .addHeader("Content-Type", "application/json")
+            .post(json.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+        client.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) = callback(false, e.message ?: "Network error")
+            override fun onResponse(call: Call, response: Response) {
+                response.use {
+                    when {
+                        it.isSuccessful -> callback(true, null)
+                        it.code == 401 -> callback(false, "Invalid key (401)")
+                        else -> callback(false, "HTTP ${it.code}")
+                    }
+                }
+            }
+        })
     }
 
     fun transcribe(audioFile: File, callback: (String?, String?) -> Unit) {

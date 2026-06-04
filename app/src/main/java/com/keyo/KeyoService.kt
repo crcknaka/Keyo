@@ -10,8 +10,10 @@ import android.view.View
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.graphics.Path
@@ -19,9 +21,13 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -66,6 +72,39 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private var soundEnabled = mutableStateOf(false)
     private var themeId = mutableStateOf("catppuccin")
 
+    // True for password / no-personalized-learning fields. In these we never send anything
+    // to the network: no spellcheck, no voice transcription, no AI.
+    private var secureField = false
+
+    private var clipHistory = mutableStateOf<List<String>>(emptyList())
+    private var emojiCategory = mutableIntStateOf(0)        // emoji panel category
+    // Dynamic top toolbar: a freshly-copied snippet shows as a quick-paste chip for a while.
+    private var showClipChip = mutableStateOf(false)
+    private var lastClip = mutableStateOf("")
+    private val hideClipChip = Runnable { showClipChip.value = false }
+
+    private val clipboardManager: android.content.ClipboardManager? by lazy {
+        getSystemService(android.content.Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+    }
+    // Record copied text into the clipboard-history panel (skipped in password fields).
+    private val clipListener = android.content.ClipboardManager.OnPrimaryClipChangedListener {
+        if (!secureField) {
+            try {
+                val text = clipboardManager?.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString()
+                if (!text.isNullOrBlank()) {
+                    KeyboardPrefs.addClip(this, text)
+                    handler.post {
+                        clipHistory.value = KeyboardPrefs.getClipHistory(this)
+                        lastClip.value = text
+                        showClipChip.value = true
+                        handler.removeCallbacks(hideClipChip)
+                        handler.postDelayed(hideClipChip, 25_000) // auto-hide the chip
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+    }
+
     // Reapply settings live while the user drags the size sliders in the Settings screen.
     private val prefListener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
         handler.post { reloadPrefs() }
@@ -82,6 +121,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         soundEnabled.value = KeyboardPrefs.isSoundEnabled(this)
         themeId.value = KeyboardPrefs.getTheme(this)
         enabledLangs.value = KeyboardPrefs.getEnabledLanguages(this)
+        clipHistory.value = KeyboardPrefs.getClipHistory(this)
     }
 
     // Max content rows any mode shows — keeps the keyboard a fixed height so it never
@@ -99,6 +139,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         lifecycleRegistry.currentState = Lifecycle.State.CREATED
         reloadPrefs()
         KeyboardPrefs.registerChangeListener(this, prefListener)
+        clipboardManager?.addPrimaryClipChangedListener(clipListener)
     }
 
     private fun installLifecycleOwnerOnDecorView() {
@@ -174,11 +215,28 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         // Store IME action for enter key behavior
         imeActionId.intValue = info?.imeOptions?.and(android.view.inputmethod.EditorInfo.IME_MASK_ACTION)
             ?: android.view.inputmethod.EditorInfo.IME_ACTION_NONE
+
+        // Detect password / incognito fields — disable all network features there.
+        val inputType = info?.inputType ?: 0
+        val cls = inputType and android.text.InputType.TYPE_MASK_CLASS
+        val variation = inputType and android.text.InputType.TYPE_MASK_VARIATION
+        val isPassword =
+            (cls == android.text.InputType.TYPE_CLASS_TEXT && (
+                variation == android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD ||
+                variation == android.text.InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD ||
+                variation == android.text.InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD)) ||
+            (cls == android.text.InputType.TYPE_CLASS_NUMBER &&
+                variation == android.text.InputType.TYPE_NUMBER_VARIATION_PASSWORD)
+        val noLearning = ((info?.imeOptions ?: 0) and
+            android.view.inputmethod.EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING) != 0
+        secureField = isPassword || noLearning
     }
 
     override fun onEvaluateFullscreenMode(): Boolean {
-        // Never go fullscreen — always let the app show above the keyboard
-        return false
+        // Portrait: stay non-fullscreen so the app shows above the keyboard.
+        // Landscape: go fullscreen so a text line (extract view) appears above the keys,
+        // like Gboard — otherwise the keyboard would cover the whole field.
+        return resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
     }
 
     override fun onComputeInsets(outInsets: Insets) {
@@ -193,6 +251,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
 
     override fun onDestroy() {
         KeyboardPrefs.unregisterChangeListener(this, prefListener)
+        clipboardManager?.removePrimaryClipChangedListener(clipListener)
         lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
         super.onDestroy()
     }
@@ -222,20 +281,14 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 .background(bgColor)
                 .padding(horizontal = 2.dp, vertical = 4.dp)
         ) {
-            // Fixed-height status line so the layout never shifts when status appears/clears
-            Box(
-                modifier = Modifier.fillMaxWidth().height(16.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                if (status.isNotEmpty()) {
-                    Text(
-                        text = status,
-                        color = accentColor,
-                        fontSize = 11.sp,
-                        textAlign = TextAlign.Center
-                    )
-                }
-            }
+            // Dynamic top toolbar (Gboard-style). Priority: status > quick-paste chip > icons.
+            TopToolbar(status, bgColor, keyColor, textColor, accentColor)
+
+            if (mode == "emoji") {
+                EmojiPanel(keyHeight, keyColor, textColor, accentColor)
+            } else if (mode == "clipboard") {
+                ClipboardPanel(keyHeight, keyColor, textColor, accentColor)
+            } else {
 
             // Key content area — fixed height (maxContentRows tall) so switching between
             // abc / 123 / symbols / numpad never resizes the keyboard. Rows sit at the
@@ -333,7 +386,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 }
                 "symbols" -> {
                     val symRows = listOf(
-                        listOf("~","`","|","·","√","π","τ","÷","×","¶"),
+                        listOf("~","`","|","·","√","π","τ","÷","×","="),
                         listOf("©","®","™","℅","[","]","{","}","<",">"),
                         null
                     )
@@ -404,6 +457,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 val recordingAI by isRecordingAI
                 var aiCancelled by remember { mutableStateOf(false) }
                 var aiDragX by remember { mutableFloatStateOf(0f) }
+                var aiPressed by remember { mutableStateOf(false) }
                 val cancelThreshold = 100f
 
                 Box(
@@ -411,10 +465,12 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         .weight(0.9f)
                         .height(keyHeight)
                         .padding(horizontal = keyHGapDp.intValue.dp, vertical = keyVGapDp.intValue.dp)
+                        .semantics { contentDescription = "AI assistant. Long press and speak a task" }
                         .background(
                             when {
                                 recordingAI && aiDragX < -cancelThreshold -> Color(0xFF666666)
                                 recordingAI -> Color(0xFF50FA7B)
+                                aiPressed -> lerp(keyColor, Color.Black, 0.22f)
                                 else -> keyColor
                             },
                             RoundedCornerShape(6.dp)
@@ -424,6 +480,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                 val down = awaitFirstDown()
                                 aiCancelled = false
                                 aiDragX = 0f
+                                aiPressed = true
                                 var longPressed = false
 
                                 val longPressJob = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
@@ -450,6 +507,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                 } catch (_: kotlinx.coroutines.CancellationException) {}
 
                                 longPressJob.cancel()
+                                aiPressed = false
                                 if (longPressed) {
                                     if (aiCancelled) cancelAIRecording() else stopAIRecording()
                                     aiDragX = 0f
@@ -473,7 +531,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     if (!recordingAI) {
                         Text(
                             "🤖",
-                            fontSize = 13.sp,
+                            fontSize = 11.sp,
                             modifier = Modifier.align(Alignment.TopEnd).padding(2.dp)
                         )
                     }
@@ -482,7 +540,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 // Right of the comma: globe = switch language (abc); mode hint otherwise
                 when (mode) {
                     "abc" -> {
-                        KeyButton("🌐", keyColor, textColor, Modifier.weight(1f)) {
+                        LanguageKey(keyColor, textColor, keyHeight, Modifier.weight(1f)) {
                             cycleLanguage()
                         }
                     }
@@ -503,94 +561,9 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     }
                 }
 
-                // Space — swipe to switch language, long press for voice dictation (🎤)
+                // Space — shared component (tap = space, hold = dictate, swipe = cursor slider)
                 val spaceLabel = if (mode == "abc") lang.uppercase() else "space"
-                var micCancelled by remember { mutableStateOf(false) }
-                var micDragX by remember { mutableFloatStateOf(0f) }
-
-                Box(
-                    modifier = Modifier
-                        .weight(3.5f)
-                        .height(keyHeight)
-                        .padding(horizontal = keyHGapDp.intValue.dp, vertical = keyVGapDp.intValue.dp)
-                        .background(
-                            when {
-                                recording && micDragX < -cancelThreshold -> Color(0xFF666666)
-                                recording -> recordColor
-                                else -> keyColor
-                            },
-                            RoundedCornerShape(6.dp)
-                        )
-                        .pointerInput(Unit) {
-                            awaitEachGesture {
-                                val down = awaitFirstDown()
-                                var totalDragX = 0f
-                                var swiped = false
-                                var longPressed = false
-                                micCancelled = false
-                                micDragX = 0f
-
-                                val longPressJob = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
-                                    kotlinx.coroutines.delay(400)
-                                    longPressed = true
-                                    startVoiceRecording()
-                                    performKeyFeedback()
-                                }
-
-                                try {
-                                    while (true) {
-                                        val event = awaitPointerEvent()
-                                        val change = event.changes.firstOrNull() ?: break
-                                        if (!change.pressed) {
-                                            change.consume()
-                                            break
-                                        }
-                                        totalDragX = change.position.x - down.position.x
-                                        if (longPressed) {
-                                            micDragX = totalDragX
-                                            if (micDragX < -cancelThreshold) micCancelled = true
-                                        } else if (kotlin.math.abs(totalDragX) > 60f) {
-                                            swiped = true
-                                        }
-                                        change.consume()
-                                    }
-                                } catch (_: kotlinx.coroutines.CancellationException) {}
-
-                                longPressJob.cancel()
-                                if (longPressed) {
-                                    if (micCancelled) cancelVoiceRecording() else stopVoiceRecording()
-                                    micDragX = 0f
-                                } else if (swiped) {
-                                    performKeyFeedback()
-                                    cycleLanguage()
-                                } else {
-                                    performKeyFeedback()
-                                    commitChar(' ')
-                                }
-                            }
-                        },
-                    contentAlignment = Alignment.Center
-                ) {
-                    if (recording) {
-                        Text(
-                            text = if (micDragX < -cancelThreshold) "✕" else "🎤 ●",
-                            fontSize = 16.sp,
-                            color = Color.White
-                        )
-                    } else {
-                        Text(
-                            text = spaceLabel,
-                            color = textColor,
-                            fontSize = 14.sp,
-                            textAlign = TextAlign.Center
-                        )
-                        Text(
-                            "🎤",
-                            fontSize = 13.sp,
-                            modifier = Modifier.align(Alignment.TopEnd).padding(3.dp)
-                        )
-                    }
-                }
+                SpaceKey(Modifier.weight(3.5f), spaceLabel, keyColor, textColor, accentColor, recordColor)
 
                 // Period — long press shows ? , ! -
                 KeyButton(".", keyColor, textColor, Modifier.weight(0.9f)) { commitChar('.') }
@@ -622,6 +595,391 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     }
                 }
             }
+            } // end else (normal keyboard layout)
+        }
+    }
+
+    // Dynamic top toolbar (Gboard-style): status text, a quick-paste chip, or action icons.
+    @Composable
+    fun TopToolbar(status: String, bgColor: Color, keyColor: Color, textColor: Color, accentColor: Color) {
+        val chip by showClipChip
+        val clip by lastClip
+        Box(
+            modifier = Modifier.fillMaxWidth().height(40.dp).padding(horizontal = 4.dp),
+            contentAlignment = Alignment.CenterStart
+        ) {
+            when {
+                status.isNotEmpty() -> Text(
+                    status, color = accentColor, fontSize = 12.sp,
+                    modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center
+                )
+                chip && clip.isNotEmpty() -> Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("📋", fontSize = 16.sp, modifier = Modifier.padding(horizontal = 6.dp))
+                    Box(
+                        modifier = Modifier.weight(1f).fillMaxHeight()
+                            .semantics { contentDescription = "Paste copied text" }
+                            .clickable {
+                                performKeyFeedback(); commitText(clip)
+                                showClipChip.value = false
+                            },
+                        contentAlignment = Alignment.CenterStart
+                    ) {
+                        Text(
+                            "Paste: " + clip.replace("\n", " ").take(40),
+                            color = textColor, fontSize = 13.sp, maxLines = 1
+                        )
+                    }
+                    Box(
+                        modifier = Modifier.size(36.dp).clickable { showClipChip.value = false },
+                        contentAlignment = Alignment.Center
+                    ) { Text("✕", color = textColor.copy(alpha = 0.6f), fontSize = 14.sp) }
+                }
+                else -> Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(2.dp)
+                ) {
+                    ToolbarIcon("😀", textColor) { emojiCategory.intValue = 0; keyboardMode.value = "emoji" }
+                    ToolbarIcon("📋", textColor) { keyboardMode.value = "clipboard" }
+                    ToolbarIcon("↶", textColor) { performKeyFeedback(); sendCtrlKey(android.view.KeyEvent.KEYCODE_Z) }
+                    ToolbarIcon("↷", textColor) { performKeyFeedback(); sendCtrlKey(android.view.KeyEvent.KEYCODE_Z, withShift = true) }
+                    ToolbarIcon("⬚", textColor) { performKeyFeedback(); selectAll() }
+                    ToolbarIcon("⚙", textColor) { performKeyFeedback(); openSettings() }
+                }
+            }
+        }
+    }
+
+    @Composable
+    private fun ToolbarIcon(glyph: String, textColor: Color, onClick: () -> Unit) {
+        Box(
+            modifier = Modifier.size(40.dp)
+                .semantics { contentDescription = keyDescription(glyph) }
+                .clickable { onClick() },
+            contentAlignment = Alignment.Center
+        ) { Text(glyph, fontSize = 18.sp, color = textColor) }
+    }
+
+    // A circular bezel/dial knob with tick marks that rotate as you scrub the cursor.
+    @Composable
+    private fun BezelKnob(rotationDeg: Float, ring: Color, hub: Color, modifier: Modifier) {
+        Canvas(modifier = modifier) {
+            val r = size.minDimension / 2f
+            val c = androidx.compose.ui.geometry.Offset(size.width / 2f, size.height / 2f)
+            // base disc + subtle inner face
+            drawCircle(color = ring, radius = r, center = c)
+            drawCircle(color = hub.copy(alpha = 0.18f), radius = r * 0.78f, center = c)
+            // rotating ticks around the bezel
+            val ticks = 12
+            for (i in 0 until ticks) {
+                val ang = Math.toRadians((i * (360.0 / ticks) + rotationDeg))
+                val ca = kotlin.math.cos(ang).toFloat()
+                val sa = kotlin.math.sin(ang).toFloat()
+                drawLine(
+                    color = hub,
+                    start = androidx.compose.ui.geometry.Offset(c.x + ca * r * 0.60f, c.y + sa * r * 0.60f),
+                    end = androidx.compose.ui.geometry.Offset(c.x + ca * r * 0.90f, c.y + sa * r * 0.90f),
+                    strokeWidth = r * 0.13f
+                )
+            }
+            // center hub
+            drawCircle(color = hub, radius = r * 0.30f, center = c)
+        }
+    }
+
+    // Emoji-only panel (mode == "emoji"). No clipboard here.
+    @Composable
+    fun EmojiPanel(
+        keyHeight: androidx.compose.ui.unit.Dp,
+        keyColor: Color,
+        textColor: Color,
+        accentColor: Color
+    ) {
+        val category by emojiCategory
+        Column(modifier = Modifier.fillMaxWidth().height(keyHeight * (maxContentRows + 1))) {
+            // Category tabs
+            Row(
+                modifier = Modifier.fillMaxWidth().height(36.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceEvenly
+            ) {
+                EMOJI_TABS.forEachIndexed { idx, tab ->
+                    val selected = idx == category
+                    Box(
+                        modifier = Modifier.weight(1f).fillMaxHeight()
+                            .semantics { contentDescription = "Emoji category $tab" }
+                            .clickable { emojiCategory.intValue = idx },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(tab, fontSize = 18.sp,
+                            color = if (selected) accentColor else textColor.copy(alpha = 0.6f))
+                    }
+                }
+            }
+            androidx.compose.material3.Divider(color = textColor.copy(alpha = 0.12f))
+
+            val emojis = EMOJI_GROUPS[category.coerceIn(0, EMOJI_GROUPS.size - 1)]
+            androidx.compose.foundation.lazy.grid.LazyVerticalGrid(
+                columns = androidx.compose.foundation.lazy.grid.GridCells.Fixed(8),
+                modifier = Modifier.fillMaxWidth().weight(1f)
+            ) {
+                items(emojis.size) { i ->
+                    val e = emojis[i]
+                    Box(
+                        modifier = Modifier.aspectRatio(1f)
+                            .clickable { performKeyFeedback(); commitText(e) },
+                        contentAlignment = Alignment.Center
+                    ) { Text(e, fontSize = 22.sp) }
+                }
+            }
+            PanelBottomBar(keyHeight, keyColor, textColor, accentColor)
+        }
+    }
+
+    // Clipboard-only panel (mode == "clipboard"). No emoji here.
+    @Composable
+    fun ClipboardPanel(
+        keyHeight: androidx.compose.ui.unit.Dp,
+        keyColor: Color,
+        textColor: Color,
+        accentColor: Color
+    ) {
+        val clips by clipHistory
+        Column(modifier = Modifier.fillMaxWidth().height(keyHeight * (maxContentRows + 1))) {
+            // Header with Clear
+            Row(
+                modifier = Modifier.fillMaxWidth().height(36.dp).padding(horizontal = 14.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Clipboard", color = textColor, fontSize = 14.sp,
+                    fontWeight = androidx.compose.ui.text.font.FontWeight.Medium, modifier = Modifier.weight(1f))
+                if (clips.isNotEmpty()) {
+                    Text("Clear", color = accentColor, fontSize = 13.sp,
+                        modifier = Modifier.clickable {
+                            KeyboardPrefs.clearClips(this@KeyoService); clipHistory.value = emptyList()
+                        })
+                }
+            }
+            androidx.compose.material3.Divider(color = textColor.copy(alpha = 0.12f))
+
+            Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
+                if (clips.isEmpty()) {
+                    Text("Copied text will appear here", color = textColor.copy(alpha = 0.5f),
+                        fontSize = 13.sp, modifier = Modifier.align(Alignment.Center))
+                } else {
+                    androidx.compose.foundation.lazy.LazyColumn(modifier = Modifier.fillMaxSize()) {
+                        items(clips.size) { i ->
+                            val clip = clips[i]
+                            Row(
+                                modifier = Modifier.fillMaxWidth()
+                                    .pointerInput(clip) {
+                                        detectTapGestures(
+                                            onTap = { performKeyFeedback(); commitText(clip) },
+                                            onLongPress = {
+                                                KeyboardPrefs.removeClip(this@KeyoService, clip)
+                                                clipHistory.value = KeyboardPrefs.getClipHistory(this@KeyoService)
+                                            }
+                                        )
+                                    }
+                                    .padding(horizontal = 14.dp, vertical = 10.dp)
+                            ) {
+                                Text(clip.replace("\n", " ").take(80),
+                                    color = textColor, fontSize = 14.sp, maxLines = 2)
+                            }
+                            androidx.compose.material3.Divider(color = textColor.copy(alpha = 0.08f))
+                        }
+                    }
+                }
+            }
+            PanelBottomBar(keyHeight, keyColor, textColor, accentColor)
+        }
+    }
+
+    // Shared space bar: tap = space, hold still = dictate, swipe = cursor slider (rotating bezel).
+    // Used in the main keyboard and in the emoji/clipboard panels so behaviour is identical.
+    @Composable
+    fun SpaceKey(
+        modifier: Modifier,
+        label: String,
+        keyColor: Color,
+        textColor: Color,
+        accentColor: Color,
+        recordColor: Color
+    ) {
+        val recording by isRecording
+        val cancelThreshold = 100f
+        var micCancelled by remember { mutableStateOf(false) }
+        var micDragX by remember { mutableFloatStateOf(0f) }
+        var spacePressed by remember { mutableStateOf(false) }
+        var cursorVisual by remember { mutableStateOf(false) }
+        var dragXVisual by remember { mutableFloatStateOf(0f) }
+
+        Box(
+            modifier = modifier
+                .height(keyHeightDp.intValue.dp)
+                .padding(horizontal = keyHGapDp.intValue.dp, vertical = keyVGapDp.intValue.dp)
+                .semantics { contentDescription = "Space. Long-press to dictate, swipe to move the cursor" }
+                .background(
+                    when {
+                        recording && micDragX < -cancelThreshold -> Color(0xFF666666)
+                        recording -> recordColor
+                        spacePressed -> lerp(keyColor, Color.Black, 0.22f)
+                        else -> keyColor
+                    },
+                    RoundedCornerShape(6.dp)
+                )
+                .pointerInput(Unit) {
+                    awaitEachGesture {
+                        val down = awaitFirstDown()
+                        var totalDragX = 0f
+                        var longPressed = false
+                        var cursorMode = false
+                        var lastStepX = 0f
+                        micCancelled = false
+                        micDragX = 0f
+                        spacePressed = true
+
+                        val longPressJob = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
+                            kotlinx.coroutines.delay(400)
+                            if (!cursorMode) {
+                                longPressed = true
+                                startVoiceRecording()
+                                performKeyFeedback()
+                            }
+                        }
+
+                        try {
+                            while (true) {
+                                val event = awaitPointerEvent()
+                                val change = event.changes.firstOrNull() ?: break
+                                if (!change.pressed) { change.consume(); break }
+                                totalDragX = change.position.x - down.position.x
+                                if (longPressed) {
+                                    micDragX = totalDragX
+                                    if (micDragX < -cancelThreshold) micCancelled = true
+                                } else {
+                                    if (!cursorMode && kotlin.math.abs(totalDragX) > 24f) {
+                                        cursorMode = true
+                                        cursorVisual = true
+                                        longPressJob.cancel()
+                                        lastStepX = totalDragX
+                                    }
+                                    if (cursorMode) {
+                                        dragXVisual = totalDragX
+                                        val stepPx = 28f
+                                        while (totalDragX - lastStepX >= stepPx) { moveCursor(false); performKeyFeedback(); lastStepX += stepPx }
+                                        while (totalDragX - lastStepX <= -stepPx) { moveCursor(true); performKeyFeedback(); lastStepX -= stepPx }
+                                    }
+                                }
+                                change.consume()
+                            }
+                        } catch (_: kotlinx.coroutines.CancellationException) {}
+
+                        longPressJob.cancel()
+                        spacePressed = false
+                        cursorVisual = false
+                        dragXVisual = 0f
+                        if (longPressed) {
+                            if (micCancelled) cancelVoiceRecording() else stopVoiceRecording()
+                            micDragX = 0f
+                        } else if (!cursorMode) {
+                            performKeyFeedback()
+                            commitChar(' ')
+                        }
+                    }
+                },
+            contentAlignment = Alignment.Center
+        ) {
+            if (recording) {
+                Text(
+                    text = if (micDragX < -cancelThreshold) "✕" else "🎤 ●",
+                    fontSize = 16.sp, color = Color.White
+                )
+            } else if (cursorVisual) {
+                val density = androidx.compose.ui.platform.LocalDensity.current
+                BoxWithConstraints(
+                    modifier = Modifier.fillMaxSize().clipToBounds().padding(horizontal = 10.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    val halfTravelPx = with(density) { (maxWidth / 2 - 16.dp).toPx() }
+                    val knobOffset = with(density) { dragXVisual.coerceIn(-halfTravelPx, halfTravelPx).toDp() }
+                    Box(
+                        modifier = Modifier.fillMaxWidth().height(4.dp)
+                            .background(textColor.copy(alpha = 0.22f), RoundedCornerShape(2.dp))
+                    )
+                    BezelKnob(
+                        rotationDeg = dragXVisual * 0.9f,
+                        ring = accentColor,
+                        hub = textColor,
+                        modifier = Modifier.offset(x = knobOffset).size(30.dp)
+                    )
+                }
+            } else {
+                Text(text = label, color = textColor, fontSize = 14.sp, textAlign = TextAlign.Center)
+                Text("🎤", fontSize = 11.sp, modifier = Modifier.align(Alignment.TopEnd).padding(3.dp))
+            }
+        }
+    }
+
+    @Composable
+    private fun PanelBottomBar(
+        keyHeight: androidx.compose.ui.unit.Dp,
+        keyColor: Color,
+        textColor: Color,
+        accentColor: Color
+    ) {
+        androidx.compose.material3.Divider(color = textColor.copy(alpha = 0.12f))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceEvenly,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            KeyButton("ABC", accentColor, Color.Black, Modifier.weight(1.4f)) { keyboardMode.value = "abc" }
+            SpaceKey(Modifier.weight(4f), "space", keyColor, textColor, accentColor, Color(currentTheme.record))
+            BackspaceKey(keyColor, textColor, Modifier.weight(1.4f))
+        }
+    }
+
+    // Language key — a monochrome globe drawn so it matches the key text colour (not a colored emoji).
+    @Composable
+    fun LanguageKey(
+        keyColor: Color,
+        iconColor: Color,
+        height: androidx.compose.ui.unit.Dp,
+        modifier: Modifier,
+        onClick: () -> Unit
+    ) {
+        val interaction = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
+        val pressed by interaction.collectIsPressedAsState()
+        Box(
+            modifier = modifier
+                .height(height)
+                .padding(horizontal = keyHGapDp.intValue.dp, vertical = keyVGapDp.intValue.dp)
+                .background(if (pressed) lerp(keyColor, Color.Black, 0.22f) else keyColor, RoundedCornerShape(6.dp))
+                .semantics { contentDescription = "Switch language" }
+                .clickable(interactionSource = interaction, indication = null) { performKeyFeedback(); onClick() },
+            contentAlignment = Alignment.Center
+        ) {
+            Canvas(modifier = Modifier.size(20.dp)) {
+                val r = size.minDimension / 2f * 0.92f
+                val cx = size.width / 2f
+                val cy = size.height / 2f
+                val sw = r * 0.10f
+                val stroke = androidx.compose.ui.graphics.drawscope.Stroke(width = sw)
+                fun off(x: Float, y: Float) = androidx.compose.ui.geometry.Offset(x, y)
+                drawCircle(color = iconColor, radius = r, center = off(cx, cy), style = stroke)
+                drawOval(
+                    color = iconColor,
+                    topLeft = off(cx - r * 0.45f, cy - r),
+                    size = androidx.compose.ui.geometry.Size(r * 0.9f, r * 2f),
+                    style = stroke
+                )
+                drawLine(iconColor, off(cx - r, cy), off(cx + r, cy), sw)
+                drawLine(iconColor, off(cx - r * 0.82f, cy - r * 0.5f), off(cx + r * 0.82f, cy - r * 0.5f), sw)
+                drawLine(iconColor, off(cx - r * 0.82f, cy + r * 0.5f), off(cx + r * 0.82f, cy + r * 0.5f), sw)
+            }
         }
     }
 
@@ -636,12 +994,16 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         modifier: Modifier,
         onClick: () -> Unit
     ) {
+        val interaction = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
+        val pressed by interaction.collectIsPressedAsState()
+        val base = if (active) accentColor else keyColor
         Box(
             modifier = modifier
                 .height(height)
                 .padding(horizontal = keyHGapDp.intValue.dp, vertical = keyVGapDp.intValue.dp)
-                .background(if (active) accentColor else keyColor, RoundedCornerShape(6.dp))
-                .clickable {
+                .background(if (pressed) lerp(base, Color.Black, 0.22f) else base, RoundedCornerShape(6.dp))
+                .semantics { contentDescription = "Shift" }
+                .clickable(interactionSource = interaction, indication = null) {
                     performKeyFeedback()
                     onClick()
                 },
@@ -675,8 +1037,13 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             modifier = modifier
                 .height(bsHeight)
                 .padding(horizontal = keyHGapDp.intValue.dp, vertical = keyVGapDp.intValue.dp)
+                .semantics { contentDescription = "Delete" }
                 .background(
-                    if (swipedClear) Color(0xFFFF5555) else bgColor,
+                    when {
+                        swipedClear -> Color(0xFFFF5555)
+                        isPressed -> lerp(bgColor, Color.Black, 0.22f)
+                        else -> bgColor
+                    },
                     RoundedCornerShape(6.dp)
                 )
                 .pointerInput(Unit) {
@@ -781,6 +1148,55 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         "$" to listOf("€","£","¥","₽","₹")
     )
 
+    // Emoji panel categories (clipboard is now a separate panel).
+    private val EMOJI_TABS = listOf("😀", "🐶", "🍕", "❤️", "✋")
+    private val EMOJI_GROUPS = listOf(
+        // Smileys
+        listOf("😀","😃","😄","😁","😆","😅","😂","🤣","😊","🙂","🙃","😉","😌","😍","🥰","😘",
+               "😋","😛","😜","🤪","😝","🤗","🤔","😐","😶","😏","😒","🙄","😬","😴","😎","🥳",
+               "😢","😭","😤","😠","😡","🤯","😱","😳","🥺","😇","🤤","😞","😔","🤥","🤧","🤒"),
+        // Animals
+        listOf("🐶","🐱","🐭","🐹","🐰","🦊","🐻","🐼","🐨","🐯","🦁","🐮","🐷","🐸","🐵","🐔",
+               "🐧","🐦","🐤","🦆","🦅","🦉","🐺","🐗","🐴","🦄","🐝","🐛","🦋","🐌","🐞","🐢",
+               "🐍","🐙","🐠","🐬","🐳","🦈","🐊","🐅","🦓","🦍","🐘","🐫","🦒","🦘","🐓","🦌"),
+        // Food
+        listOf("🍏","🍎","🍐","🍊","🍋","🍌","🍉","🍇","🍓","🍈","🍒","🍑","🥭","🍍","🥥","🥝",
+               "🍅","🥑","🍆","🥔","🥕","🌽","🌶","🥒","🥬","🥦","🧄","🧅","🍄","🥜","🍞","🥐",
+               "🧀","🍕","🍔","🍟","🌭","🌮","🌯","🍣","🍦","🍩","🍪","🎂","🍰","☕","🍺","🍷"),
+        // Hearts & symbols
+        listOf("❤️","🧡","💛","💚","💙","💜","🖤","🤍","🤎","💔","❣️","💕","💞","💓","💗","💖",
+               "💘","💝","✨","⭐","🌟","💫","⚡","🔥","💯","✅","❌","❓","❗","💤","🎉","🎊",
+               "🎁","🏆","🎯","🔔","💡","💰","📌","🔒","🔑","⏰","📅","📈","🌈","☀️","🌙","⛄"),
+        // Gestures
+        listOf("👋","🤚","✋","🖐","🖖","👌","🤌","🤏","✌️","🤞","🤟","🤘","🤙","👈","👉","👆",
+               "👇","☝️","👍","👎","✊","👊","🤛","🤜","👏","🙌","👐","🤲","🙏","💪","🦵","🦶",
+               "👂","👃","👀","🧠","👶","🧒","👦","👧","🧑","👨","👩","🧓","👴","👵","🙋","🤷")
+    )
+
+    // Spoken label for TalkBack / accessibility services.
+    private fun keyDescription(label: String): String = when (label) {
+        "⌫" -> "Delete"
+        "↵" -> "Enter"
+        "✓" -> "Done"
+        "➤" -> "Send"
+        "🔍" -> "Search"
+        "123" -> "Numbers and symbols"
+        "ABC" -> "Letters"
+        "!?#" -> "More symbols"
+        "🔢" -> "Number pad"
+        "🌐" -> "Switch language"
+        "🤖" -> "AI assistant"
+        "⬆" -> "Shift"
+        "😀" -> "Emoji"
+        "📋" -> "Clipboard"
+        "⚙" -> "Settings"
+        "↶" -> "Undo"
+        "↷" -> "Redo"
+        "⬚" -> "Select all"
+        " " -> "Space"
+        else -> label
+    }
+
     @Composable
     fun KeyButton(
         label: String,
@@ -798,11 +1214,12 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         val hasAlts = alts != null && alts.isNotEmpty()
 
         Box(modifier = modifier.height(height).padding(horizontal = keyHGapDp.intValue.dp, vertical = keyVGapDp.intValue.dp)) {
-            // Main key
+            // Main key — darkens instantly while pressed for a tactile "button" feel
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(bgColor, RoundedCornerShape(6.dp))
+                    .semantics { contentDescription = keyDescription(label) }
+                    .background(if (pressed) lerp(bgColor, Color.Black, 0.22f) else bgColor, RoundedCornerShape(6.dp))
                     .pointerInput(label) {
                         awaitEachGesture {
                             val down = awaitFirstDown()
@@ -949,6 +1366,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     }
 
     private fun scheduleSpellcheck() {
+        if (secureField) return  // never send text from password/incognito fields
         if (!KeyboardPrefs.isSpellcheckEnabled(this)) return
         spellcheckRunnable?.let { spellcheckHandler.removeCallbacks(it) }
         spellcheckRunnable = Runnable { runSpellcheck() }
@@ -1027,6 +1445,27 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         KeyboardPrefs.setCurrentLanguage(this, next)
     }
 
+    // Send a Ctrl(+Shift)+key combo (used for undo/redo). Works in editors that support it.
+    private fun sendCtrlKey(keyCode: Int, withShift: Boolean = false) {
+        val ic = currentInputConnection ?: return
+        var meta = android.view.KeyEvent.META_CTRL_ON or android.view.KeyEvent.META_CTRL_LEFT_ON
+        if (withShift) meta = meta or android.view.KeyEvent.META_SHIFT_ON or android.view.KeyEvent.META_SHIFT_LEFT_ON
+        ic.sendKeyEvent(android.view.KeyEvent(0, 0, android.view.KeyEvent.ACTION_DOWN, keyCode, 0, meta))
+        ic.sendKeyEvent(android.view.KeyEvent(0, 0, android.view.KeyEvent.ACTION_UP, keyCode, 0, meta))
+    }
+
+    private fun selectAll() {
+        currentInputConnection?.performContextMenuAction(android.R.id.selectAll)
+    }
+
+    // Move the text cursor one character left/right (space-bar swipe).
+    private fun moveCursor(left: Boolean) {
+        val ic = currentInputConnection ?: return
+        val code = if (left) android.view.KeyEvent.KEYCODE_DPAD_LEFT else android.view.KeyEvent.KEYCODE_DPAD_RIGHT
+        ic.sendKeyEvent(android.view.KeyEvent(android.view.KeyEvent.ACTION_DOWN, code))
+        ic.sendKeyEvent(android.view.KeyEvent(android.view.KeyEvent.ACTION_UP, code))
+    }
+
     // Open Keyo settings directly from the keyboard (long-press the period and pick ⚙).
     private fun openSettings() {
         try {
@@ -1065,6 +1504,11 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
 
     private fun startVoiceRecording() {
         try {
+            if (secureField) {
+                statusText.value = "🔒 Voice is off in password fields"
+                handler.postDelayed({ if (statusText.value.startsWith("🔒")) statusText.value = "" }, 1500)
+                return
+            }
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
                 != PackageManager.PERMISSION_GRANTED) {
                 statusText.value = "⚠ Mic permission needed — open app settings"
@@ -1149,6 +1593,11 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
 
     private fun startAIRecording() {
         try {
+            if (secureField) {
+                statusText.value = "🔒 AI is off in password fields"
+                handler.postDelayed({ if (statusText.value.startsWith("🔒")) statusText.value = "" }, 1500)
+                return
+            }
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
                 != PackageManager.PERMISSION_GRANTED) {
                 statusText.value = "⚠ Mic permission needed"
