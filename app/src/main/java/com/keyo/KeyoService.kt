@@ -742,21 +742,20 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     ) {
         val clips by clipHistory
         Column(modifier = Modifier.fillMaxWidth().height(keyHeight * (maxContentRows + 1))) {
-            // Header with Clear
-            Row(
-                modifier = Modifier.fillMaxWidth().height(36.dp).padding(horizontal = 14.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text("Clipboard", color = textColor, fontSize = 14.sp,
-                    fontWeight = androidx.compose.ui.text.font.FontWeight.Medium, modifier = Modifier.weight(1f))
-                if (clips.isNotEmpty()) {
+            // Slim "Clear" row, only when there's something to clear (no redundant title)
+            if (clips.isNotEmpty()) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().height(30.dp).padding(horizontal = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.End
+                ) {
                     Text("Clear", color = accentColor, fontSize = 13.sp,
                         modifier = Modifier.clickable {
                             KeyboardPrefs.clearClips(this@KeyoService); clipHistory.value = emptyList()
                         })
                 }
+                androidx.compose.material3.Divider(color = textColor.copy(alpha = 0.12f))
             }
-            androidx.compose.material3.Divider(color = textColor.copy(alpha = 0.12f))
 
             Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
                 if (clips.isEmpty()) {
