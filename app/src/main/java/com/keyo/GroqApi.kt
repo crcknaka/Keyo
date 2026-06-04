@@ -100,6 +100,76 @@ object GroqApi {
         })
     }
 
+    /** Rewrite/transform text per an instruction (Rewrite menu). Returns only the new text. */
+    fun rewrite(text: String, instruction: String, callback: (String?, String?) -> Unit) {
+        val sys = "You are a precise text-editing tool. Apply the user's instruction to their text and " +
+            "output ONLY the resulting text — no explanations, no quotes, no preamble. " +
+            "Keep the original language unless the instruction says to translate. " +
+            "NEVER output HTML or markdown tags; for emphasis use markers ⟦b⟧bold⟦/b⟧ and ⟦i⟧italic⟦/i⟧."
+        val json = JSONObject().apply {
+            put("model", model)
+            put("messages", JSONArray().apply {
+                put(JSONObject().apply { put("role", "system"); put("content", sys) })
+                put(JSONObject().apply { put("role", "user"); put("content", "Instruction: $instruction\n\nText:\n$text") })
+            })
+            put("temperature", 0.4)
+            put("max_tokens", 2048)
+        }
+        val request = Request.Builder()
+            .url("https://api.groq.com/openai/v1/chat/completions")
+            .addHeader("Authorization", "Bearer $apiKey")
+            .addHeader("Content-Type", "application/json")
+            .post(json.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+        client.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) = callback(null, "Network error: ${e.message}")
+            override fun onResponse(call: Call, response: Response) {
+                val body = response.body?.string()
+                if (response.isSuccessful && body != null) {
+                    try {
+                        val content = JSONObject(body).getJSONArray("choices").getJSONObject(0)
+                            .getJSONObject("message").getString("content")
+                        callback(content.trim(), null)
+                    } catch (e: Exception) { callback(null, "Parse error: ${e.message}") }
+                } else callback(null, "API error ${response.code}")
+            }
+        })
+    }
+
+    /** Find emoji matching a query (any language). Returns a string of emoji characters. */
+    fun suggestEmojis(query: String, callback: (String?, String?) -> Unit) {
+        val sys = "You are an emoji search engine. For the given word or phrase (any language), reply with " +
+            "ONLY relevant emoji characters (10-30 of them), most relevant first. No words, no explanations."
+        val json = JSONObject().apply {
+            put("model", "llama-3.1-8b-instant")
+            put("messages", JSONArray().apply {
+                put(JSONObject().apply { put("role", "system"); put("content", sys) })
+                put(JSONObject().apply { put("role", "user"); put("content", query) })
+            })
+            put("temperature", 0.3)
+            put("max_tokens", 200)
+        }
+        val request = Request.Builder()
+            .url("https://api.groq.com/openai/v1/chat/completions")
+            .addHeader("Authorization", "Bearer $apiKey")
+            .addHeader("Content-Type", "application/json")
+            .post(json.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+        client.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) = callback(null, e.message)
+            override fun onResponse(call: Call, response: Response) {
+                val body = response.body?.string()
+                if (response.isSuccessful && body != null) {
+                    try {
+                        val content = JSONObject(body).getJSONArray("choices").getJSONObject(0)
+                            .getJSONObject("message").getString("content")
+                        callback(content.trim(), null)
+                    } catch (e: Exception) { callback(null, e.message) }
+                } else callback(null, "API error ${response.code}")
+            }
+        })
+    }
+
     fun executeTask(task: String, context: Context? = null, callback: (String?, String?) -> Unit) {
         // Clear history if inactive for too long
         val now = System.currentTimeMillis()
@@ -119,7 +189,8 @@ Rules:
 - You can chain: use a tool AND respond with text.
 - When using tools, after getting the result, provide a brief human-friendly summary.
 - Reply in the same language the user spoke in (English, Russian, or Latvian).
-- Be concise and natural."""
+- Be concise and natural.
+- NEVER output HTML or markdown tags (no <b>, **, etc.). For emphasis use these exact markers: ⟦b⟧bold text⟦/b⟧ for bold and ⟦i⟧italic text⟦/i⟧ for italic. The keyboard converts them to real formatting."""
 
         val messages = JSONArray().apply {
             put(JSONObject().apply {

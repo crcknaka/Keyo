@@ -22,6 +22,11 @@ object KeyboardPrefs {
     private const val KEY_API_KEY = "groq_api_key"
     private const val KEY_CLIPS = "clip_history"
     private const val MAX_CLIPS = 25
+    private const val KEY_PINNED = "pinned_clips"
+    private const val KEY_PHRASES = "quick_phrases"
+    private const val KEY_RECENT_EMOJI = "recent_emoji"
+    private const val KEY_DOUBLE_SPACE = "double_space_period"
+    private const val KEY_AUTO_CAP = "auto_capitalize"
 
     // Defaults / ranges for the visual size editor.
     const val DEFAULT_KEY_HEIGHT = 48
@@ -192,6 +197,52 @@ object KeyboardPrefs {
     }
 
     fun clearClips(context: Context) = prefs(context).edit().remove(KEY_CLIPS).apply()
+
+    // --- Generic JSON string-list storage (phrases, recents, pins) ---
+    private fun getList(context: Context, key: String): List<String> {
+        val raw = prefs(context).getString(key, "[]") ?: "[]"
+        return try { val a = JSONArray(raw); List(a.length()) { a.getString(it) } } catch (_: Exception) { emptyList() }
+    }
+    private fun putList(context: Context, key: String, list: List<String>) {
+        val a = JSONArray(); list.forEach { a.put(it) }
+        prefs(context).edit().putString(key, a.toString()).apply()
+    }
+
+    // Pinned clips (kept above history, never auto-evicted)
+    fun getPinned(context: Context) = getList(context, KEY_PINNED)
+    fun isPinned(context: Context, text: String) = getPinned(context).contains(text)
+    fun togglePin(context: Context, text: String) {
+        val cur = getPinned(context).toMutableList()
+        if (!cur.remove(text)) cur.add(0, text)
+        putList(context, KEY_PINNED, cur)
+    }
+
+    // Quick phrases / templates (user-defined)
+    fun getPhrases(context: Context) = getList(context, KEY_PHRASES)
+    fun addPhrase(context: Context, text: String) {
+        if (text.isBlank()) return
+        val cur = getPhrases(context).toMutableList()
+        cur.remove(text); cur.add(text)
+        putList(context, KEY_PHRASES, cur)
+    }
+    fun removePhrase(context: Context, text: String) {
+        putList(context, KEY_PHRASES, getPhrases(context).filter { it != text })
+    }
+
+    // Recently-used emoji
+    fun getRecentEmoji(context: Context) = getList(context, KEY_RECENT_EMOJI)
+    fun addRecentEmoji(context: Context, e: String) {
+        val cur = getRecentEmoji(context).toMutableList()
+        cur.remove(e); cur.add(0, e)
+        while (cur.size > 32) cur.removeAt(cur.size - 1)
+        putList(context, KEY_RECENT_EMOJI, cur)
+    }
+
+    // Typing helpers
+    fun isDoubleSpacePeriod(context: Context) = prefs(context).getBoolean(KEY_DOUBLE_SPACE, true)
+    fun setDoubleSpacePeriod(context: Context, v: Boolean) = prefs(context).edit().putBoolean(KEY_DOUBLE_SPACE, v).apply()
+    fun isAutoCap(context: Context) = prefs(context).getBoolean(KEY_AUTO_CAP, true)
+    fun setAutoCap(context: Context, v: Boolean) = prefs(context).edit().putBoolean(KEY_AUTO_CAP, v).apply()
 
     private fun saveClips(context: Context, list: List<String>) {
         val arr = JSONArray()

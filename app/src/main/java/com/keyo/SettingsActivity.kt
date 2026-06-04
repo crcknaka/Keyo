@@ -204,6 +204,8 @@ class SettingsActivity : ComponentActivity() {
                 SectionLabel("Typing feel")
                 var haptic by remember { mutableStateOf(KeyboardPrefs.getHapticStrength(this@SettingsActivity)) }
                 var sound by remember { mutableStateOf(KeyboardPrefs.isSoundEnabled(this@SettingsActivity)) }
+                var dblSpace by remember { mutableStateOf(KeyboardPrefs.isDoubleSpacePeriod(this@SettingsActivity)) }
+                var autoCap by remember { mutableStateOf(KeyboardPrefs.isAutoCap(this@SettingsActivity)) }
                 Group {
                     ChoiceRow("Haptics", KeyboardPrefs.HAPTIC_LEVELS, haptic) {
                         haptic = it; KeyboardPrefs.setHapticStrength(this@SettingsActivity, it)
@@ -211,6 +213,61 @@ class SettingsActivity : ComponentActivity() {
                     Divider(color = divider, thickness = 1.dp)
                     ToggleRow("Key sound", "Play a click on every key", sound) {
                         sound = it; KeyboardPrefs.setSoundEnabled(this@SettingsActivity, it)
+                    }
+                    Divider(color = divider, thickness = 1.dp)
+                    ToggleRow("Double-space → period", "Two spaces insert \". \"", dblSpace) {
+                        dblSpace = it; KeyboardPrefs.setDoubleSpacePeriod(this@SettingsActivity, it)
+                    }
+                    Divider(color = divider, thickness = 1.dp)
+                    ToggleRow("Auto-capitalize", "Capitalize the start of sentences", autoCap) {
+                        autoCap = it; KeyboardPrefs.setAutoCap(this@SettingsActivity, it)
+                    }
+                }
+
+                // ===== Quick phrases =====
+                var phrases by remember { mutableStateOf(KeyboardPrefs.getPhrases(this@SettingsActivity)) }
+                var newPhrase by remember { mutableStateOf("") }
+                ExpandableSection("Quick phrases", "${phrases.size} saved — tap the ★ key to insert") {
+                    Column(Modifier.padding(12.dp)) {
+                        phrases.forEach { p ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(p.replace("\n", " ").take(80), color = textPrimary, fontSize = 14.sp,
+                                    maxLines = 2, modifier = Modifier.weight(1f).padding(end = 8.dp))
+                                Text("✕", color = textMuted, fontSize = 16.sp,
+                                    modifier = Modifier.clickable {
+                                        KeyboardPrefs.removePhrase(this@SettingsActivity, p)
+                                        phrases = KeyboardPrefs.getPhrases(this@SettingsActivity)
+                                    })
+                            }
+                            Divider(color = divider, thickness = 1.dp)
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedTextField(
+                            value = newPhrase,
+                            onValueChange = { newPhrase = it },
+                            placeholder = { Text("New phrase or template…", color = textFaint) },
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedTextColor = textPrimary, unfocusedTextColor = textPrimary,
+                                focusedBorderColor = accent, unfocusedBorderColor = border, cursorColor = accent
+                            )
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        Button(
+                            onClick = {
+                                if (newPhrase.isNotBlank()) {
+                                    KeyboardPrefs.addPhrase(this@SettingsActivity, newPhrase.trim())
+                                    phrases = KeyboardPrefs.getPhrases(this@SettingsActivity)
+                                    newPhrase = ""
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(10.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = accent)
+                        ) { Text("Add phrase", color = Color.White, fontWeight = FontWeight.SemiBold) }
                     }
                 }
 

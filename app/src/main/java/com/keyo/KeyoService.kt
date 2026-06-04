@@ -14,13 +14,16 @@ import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.graphics.Path
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.lerp
@@ -77,6 +80,8 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private var secureField = false
 
     private var clipHistory = mutableStateOf<List<String>>(emptyList())
+    private var pinnedClips = mutableStateOf<List<String>>(emptyList())
+    private var phrasesState = mutableStateOf<List<String>>(emptyList())
     private var emojiCategory = mutableIntStateOf(0)        // emoji panel category
     // Dynamic top toolbar: a freshly-copied snippet shows as a quick-paste chip for a while.
     private var showClipChip = mutableStateOf(false)
@@ -122,6 +127,9 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         themeId.value = KeyboardPrefs.getTheme(this)
         enabledLangs.value = KeyboardPrefs.getEnabledLanguages(this)
         clipHistory.value = KeyboardPrefs.getClipHistory(this)
+        pinnedClips.value = KeyboardPrefs.getPinned(this)
+        recentEmoji.value = KeyboardPrefs.getRecentEmoji(this)
+        phrasesState.value = KeyboardPrefs.getPhrases(this)
     }
 
     // Max content rows any mode shows — keeps the keyboard a fixed height so it never
@@ -230,6 +238,9 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         val noLearning = ((info?.imeOptions ?: 0) and
             android.view.inputmethod.EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING) != 0
         secureField = isPassword || noLearning
+
+        isShift.value = false
+        maybeAutoCapitalize()
     }
 
     override fun onEvaluateFullscreenMode(): Boolean {
@@ -288,6 +299,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 EmojiPanel(keyHeight, keyColor, textColor, accentColor)
             } else if (mode == "clipboard") {
                 ClipboardPanel(keyHeight, keyColor, textColor, accentColor)
+            } else if (mode == "rewrite") {
+                RewritePanel(keyHeight, keyColor, textColor, accentColor)
+            } else if (mode == "phrases") {
+                PhrasesPanel(keyHeight, keyColor, textColor, accentColor)
             } else {
 
             // Key content area — fixed height (maxContentRows tall) so switching between
@@ -633,10 +648,18 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 }
                 else -> Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(2.dp)
+                    horizontalArrangement = Arrangement.spacedBy(2.dp),
+                    modifier = Modifier.horizontalScroll(rememberScrollState())
                 ) {
-                    ToolbarIcon("😀", textColor) { emojiCategory.intValue = 0; keyboardMode.value = "emoji" }
+                    Box(
+                        modifier = Modifier.size(40.dp)
+                            .semantics { contentDescription = "Rewrite / improve text" }
+                            .clickable { keyboardMode.value = "rewrite" },
+                        contentAlignment = Alignment.Center
+                    ) { SparkleGlyph(accentColor, Modifier.size(20.dp)) }
+                    ToolbarIcon("😀", textColor) { emojiCategory.intValue = if (recentEmoji.value.isEmpty()) 1 else 0; keyboardMode.value = "emoji" }
                     ToolbarIcon("📋", textColor) { keyboardMode.value = "clipboard" }
+                    ToolbarIcon("★", textColor) { keyboardMode.value = "phrases" }
                     ToolbarIcon("↶", textColor) { performKeyFeedback(); sendCtrlKey(android.view.KeyEvent.KEYCODE_Z) }
                     ToolbarIcon("↷", textColor) { performKeyFeedback(); sendCtrlKey(android.view.KeyEvent.KEYCODE_Z, withShift = true) }
                     ToolbarIcon("⬚", textColor) { performKeyFeedback(); selectAll() }
@@ -692,40 +715,72 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         accentColor: Color
     ) {
         val category by emojiCategory
+        val recent by recentEmoji
+        var suggestions by remember { mutableStateOf<List<String>>(emptyList()) }
+        var suggesting by remember { mutableStateOf(false) }
         Column(modifier = Modifier.fillMaxWidth().height(keyHeight * (maxContentRows + 1))) {
-            // Category tabs
+            // Category tabs + AI "suggest emoji for my text" button
             Row(
                 modifier = Modifier.fillMaxWidth().height(36.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceEvenly
+                verticalAlignment = Alignment.CenterVertically
             ) {
                 EMOJI_TABS.forEachIndexed { idx, tab ->
-                    val selected = idx == category
+                    val selected = idx == category && suggestions.isEmpty()
                     Box(
                         modifier = Modifier.weight(1f).fillMaxHeight()
                             .semantics { contentDescription = "Emoji category $tab" }
-                            .clickable { emojiCategory.intValue = idx },
+                            .clickable { emojiCategory.intValue = idx; suggestions = emptyList() },
                         contentAlignment = Alignment.Center
                     ) {
                         Text(tab, fontSize = 18.sp,
                             color = if (selected) accentColor else textColor.copy(alpha = 0.6f))
                     }
                 }
+                // Suggest from current text
+                Box(
+                    modifier = Modifier.weight(1f).fillMaxHeight()
+                        .semantics { contentDescription = "Suggest emoji for my text" }
+                        .clickable {
+                            val t = currentTargetText()
+                            if (t.isNotBlank()) {
+                                suggesting = true
+                                GroqApi.suggestEmojis(t) { res, _ ->
+                                    handler.post { suggesting = false; suggestions = splitEmojis(res ?: "") }
+                                }
+                            }
+                        },
+                    contentAlignment = Alignment.Center
+                ) { SparkleGlyph(if (suggestions.isNotEmpty()) accentColor else textColor.copy(alpha = 0.6f), Modifier.size(17.dp)) }
             }
             androidx.compose.material3.Divider(color = textColor.copy(alpha = 0.12f))
 
-            val emojis = EMOJI_GROUPS[category.coerceIn(0, EMOJI_GROUPS.size - 1)]
-            androidx.compose.foundation.lazy.grid.LazyVerticalGrid(
-                columns = androidx.compose.foundation.lazy.grid.GridCells.Fixed(8),
-                modifier = Modifier.fillMaxWidth().weight(1f)
-            ) {
-                items(emojis.size) { i ->
-                    val e = emojis[i]
-                    Box(
-                        modifier = Modifier.aspectRatio(1f)
-                            .clickable { performKeyFeedback(); commitText(e) },
-                        contentAlignment = Alignment.Center
-                    ) { Text(e, fontSize = 22.sp) }
+            val emojis = when {
+                suggestions.isNotEmpty() -> suggestions
+                category == 0 -> recent.ifEmpty { EMOJI_GROUPS[0] }
+                else -> EMOJI_GROUPS[(category - 1).coerceIn(0, EMOJI_GROUPS.size - 1)]
+            }
+            Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
+                if (suggesting) {
+                    Text("✨ Finding emoji…", color = textColor.copy(alpha = 0.6f),
+                        fontSize = 13.sp, modifier = Modifier.align(Alignment.Center))
+                } else {
+                    androidx.compose.foundation.lazy.grid.LazyVerticalGrid(
+                        columns = androidx.compose.foundation.lazy.grid.GridCells.Fixed(8),
+                        modifier = Modifier.fillMaxSize()
+                    ) {
+                        items(emojis.size) { i ->
+                            val e = emojis[i]
+                            Box(
+                                modifier = Modifier.aspectRatio(1f)
+                                    .clickable {
+                                        performKeyFeedback(); commitText(e)
+                                        KeyboardPrefs.addRecentEmoji(this@KeyoService, e)
+                                        recentEmoji.value = KeyboardPrefs.getRecentEmoji(this@KeyoService)
+                                    },
+                                contentAlignment = Alignment.Center
+                            ) { Text(e, fontSize = 22.sp) }
+                        }
+                    }
                 }
             }
             PanelBottomBar(keyHeight, keyColor, textColor, accentColor)
@@ -741,8 +796,11 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         accentColor: Color
     ) {
         val clips by clipHistory
+        val pins by pinnedClips
+        // Pinned items first, then recent history (excluding any that are pinned).
+        val combined = pins.map { it to true } + clips.filter { it !in pins }.map { it to false }
         Column(modifier = Modifier.fillMaxWidth().height(keyHeight * (maxContentRows + 1))) {
-            // Slim "Clear" row, only when there's something to clear (no redundant title)
+            // Slim "Clear" row (clears unpinned history), only when there's history
             if (clips.isNotEmpty()) {
                 Row(
                     modifier = Modifier.fillMaxWidth().height(30.dp).padding(horizontal = 14.dp),
@@ -758,27 +816,82 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             }
 
             Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
-                if (clips.isEmpty()) {
+                if (combined.isEmpty()) {
                     Text("Copied text will appear here", color = textColor.copy(alpha = 0.5f),
                         fontSize = 13.sp, modifier = Modifier.align(Alignment.Center))
                 } else {
                     androidx.compose.foundation.lazy.LazyColumn(modifier = Modifier.fillMaxSize()) {
-                        items(clips.size) { i ->
-                            val clip = clips[i]
+                        items(combined.size) { i ->
+                            val (clip, pinned) = combined[i]
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Box(
+                                    modifier = Modifier.weight(1f)
+                                        .pointerInput(clip) {
+                                            detectTapGestures(
+                                                onTap = { performKeyFeedback(); commitText(clip) },
+                                                onLongPress = {
+                                                    if (!pinned) {
+                                                        KeyboardPrefs.removeClip(this@KeyoService, clip)
+                                                        clipHistory.value = KeyboardPrefs.getClipHistory(this@KeyoService)
+                                                    }
+                                                }
+                                            )
+                                        }
+                                        .padding(start = 14.dp, top = 10.dp, bottom = 10.dp, end = 6.dp)
+                                ) {
+                                    Text(clip.replace("\n", " ").take(80),
+                                        color = textColor, fontSize = 14.sp, maxLines = 2)
+                                }
+                                // Pin toggle
+                                Box(
+                                    modifier = Modifier.size(40.dp)
+                                        .semantics { contentDescription = if (pinned) "Unpin" else "Pin" }
+                                        .clickable {
+                                            KeyboardPrefs.togglePin(this@KeyoService, clip)
+                                            pinnedClips.value = KeyboardPrefs.getPinned(this@KeyoService)
+                                        },
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text("📌", fontSize = 15.sp, modifier = Modifier.alpha(if (pinned) 1f else 0.3f))
+                                }
+                            }
+                            androidx.compose.material3.Divider(color = textColor.copy(alpha = 0.08f))
+                        }
+                    }
+                }
+            }
+            PanelBottomBar(keyHeight, keyColor, textColor, accentColor)
+        }
+    }
+
+    // Quick phrases panel (mode == "phrases"). Tap a saved phrase to insert it.
+    @Composable
+    fun PhrasesPanel(
+        keyHeight: androidx.compose.ui.unit.Dp,
+        keyColor: Color,
+        textColor: Color,
+        accentColor: Color
+    ) {
+        val phrases by phrasesState
+        Column(modifier = Modifier.fillMaxWidth().height(keyHeight * (maxContentRows + 1))) {
+            Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
+                if (phrases.isEmpty()) {
+                    Text("Add quick phrases in Settings → Quick phrases",
+                        color = textColor.copy(alpha = 0.5f), fontSize = 13.sp,
+                        modifier = Modifier.align(Alignment.Center).padding(16.dp))
+                } else {
+                    androidx.compose.foundation.lazy.LazyColumn(modifier = Modifier.fillMaxSize()) {
+                        items(phrases.size) { i ->
+                            val p = phrases[i]
                             Row(
                                 modifier = Modifier.fillMaxWidth()
-                                    .pointerInput(clip) {
-                                        detectTapGestures(
-                                            onTap = { performKeyFeedback(); commitText(clip) },
-                                            onLongPress = {
-                                                KeyboardPrefs.removeClip(this@KeyoService, clip)
-                                                clipHistory.value = KeyboardPrefs.getClipHistory(this@KeyoService)
-                                            }
-                                        )
-                                    }
-                                    .padding(horizontal = 14.dp, vertical = 10.dp)
+                                    .clickable { performKeyFeedback(); commitText(formatEmphasis(p)) }
+                                    .padding(horizontal = 14.dp, vertical = 12.dp)
                             ) {
-                                Text(clip.replace("\n", " ").take(80),
+                                Text(p.replace("\n", " ").take(100),
                                     color = textColor, fontSize = 14.sp, maxLines = 2)
                             }
                             androidx.compose.material3.Divider(color = textColor.copy(alpha = 0.08f))
@@ -919,6 +1032,94 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 MicGlyph(textColor, Modifier.align(Alignment.TopEnd).padding(3.dp).size(14.dp))
             }
         }
+    }
+
+    // (label, instruction, submenuKey) — instruction null means it opens a submenu.
+    private val REWRITE_MAIN = listOf(
+        Triple<String, String?, String?>("Fix grammar & spelling", "Fix spelling and grammar; keep the meaning and language.", null),
+        Triple<String, String?, String?>("Make shorter", "Make it shorter and more concise; keep the language.", null),
+        Triple<String, String?, String?>("Make longer", "Expand it with a little more detail; keep the language.", null),
+        Triple<String, String?, String?>("Professional", "Rewrite in a professional, polished tone; keep the language.", null),
+        Triple<String, String?, String?>("Friendly", "Rewrite in a warm, friendly tone; keep the language.", null),
+        Triple<String, String?, String?>("Bullet points", "Reformat as a short bullet-point list; keep the language.", null),
+        Triple<String, String?, String?>("Add emoji", "Add a few fitting emoji without changing the wording; keep the language.", null),
+        Triple<String, String?, String?>("Tone…", null, "tone"),
+        Triple<String, String?, String?>("Translate…", null, "translate")
+    )
+    private val REWRITE_TONE = listOf(
+        Triple<String, String?, String?>("Formal", "Rewrite in a formal tone; keep the language.", null),
+        Triple<String, String?, String?>("Confident", "Rewrite in a confident, assertive tone; keep the language.", null),
+        Triple<String, String?, String?>("Humorous", "Rewrite with light humor; keep the language.", null),
+        Triple<String, String?, String?>("Sassy / bold", "Rewrite in a bold, cheeky, sassy tone; keep the language.", null),
+        Triple<String, String?, String?>("Empathetic", "Rewrite in an empathetic, caring tone; keep the language.", null),
+        Triple<String, String?, String?>("Casual", "Rewrite in a relaxed, casual tone; keep the language.", null),
+        Triple<String, String?, String?>("Poetic", "Rewrite in a poetic style; keep the language.", null)
+    )
+    private val REWRITE_TRANSLATE = listOf("English", "Russian", "Latvian", "German", "Spanish", "French", "Ukrainian", "Chinese")
+        .map { Triple<String, String?, String?>("→ $it", "Translate the text to $it. Output only the translation.", null) }
+
+    // AI rewrite panel (mode == "rewrite").
+    @Composable
+    fun RewritePanel(
+        keyHeight: androidx.compose.ui.unit.Dp,
+        keyColor: Color,
+        textColor: Color,
+        accentColor: Color
+    ) {
+        var sub by remember { mutableStateOf("") }
+        Column(modifier = Modifier.fillMaxWidth().height(keyHeight * (maxContentRows + 1))) {
+            // Formatting chips + back
+            Row(
+                modifier = Modifier.fillMaxWidth().height(40.dp).padding(horizontal = 10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                FormatChip("𝐁", textColor, keyColor) { applyFormatToSelection(true) }
+                Spacer(Modifier.width(8.dp))
+                FormatChip("𝐼", textColor, keyColor) { applyFormatToSelection(false) }
+                Spacer(Modifier.weight(1f))
+                if (sub.isNotEmpty()) {
+                    Text("‹ Back", color = accentColor, fontSize = 14.sp,
+                        modifier = Modifier.clickable { sub = "" })
+                }
+            }
+            androidx.compose.material3.Divider(color = textColor.copy(alpha = 0.12f))
+
+            val items = when (sub) {
+                "tone" -> REWRITE_TONE
+                "translate" -> REWRITE_TRANSLATE
+                else -> REWRITE_MAIN
+            }
+            androidx.compose.foundation.lazy.LazyColumn(modifier = Modifier.fillMaxWidth().weight(1f)) {
+                items(items.size) { i ->
+                    val (label, instr, subKey) = items[i]
+                    Row(
+                        modifier = Modifier.fillMaxWidth()
+                            .clickable {
+                                if (subKey != null) sub = subKey
+                                else if (instr != null) runRewrite(instr)
+                            }
+                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(label, color = textColor, fontSize = 15.sp, modifier = Modifier.weight(1f))
+                        if (subKey != null) Text("›", color = accentColor, fontSize = 18.sp)
+                    }
+                    androidx.compose.material3.Divider(color = textColor.copy(alpha = 0.06f))
+                }
+            }
+            PanelBottomBar(keyHeight, keyColor, textColor, accentColor)
+        }
+    }
+
+    @Composable
+    private fun FormatChip(label: String, textColor: Color, keyColor: Color, onClick: () -> Unit) {
+        Box(
+            modifier = Modifier.height(30.dp).widthIn(min = 46.dp)
+                .background(keyColor, RoundedCornerShape(8.dp))
+                .clickable { onClick() }
+                .padding(horizontal = 14.dp),
+            contentAlignment = Alignment.Center
+        ) { Text(label, color = textColor, fontSize = 16.sp) }
     }
 
     @Composable
@@ -1290,8 +1491,9 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         "$" to listOf("€","£","¥","₽","₹")
     )
 
-    // Emoji panel categories (clipboard is now a separate panel).
-    private val EMOJI_TABS = listOf("😀", "🐶", "🍕", "❤️", "✋")
+    // Emoji panel categories. Tab 0 = recently used; 1..n map to EMOJI_GROUPS.
+    private val EMOJI_TABS = listOf("🕘", "😀", "🐶", "🍕", "❤️", "✋")
+    private var recentEmoji = mutableStateOf<List<String>>(emptyList())
     private val EMOJI_GROUPS = listOf(
         // Smileys
         listOf("😀","😃","😄","😁","😆","😅","😂","🤣","😊","🙂","🙃","😉","😌","😍","🥰","😘",
@@ -1335,6 +1537,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         "↶" -> "Undo"
         "↷" -> "Redo"
         "⬚" -> "Select all"
+        "★" -> "Quick phrases"
         " " -> "Space"
         else -> label
     }
@@ -1342,6 +1545,110 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     // Slightly smaller font for multi-character mode keys (123 / ABC / !?#) so they don't look bulky.
     private fun modeKeyFont(): androidx.compose.ui.unit.TextUnit =
         (KeyboardPrefs.fontSizeSp(keyHeightDp.intValue, keyVGapDp.intValue) * 0.72f).sp
+
+    // ---- Rich formatting (bold / italic) ----
+    private fun currentPkg(): String = currentInputEditorInfo?.packageName ?: ""
+
+    // Map A-Z a-z 0-9 to Unicode mathematical bold/italic so they render styled in ANY app
+    // (Latin only — Cyrillic has no Unicode bold equivalents).
+    private fun toUnicodeStyled(s: String, italic: Boolean): String {
+        val sb = StringBuilder()
+        for (ch in s) {
+            val cp = when {
+                ch in 'A'..'Z' -> (if (italic) 0x1D434 else 0x1D400) + (ch - 'A')
+                ch in 'a'..'z' -> if (italic && ch == 'h') 0x210E
+                                  else (if (italic) 0x1D44E else 0x1D41A) + (ch - 'a')
+                !italic && ch in '0'..'9' -> 0x1D7CE + (ch - '0')
+                else -> ch.code
+            }
+            sb.appendCodePoint(cp)
+        }
+        return sb.toString()
+    }
+
+    private fun isWhatsApp() = currentPkg().let { it == "com.whatsapp" || it == "com.whatsapp.w4b" }
+
+    private fun applyBold(text: String): String =
+        if (isWhatsApp()) "*$text*" else toUnicodeStyled(text, italic = false)
+
+    private fun applyItalic(text: String): String =
+        if (isWhatsApp()) "_${text}_" else toUnicodeStyled(text, italic = true)
+
+    // Convert the AI's ⟦b⟧/⟦i⟧ markers into real per-app formatting.
+    private fun formatEmphasis(text: String): String {
+        var t = Regex("⟦b⟧(.*?)⟦/b⟧", RegexOption.DOT_MATCHES_ALL).replace(text) { applyBold(it.groupValues[1]) }
+        t = Regex("⟦i⟧(.*?)⟦/i⟧", RegexOption.DOT_MATCHES_ALL).replace(t) { applyItalic(it.groupValues[1]) }
+        return t.replace("⟦b⟧", "").replace("⟦/b⟧", "").replace("⟦i⟧", "").replace("⟦/i⟧", "")
+    }
+
+    private fun applyFormatToSelection(bold: Boolean) {
+        val ic = currentInputConnection ?: return
+        val sel = ic.getSelectedText(0)
+        if (sel.isNullOrEmpty()) {
+            statusText.value = "Select text to format"
+            handler.postDelayed({ if (statusText.value.startsWith("Select")) statusText.value = "" }, 1500)
+            return
+        }
+        performKeyFeedback()
+        ic.commitText(if (bold) applyBold(sel.toString()) else applyItalic(sel.toString()), 1)
+    }
+
+    // Selected text, or the text just before the cursor (for AI features).
+    private fun currentTargetText(): String {
+        val ic = currentInputConnection ?: return ""
+        val sel = ic.getSelectedText(0)
+        if (!sel.isNullOrEmpty()) return sel.toString()
+        return ic.getTextBeforeCursor(200, 0)?.toString() ?: ""
+    }
+
+    // Split a string into emoji (grapheme clusters), dropping plain ASCII/whitespace.
+    private fun splitEmojis(s: String): List<String> {
+        val bi = java.text.BreakIterator.getCharacterInstance()
+        bi.setText(s)
+        val out = mutableListOf<String>()
+        var start = bi.first(); var end = bi.next()
+        while (end != java.text.BreakIterator.DONE) {
+            val g = s.substring(start, end).trim()
+            if (g.isNotEmpty() && g[0].code > 0x2030) out.add(g)
+            start = end; end = bi.next()
+        }
+        return out
+    }
+
+    // ---- AI rewrite of the selected text (or the text before the cursor) ----
+    private fun runRewrite(instruction: String) {
+        if (secureField) {
+            statusText.value = "🔒 AI is off in password fields"
+            handler.postDelayed({ if (statusText.value.startsWith("🔒")) statusText.value = "" }, 1500)
+            return
+        }
+        val ic = currentInputConnection
+        val sel = ic?.getSelectedText(0)
+        val hadSelection = !sel.isNullOrEmpty()
+        val target = if (hadSelection) sel.toString() else (ic?.getTextBeforeCursor(4000, 0)?.toString() ?: "")
+        if (target.isBlank()) {
+            statusText.value = "✨ Nothing to rewrite"
+            handler.postDelayed({ if (statusText.value.startsWith("✨")) statusText.value = "" }, 1500)
+            return
+        }
+        keyboardMode.value = "abc"
+        statusText.value = "✨ Improving…"
+        GroqApi.rewrite(target, instruction) { res, err ->
+            handler.post {
+                if (res != null) {
+                    val out = formatEmphasis(res)
+                    currentInputConnection?.let { c ->
+                        if (hadSelection) c.commitText(out, 1)
+                        else { c.deleteSurroundingText(target.length, 0); c.commitText(out, 1) }
+                    }
+                    statusText.value = ""
+                } else {
+                    statusText.value = err ?: "Rewrite failed"
+                    handler.postDelayed({ statusText.value = "" }, 2500)
+                }
+            }
+        }
+    }
 
     @Composable
     fun KeyButton(
@@ -1507,8 +1814,32 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     // Note: haptic feedback is triggered by the caller (KeyButton tap / custom keys),
     // not here, so every key vibrates exactly once.
     private fun commitChar(char: Char) {
-        currentInputConnection?.commitText(char.toString(), 1)
+        val ic = currentInputConnection
+        // Double-space -> ". " (only after a word character)
+        if (char == ' ' && KeyboardPrefs.isDoubleSpacePeriod(this)) {
+            val before = ic?.getTextBeforeCursor(2, 0)?.toString() ?: ""
+            if (before.length == 2 && before[1] == ' ' && before[0].isLetterOrDigit()) {
+                ic?.deleteSurroundingText(1, 0)
+                ic?.commitText(". ", 1)
+                scheduleSpellcheck()
+                maybeAutoCapitalize()
+                return
+            }
+        }
+        ic?.commitText(char.toString(), 1)
         scheduleSpellcheck()
+        maybeAutoCapitalize()
+    }
+
+    // Auto-capitalize: turn shift on at the start of input / a new sentence.
+    private fun maybeAutoCapitalize() {
+        if (!KeyboardPrefs.isAutoCap(this)) return
+        val before = currentInputConnection?.getTextBeforeCursor(2, 0)?.toString() ?: ""
+        val atStart = before.isEmpty()
+        val afterSentence = before.length == 2 && before[1] == ' ' &&
+            (before[0] == '.' || before[0] == '!' || before[0] == '?' || before[0] == '\n')
+        val afterNewline = before.isNotEmpty() && before.last() == '\n'
+        if (atStart || afterSentence || afterNewline) isShift.value = true
     }
 
     private fun scheduleSpellcheck() {
@@ -1785,7 +2116,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                             handler.post {
                                 try {
                                     if (result != null) {
-                                        currentInputConnection?.commitText(result, 1)
+                                        currentInputConnection?.commitText(formatEmphasis(result), 1)
                                         statusText.value = ""
                                     } else {
                                         statusText.value = taskError ?: "Task failed"
