@@ -340,7 +340,7 @@ class SettingsActivity : ComponentActivity() {
 
                 // ===== AI tools (collapsible) =====
                 val toolCount = com.keyo.tools.ToolRegistry.all().count { it.uiExample.isNotEmpty() }
-                ExpandableSection("AI tools", "$toolCount voice commands — hold 🤖 and say…") {
+                ExpandableSection("AI tools", "$toolCount voice commands — hold the ✨ key and say…") {
                     Spacer(Modifier.height(6.dp))
                     com.keyo.tools.ToolRegistry.all().forEach { tool ->
                         if (tool.uiExample.isNotEmpty()) {
@@ -360,7 +360,7 @@ class SettingsActivity : ComponentActivity() {
 
                 Spacer(Modifier.height(20.dp))
                 Text(
-                    "Long-press the space bar to dictate, hold 🤖 to run a task.\n\nKeyo v${BuildConfig.VERSION_NAME} (build ${BuildConfig.VERSION_CODE})",
+                    "Long-press the space bar to dictate, hold the ✨ key to run a task.\n\nKeyo v${BuildConfig.VERSION_NAME} (build ${BuildConfig.VERSION_CODE})",
                     fontSize = 12.sp,
                     color = textFaint,
                     textAlign = TextAlign.Center,

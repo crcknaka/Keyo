@@ -375,7 +375,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     }
                     // Row 3: =\< symbols backspace
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
-                        KeyButton("!?#", accentColor, Color.Black, Modifier.weight(1.3f)) {
+                        KeyButton("!?#", accentColor, Color.Black, Modifier.weight(1.3f), fontSize = modeKeyFont()) {
                             keyboardMode.value = "symbols"
                         }
                         listOf("*","\"","'",":",";","!","?").forEach { s ->
@@ -401,7 +401,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         }
                     }
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
-                        KeyButton("123", accentColor, Color.Black, Modifier.weight(1.3f)) {
+                        KeyButton("123", accentColor, Color.Black, Modifier.weight(1.3f), fontSize = modeKeyFont()) {
                             keyboardMode.value = "123"
                         }
                         listOf("°","•","○","●","□","■","♥","♦").forEach { s ->
@@ -442,12 +442,12 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 // Mode / lang toggle button (bottom-left)
                 when (mode) {
                     "abc" -> {
-                        KeyButton("123", accentColor, Color.Black, Modifier.weight(1.2f)) {
+                        KeyButton("123", accentColor, Color.Black, Modifier.weight(1.2f), fontSize = modeKeyFont()) {
                             keyboardMode.value = "123"
                         }
                     }
                     "123", "symbols", "numpad" -> {
-                        KeyButton("ABC", accentColor, Color.Black, Modifier.weight(1.2f)) {
+                        KeyButton("ABC", accentColor, Color.Black, Modifier.weight(1.2f), fontSize = modeKeyFont()) {
                             keyboardMode.value = "abc"
                         }
                     }
@@ -539,17 +539,17 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         }
                     }
                     "123" -> {
-                        KeyButton("!?#", keyColor, textColor, Modifier.weight(1f)) {
+                        KeyButton("!?#", keyColor, textColor, Modifier.weight(1f), fontSize = modeKeyFont()) {
                             keyboardMode.value = "symbols"
                         }
                     }
                     "symbols" -> {
-                        KeyButton("🔢", keyColor, textColor, Modifier.weight(1f)) {
+                        KeyButton("🔢", keyColor, textColor, Modifier.weight(1f), fontSize = modeKeyFont()) {
                             keyboardMode.value = "numpad"
                         }
                     }
                     "numpad" -> {
-                        KeyButton("123", keyColor, textColor, Modifier.weight(1f)) {
+                        KeyButton("123", keyColor, textColor, Modifier.weight(1f), fontSize = modeKeyFont()) {
                             keyboardMode.value = "123"
                         }
                     }
@@ -935,7 +935,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             horizontalArrangement = Arrangement.SpaceEvenly,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            KeyButton("ABC", accentColor, Color.Black, Modifier.weight(1.4f)) { keyboardMode.value = "abc" }
+            KeyButton("ABC", accentColor, Color.Black, Modifier.weight(1.4f), fontSize = modeKeyFont()) { keyboardMode.value = "abc" }
             SpaceKey(Modifier.weight(4f), "space", keyColor, textColor, accentColor, Color(currentTheme.record))
             BackspaceKey(keyColor, textColor, Modifier.weight(1.4f))
         }
@@ -1339,6 +1339,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         " " -> "Space"
         else -> label
     }
+
+    // Slightly smaller font for multi-character mode keys (123 / ABC / !?#) so they don't look bulky.
+    private fun modeKeyFont(): androidx.compose.ui.unit.TextUnit =
+        (KeyboardPrefs.fontSizeSp(keyHeightDp.intValue, keyVGapDp.intValue) * 0.72f).sp
 
     @Composable
     fun KeyButton(
