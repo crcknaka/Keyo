@@ -1,0 +1,266 @@
+package com.keyo
+
+import android.content.Context
+import android.content.SharedPreferences
+
+object KeyboardPrefs {
+    private const val PREFS_NAME = "keyo_prefs"
+    private const val KEY_MODEL = "ai_model"
+    private const val KEY_AI_MODEL = "ai_assistant_model"
+    private const val KEY_AUTOCORRECT = "autocorrect_enabled"
+    private const val KEY_SPELLCHECK = "spellcheck_enabled"
+    private const val KEY_NUMBER_ROW = "number_row_enabled"
+    private const val KEY_KB_SIZE = "keyboard_size"
+    private const val KEY_HAPTIC_STRENGTH = "haptic_strength"
+    private const val KEY_SOUND = "sound_enabled"
+    private const val KEY_THEME = "theme"
+    private const val KEY_LANGS = "enabled_languages"
+    private const val KEY_CUR_LANG = "current_language"
+    private const val KEY_API_KEY = "groq_api_key"
+
+    private fun prefs(context: Context): SharedPreferences {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    }
+
+    fun getModel(context: Context): String {
+        return prefs(context).getString(KEY_MODEL, "llama-3.3-70b-versatile") ?: "llama-3.3-70b-versatile"
+    }
+
+    fun setModel(context: Context, model: String) {
+        prefs(context).edit().putString(KEY_MODEL, model).apply()
+    }
+
+    fun getAiModel(context: Context): String {
+        return prefs(context).getString(KEY_AI_MODEL, "openai/gpt-oss-120b") ?: "openai/gpt-oss-120b"
+    }
+
+    fun setAiModel(context: Context, model: String) {
+        prefs(context).edit().putString(KEY_AI_MODEL, model).apply()
+    }
+
+    fun isAutocorrectEnabled(context: Context): Boolean {
+        return prefs(context).getBoolean(KEY_AUTOCORRECT, true)
+    }
+
+    fun setAutocorrectEnabled(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_AUTOCORRECT, enabled).apply()
+    }
+
+    fun isSpellcheckEnabled(context: Context): Boolean {
+        return prefs(context).getBoolean(KEY_SPELLCHECK, true)
+    }
+
+    fun setSpellcheckEnabled(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_SPELLCHECK, enabled).apply()
+    }
+
+    fun isNumberRowEnabled(context: Context): Boolean {
+        return prefs(context).getBoolean(KEY_NUMBER_ROW, true)
+    }
+
+    fun setNumberRowEnabled(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_NUMBER_ROW, enabled).apply()
+    }
+
+    // --- Keyboard size (controls how much vertical space the keyboard takes) ---
+    // Values: "compact" | "normal" | "large" | "xlarge"
+    val KEYBOARD_SIZES = listOf(
+        "compact" to "Compact",
+        "normal" to "Normal",
+        "large" to "Large",
+        "xlarge" to "Extra large"
+    )
+
+    fun getKeyboardSize(context: Context): String {
+        return prefs(context).getString(KEY_KB_SIZE, "normal") ?: "normal"
+    }
+
+    fun setKeyboardSize(context: Context, size: String) {
+        prefs(context).edit().putString(KEY_KB_SIZE, size).apply()
+    }
+
+    /** Height (dp) of a single key row for the given size. Drives the fixed key-area height.
+     *  "normal" (39dp) is calibrated to match the stock keyboard's key height. */
+    fun rowHeightDp(size: String): Int = when (size) {
+        "compact" -> 34
+        "large" -> 46
+        "xlarge" -> 53
+        else -> 39 // normal — matches the stock keyboard
+    }
+
+    fun fontSizeSp(size: String): Int = when (size) {
+        "compact" -> 15
+        "large" -> 19
+        "xlarge" -> 21
+        else -> 17 // normal
+    }
+
+    // --- Haptics ---
+    // Values: "off" | "light" | "medium" | "strong"
+    val HAPTIC_LEVELS = listOf(
+        "off" to "Off",
+        "light" to "Light",
+        "medium" to "Medium",
+        "strong" to "Strong"
+    )
+
+    fun getHapticStrength(context: Context): String {
+        return prefs(context).getString(KEY_HAPTIC_STRENGTH, "light") ?: "light"
+    }
+
+    fun setHapticStrength(context: Context, level: String) {
+        prefs(context).edit().putString(KEY_HAPTIC_STRENGTH, level).apply()
+    }
+
+    /** Vibration duration (ms) for the configured strength; 0 = disabled. */
+    fun hapticDurationMs(level: String): Long = when (level) {
+        "light" -> 10L
+        "medium" -> 18L
+        "strong" -> 28L
+        else -> 0L // off
+    }
+
+    /** Vibration amplitude (1..255) for the configured strength. */
+    fun hapticAmplitude(level: String): Int = when (level) {
+        "light" -> 70
+        "medium" -> 140
+        "strong" -> 230
+        else -> 0
+    }
+
+    fun isSoundEnabled(context: Context): Boolean {
+        return prefs(context).getBoolean(KEY_SOUND, false)
+    }
+
+    fun setSoundEnabled(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_SOUND, enabled).apply()
+    }
+
+    /** User-supplied Groq API key. Blank means "use the build-time default". */
+    fun getApiKey(context: Context): String {
+        return prefs(context).getString(KEY_API_KEY, "") ?: ""
+    }
+
+    fun setApiKey(context: Context, key: String) {
+        prefs(context).edit().putString(KEY_API_KEY, key.trim()).apply()
+    }
+
+    fun getTheme(context: Context): String {
+        return prefs(context).getString(KEY_THEME, "catppuccin") ?: "catppuccin"
+    }
+
+    fun setTheme(context: Context, theme: String) {
+        prefs(context).edit().putString(KEY_THEME, theme).apply()
+    }
+
+    // --- Languages ---
+    // Supported codes: "en", "ru", "lv". At least one must always be enabled.
+    val SUPPORTED_LANGUAGES = listOf(
+        "en" to "English",
+        "ru" to "Russian",
+        "lv" to "Latvian"
+    )
+
+    fun getEnabledLanguages(context: Context): List<String> {
+        val raw = prefs(context).getString(KEY_LANGS, "en,ru") ?: "en,ru"
+        val list = raw.split(",").map { it.trim() }.filter { code -> SUPPORTED_LANGUAGES.any { it.first == code } }
+        return list.ifEmpty { listOf("en") }
+    }
+
+    fun isLanguageEnabled(context: Context, code: String): Boolean = getEnabledLanguages(context).contains(code)
+
+    fun setLanguageEnabled(context: Context, code: String, enabled: Boolean) {
+        val current = getEnabledLanguages(context).toMutableList()
+        if (enabled) {
+            if (!current.contains(code)) current.add(code)
+        } else {
+            current.remove(code)
+            if (current.isEmpty()) current.add("en") // never allow empty
+        }
+        // Persist in the canonical supported order
+        val ordered = SUPPORTED_LANGUAGES.map { it.first }.filter { current.contains(it) }
+        prefs(context).edit().putString(KEY_LANGS, ordered.joinToString(",")).apply()
+    }
+
+    fun getCurrentLanguage(context: Context): String {
+        val enabled = getEnabledLanguages(context)
+        val cur = prefs(context).getString(KEY_CUR_LANG, enabled.first()) ?: enabled.first()
+        return if (enabled.contains(cur)) cur else enabled.first()
+    }
+
+    fun setCurrentLanguage(context: Context, code: String) {
+        prefs(context).edit().putString(KEY_CUR_LANG, code).apply()
+    }
+
+    data class KeyboardTheme(
+        val id: String,
+        val name: String,
+        val bg: Long,
+        val key: Long,
+        val accent: Long,
+        val text: Long,
+        val record: Long = 0xFFFF5555,
+        val altPopupBg: Long = 0xFF45475A,
+        val altPopupKey: Long = 0xFF585B70
+    )
+
+    val THEMES = listOf(
+        KeyboardTheme("catppuccin", "Catppuccin Mocha",
+            bg = 0xFF1E1E2E, key = 0xFF313244, accent = 0xFFBB86FC, text = 0xFFCDD6F4),
+        KeyboardTheme("dracula", "Dracula",
+            bg = 0xFF282A36, key = 0xFF44475A, accent = 0xFFBD93F9, text = 0xFFF8F8F2,
+            altPopupBg = 0xFF44475A, altPopupKey = 0xFF6272A4),
+        KeyboardTheme("nord", "Nord",
+            bg = 0xFF2E3440, key = 0xFF3B4252, accent = 0xFF88C0D0, text = 0xFFECEFF4,
+            altPopupBg = 0xFF3B4252, altPopupKey = 0xFF4C566A),
+        KeyboardTheme("gruvbox", "Gruvbox Dark",
+            bg = 0xFF282828, key = 0xFF3C3836, accent = 0xFFFE8019, text = 0xFFEBDBB2,
+            altPopupBg = 0xFF3C3836, altPopupKey = 0xFF504945),
+        KeyboardTheme("solarized", "Solarized Dark",
+            bg = 0xFF002B36, key = 0xFF073642, accent = 0xFF268BD2, text = 0xFF839496,
+            altPopupBg = 0xFF073642, altPopupKey = 0xFF586E75),
+        KeyboardTheme("rosepine", "Rosé Pine",
+            bg = 0xFF191724, key = 0xFF26233A, accent = 0xFFEB6F92, text = 0xFFE0DEF4,
+            altPopupBg = 0xFF26233A, altPopupKey = 0xFF403D52),
+        KeyboardTheme("tokyonight", "Tokyo Night",
+            bg = 0xFF1A1B26, key = 0xFF24283B, accent = 0xFF7AA2F7, text = 0xFFC0CAF5,
+            altPopupBg = 0xFF24283B, altPopupKey = 0xFF414868),
+        KeyboardTheme("amoled", "AMOLED Black",
+            bg = 0xFF000000, key = 0xFF1A1A1A, accent = 0xFF00E5FF, text = 0xFFFFFFFF,
+            altPopupBg = 0xFF1A1A1A, altPopupKey = 0xFF333333),
+        KeyboardTheme("light", "Light",
+            bg = 0xFFE8E8E8, key = 0xFFFFFFFF, accent = 0xFF6750A4, text = 0xFF1C1B1F,
+            record = 0xFFB3261E, altPopupBg = 0xFFE0E0E0, altPopupKey = 0xFFD0D0D0)
+    )
+
+    fun getThemeData(context: Context): KeyboardTheme {
+        val id = getTheme(context)
+        return THEMES.find { it.id == id } ?: THEMES[0]
+    }
+
+    val AVAILABLE_MODELS = listOf(
+        "llama-3.3-70b-versatile" to "Llama 3.3 70B (quality)",
+        "openai/gpt-oss-120b" to "GPT-OSS 120B (top, 500 t/s)",
+        "openai/gpt-oss-20b" to "GPT-OSS 20B (fast, 1000 t/s)",
+        "meta-llama/llama-4-maverick-17b-128e-instruct" to "Llama 4 Maverick 17B",
+        "meta-llama/llama-4-scout-17b-16e-instruct" to "Llama 4 Scout 17B (fast)",
+        "qwen/qwen3-32b" to "Qwen 3 32B",
+        "moonshotai/kimi-k2-instruct-0905" to "Kimi K2 (262K context)",
+        "llama-3.1-8b-instant" to "Llama 3.1 8B (fastest)"
+    )
+
+    val AI_TOOLS = listOf(
+        "📞 Call" to "\"Call Mom\"",
+        "💬 SMS" to "\"Text Arthur: running 10 min late\"",
+        "⏰ Alarm" to "\"Set an alarm for 7:30\"",
+        "⏱ Timer" to "\"Timer for 5 minutes\"",
+        "📱 Apps" to "\"Open Telegram\"",
+        "🔦 Flashlight" to "\"Turn on the flashlight\"",
+        "🔊 Volume" to "\"Set volume to 50%\"",
+        "🔍 Search" to "\"Google the weather in Riga\"",
+        "📋 Clipboard" to "\"What's in the clipboard?\"",
+        "🔋 Battery" to "\"How much battery is left?\"",
+        "🌍 Translate" to "\"Translate to English: ...\"",
+        "✍️ Text" to "\"Write an email to a colleague...\""
+    )
+}

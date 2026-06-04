@@ -1,0 +1,48 @@
+# Built application files
+*.apk
+*.aar
+*.ap_
+*.aab
+
+# Files for the ART/Dalvik VM
+*.dex
+
+# Java class files
+*.class
+
+# Generated files
+bin/
+gen/
+out/
+release/
+
+# Gradle
+.gradle/
+build/
+app/build/
+
+# Local configuration — SDK path and secrets (the Groq API key lives here). Never commit.
+local.properties
+
+# Logs / OS files
+*.log
+.DS_Store
+Thumbs.db
+
+# Android Studio / IntelliJ
+.idea/
+*.iml
+.cxx/
+captures/
+.externalNativeBuild/
+
+# Kotlin
+.kotlin/
+
+# Keystore / signing material — never commit
+*.jks
+*.keystore
+
+# Local comparison screenshots / scratch images (not part of the project)
+orig.jpg
+keyo.jpg
