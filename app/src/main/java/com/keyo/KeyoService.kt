@@ -519,21 +519,15 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         },
                     contentAlignment = Alignment.Center
                 ) {
-                    Text(
-                        text = when {
-                            recordingAI && aiDragX < -cancelThreshold -> "✕"
-                            recordingAI -> "🤖"
-                            else -> ","
-                        },
-                        fontSize = if (recordingAI) 16.sp else 18.sp,
-                        color = if (recordingAI) Color.Black else textColor
-                    )
-                    if (!recordingAI) {
-                        Text(
-                            "🤖",
-                            fontSize = 11.sp,
-                            modifier = Modifier.align(Alignment.TopEnd).padding(2.dp)
-                        )
+                    when {
+                        recordingAI && aiDragX < -cancelThreshold ->
+                            Text("✕", fontSize = 16.sp, color = Color.Black)
+                        recordingAI ->
+                            SparkleGlyph(Color.Black, Modifier.size(20.dp))
+                        else -> {
+                            Text(",", fontSize = 18.sp, color = textColor)
+                            SparkleGlyph(textColor, Modifier.align(Alignment.TopEnd).padding(2.dp).size(13.dp))
+                        }
                     }
                 }
 
@@ -574,20 +568,20 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 val hasImeAction = imeAction != android.view.inputmethod.EditorInfo.IME_ACTION_NONE
                         && imeAction != android.view.inputmethod.EditorInfo.IME_ACTION_UNSPECIFIED
 
-                val enterLabel = when {
-                    isTextMode -> "↵"  // Always newline in symbol/number modes
+                val enterKind = when {
+                    isTextMode -> "return"
                     hasImeAction -> when (imeAction) {
-                        android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH -> "🔍"
-                        android.view.inputmethod.EditorInfo.IME_ACTION_SEND -> "➤"
-                        android.view.inputmethod.EditorInfo.IME_ACTION_GO -> "➤"
-                        android.view.inputmethod.EditorInfo.IME_ACTION_DONE -> "✓"
-                        android.view.inputmethod.EditorInfo.IME_ACTION_NEXT -> "→"
-                        else -> "➤"
+                        android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH -> "search"
+                        android.view.inputmethod.EditorInfo.IME_ACTION_SEND -> "send"
+                        android.view.inputmethod.EditorInfo.IME_ACTION_GO -> "send"
+                        android.view.inputmethod.EditorInfo.IME_ACTION_DONE -> "done"
+                        android.view.inputmethod.EditorInfo.IME_ACTION_NEXT -> "next"
+                        else -> "send"
                     }
-                    else -> "↵"
+                    else -> "return"
                 }
 
-                KeyButton(enterLabel, accentColor, Color.Black, Modifier.weight(1.0f)) {
+                EnterKey(enterKind, accentColor, Color.Black, keyHeight, Modifier.weight(1.0f)) {
                     if (isTextMode || !hasImeAction) {
                         commitChar('\n')
                     } else {
@@ -893,10 +887,15 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             contentAlignment = Alignment.Center
         ) {
             if (recording) {
-                Text(
-                    text = if (micDragX < -cancelThreshold) "✕" else "🎤 ●",
-                    fontSize = 16.sp, color = Color.White
-                )
+                if (micDragX < -cancelThreshold) {
+                    Text("✕", fontSize = 16.sp, color = Color.White)
+                } else {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        MicGlyph(Color.White, Modifier.size(20.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Box(Modifier.size(7.dp).background(Color.White, androidx.compose.foundation.shape.CircleShape))
+                    }
+                }
             } else if (cursorVisual) {
                 val density = androidx.compose.ui.platform.LocalDensity.current
                 BoxWithConstraints(
@@ -918,7 +917,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 }
             } else {
                 Text(text = label, color = textColor, fontSize = 14.sp, textAlign = TextAlign.Center)
-                Text("🎤", fontSize = 11.sp, modifier = Modifier.align(Alignment.TopEnd).padding(3.dp))
+                MicGlyph(textColor, Modifier.align(Alignment.TopEnd).padding(3.dp).size(14.dp))
             }
         }
     }
@@ -939,6 +938,151 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             KeyButton("ABC", accentColor, Color.Black, Modifier.weight(1.4f)) { keyboardMode.value = "abc" }
             SpaceKey(Modifier.weight(4f), "space", keyColor, textColor, accentColor, Color(currentTheme.record))
             BackspaceKey(keyColor, textColor, Modifier.weight(1.4f))
+        }
+    }
+
+    // ---- Hand-drawn vector key icons (one cohesive monochrome line style, no emoji) ----
+
+    @Composable
+    private fun MicGlyph(color: Color, modifier: Modifier) {
+        Canvas(modifier) {
+            val w = size.width; val h = size.height
+            val sw = h * 0.08f
+            val cap = androidx.compose.ui.graphics.StrokeCap.Round
+            val bodyW = w * 0.30f
+            val left = (w - bodyW) / 2f
+            // mic body (filled capsule)
+            drawRoundRect(
+                color = color,
+                topLeft = androidx.compose.ui.geometry.Offset(left, h * 0.10f),
+                size = androidx.compose.ui.geometry.Size(bodyW, h * 0.44f),
+                cornerRadius = androidx.compose.ui.geometry.CornerRadius(bodyW / 2f, bodyW / 2f)
+            )
+            // cradle arc
+            drawArc(
+                color = color, startAngle = 18f, sweepAngle = 144f, useCenter = false,
+                topLeft = androidx.compose.ui.geometry.Offset(w * 0.24f, h * 0.30f),
+                size = androidx.compose.ui.geometry.Size(w * 0.52f, h * 0.50f),
+                style = androidx.compose.ui.graphics.drawscope.Stroke(width = sw, cap = cap)
+            )
+            // stem + base
+            drawLine(color, androidx.compose.ui.geometry.Offset(w / 2f, h * 0.80f), androidx.compose.ui.geometry.Offset(w / 2f, h * 0.90f), sw, cap)
+            drawLine(color, androidx.compose.ui.geometry.Offset(w * 0.36f, h * 0.92f), androidx.compose.ui.geometry.Offset(w * 0.64f, h * 0.92f), sw, cap)
+        }
+    }
+
+    // Modern "AI" sparkle (4-point star), filled.
+    @Composable
+    private fun SparkleGlyph(color: Color, modifier: Modifier) {
+        Canvas(modifier) {
+            val cx = size.width / 2f; val cy = size.height / 2f
+            val rOut = size.minDimension / 2f * 0.96f
+            val rIn = rOut * 0.34f
+            val path = androidx.compose.ui.graphics.Path()
+            val tips = floatArrayOf(-90f, 0f, 90f, 180f)
+            for (i in tips.indices) {
+                val a = Math.toRadians(tips[i].toDouble())
+                val tx = cx + (kotlin.math.cos(a) * rOut).toFloat()
+                val ty = cy + (kotlin.math.sin(a) * rOut).toFloat()
+                val da = Math.toRadians((tips[i] + 45f).toDouble())
+                val ix = cx + (kotlin.math.cos(da) * rIn).toFloat()
+                val iy = cy + (kotlin.math.sin(da) * rIn).toFloat()
+                if (i == 0) path.moveTo(tx, ty) else path.lineTo(tx, ty)
+                path.lineTo(ix, iy)
+            }
+            path.close()
+            drawPath(path, color)
+        }
+    }
+
+    @Composable
+    private fun BackspaceGlyph(color: Color, modifier: Modifier) {
+        Canvas(modifier) {
+            val w = size.width; val h = size.height
+            val sw = h * 0.085f
+            val stroke = androidx.compose.ui.graphics.drawscope.Stroke(
+                width = sw, join = androidx.compose.ui.graphics.StrokeJoin.Round, cap = androidx.compose.ui.graphics.StrokeCap.Round
+            )
+            fun o(x: Float, y: Float) = androidx.compose.ui.geometry.Offset(x * w, y * h)
+            val body = androidx.compose.ui.graphics.Path().apply {
+                moveTo(w * 0.07f, h * 0.5f)
+                lineTo(w * 0.33f, h * 0.23f)
+                lineTo(w * 0.93f, h * 0.23f)
+                lineTo(w * 0.93f, h * 0.77f)
+                lineTo(w * 0.33f, h * 0.77f)
+                close()
+            }
+            drawPath(body, color, style = stroke)
+            drawLine(color, o(0.50f, 0.40f), o(0.74f, 0.60f), sw, androidx.compose.ui.graphics.StrokeCap.Round)
+            drawLine(color, o(0.74f, 0.40f), o(0.50f, 0.60f), sw, androidx.compose.ui.graphics.StrokeCap.Round)
+        }
+    }
+
+    // Enter / action glyph. kind: "return" | "done" | "search" | "send" | "next"
+    @Composable
+    private fun EnterGlyph(kind: String, color: Color, modifier: Modifier) {
+        Canvas(modifier) {
+            val w = size.width; val h = size.height
+            val sw = h * 0.10f
+            val cap = androidx.compose.ui.graphics.StrokeCap.Round
+            val stroke = androidx.compose.ui.graphics.drawscope.Stroke(
+                width = sw, cap = cap, join = androidx.compose.ui.graphics.StrokeJoin.Round
+            )
+            fun o(x: Float, y: Float) = androidx.compose.ui.geometry.Offset(x * w, y * h)
+            when (kind) {
+                "done" -> {
+                    val p = androidx.compose.ui.graphics.Path().apply {
+                        moveTo(w * 0.22f, h * 0.55f); lineTo(w * 0.42f, h * 0.74f); lineTo(w * 0.80f, h * 0.28f)
+                    }
+                    drawPath(p, color, style = stroke)
+                }
+                "search" -> {
+                    drawCircle(color, radius = w * 0.22f, center = o(0.44f, 0.44f), style = stroke)
+                    drawLine(color, o(0.60f, 0.60f), o(0.80f, 0.80f), sw, cap)
+                }
+                "send", "next" -> {
+                    drawLine(color, o(0.20f, 0.5f), o(0.78f, 0.5f), sw, cap)
+                    val p = androidx.compose.ui.graphics.Path().apply {
+                        moveTo(w * 0.60f, h * 0.32f); lineTo(w * 0.80f, h * 0.5f); lineTo(w * 0.60f, h * 0.68f)
+                    }
+                    drawPath(p, color, style = stroke)
+                }
+                else -> { // return arrow ⏎
+                    val p = androidx.compose.ui.graphics.Path().apply {
+                        moveTo(w * 0.78f, h * 0.28f); lineTo(w * 0.78f, h * 0.58f); lineTo(w * 0.28f, h * 0.58f)
+                    }
+                    drawPath(p, color, style = stroke)
+                    val head = androidx.compose.ui.graphics.Path().apply {
+                        moveTo(w * 0.42f, h * 0.46f); lineTo(w * 0.28f, h * 0.58f); lineTo(w * 0.42f, h * 0.70f)
+                    }
+                    drawPath(head, color, style = stroke)
+                }
+            }
+        }
+    }
+
+    // Enter key with a drawn icon + press feedback (replaces the plain glyph).
+    @Composable
+    fun EnterKey(
+        kind: String,
+        bgColor: Color,
+        iconColor: Color,
+        height: androidx.compose.ui.unit.Dp,
+        modifier: Modifier,
+        onClick: () -> Unit
+    ) {
+        val interaction = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
+        val pressed by interaction.collectIsPressedAsState()
+        Box(
+            modifier = modifier
+                .height(height)
+                .padding(horizontal = keyHGapDp.intValue.dp, vertical = keyVGapDp.intValue.dp)
+                .background(if (pressed) lerp(bgColor, Color.Black, 0.22f) else bgColor, RoundedCornerShape(6.dp))
+                .semantics { contentDescription = "Enter" }
+                .clickable(interactionSource = interaction, indication = null) { performKeyFeedback(); onClick() },
+            contentAlignment = Alignment.Center
+        ) {
+            EnterGlyph(kind, iconColor, Modifier.size(22.dp))
         }
     }
 
@@ -1103,12 +1247,11 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 },
             contentAlignment = Alignment.Center
         ) {
-            Text(
-                text = if (swipedClear) "✕" else "⌫",
-                color = if (swipedClear) Color.White else textColor,
-                fontSize = 16.sp,
-                textAlign = TextAlign.Center
-            )
+            if (swipedClear) {
+                Text("✕", color = Color.White, fontSize = 16.sp, textAlign = TextAlign.Center)
+            } else {
+                BackspaceGlyph(textColor, Modifier.size(22.dp))
+            }
         }
     }
 
