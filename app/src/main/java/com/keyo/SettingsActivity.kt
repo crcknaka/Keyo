@@ -9,10 +9,13 @@ import android.view.inputmethod.InputMethodManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.relocation.BringIntoViewRequester
+import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -32,6 +35,8 @@ class SettingsActivity : ComponentActivity() {
 
     // Bumped on resume so the Setup statuses re-evaluate after returning from system screens.
     private val resumeTick = mutableStateOf(0)
+    // Deep-link target section (e.g. "phrases") so we can auto-expand it.
+    private val deepLink = mutableStateOf<String?>(null)
 
     private val requestPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -39,7 +44,14 @@ class SettingsActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        deepLink.value = intent?.getStringExtra("section")
         setContent { SettingsScreen() }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        deepLink.value = intent.getStringExtra("section")
     }
 
     override fun onResume() {
@@ -79,8 +91,16 @@ class SettingsActivity : ComponentActivity() {
     private val textFaint = Color(0xFF5C5C66)
     private val accent = Color(0xFF5E6AD2)
 
+    @OptIn(ExperimentalFoundationApi::class)
     @Composable
     fun SettingsScreen() {
+        val phrasesRequester = remember { BringIntoViewRequester() }
+        LaunchedEffect(deepLink.value) {
+            if (deepLink.value == "phrases") {
+                kotlinx.coroutines.delay(300)
+                try { phrasesRequester.bringIntoView() } catch (_: Exception) {}
+            }
+        }
         Surface(modifier = Modifier.fillMaxSize(), color = bg) {
             Column(
                 modifier = Modifier
@@ -227,7 +247,9 @@ class SettingsActivity : ComponentActivity() {
                 // ===== Quick phrases =====
                 var phrases by remember { mutableStateOf(KeyboardPrefs.getPhrases(this@SettingsActivity)) }
                 var newPhrase by remember { mutableStateOf("") }
-                ExpandableSection("Quick phrases", "${phrases.size} saved — tap the ★ key to insert") {
+                Column(Modifier.fillMaxWidth().bringIntoViewRequester(phrasesRequester)) {
+                ExpandableSection("Quick phrases", "${phrases.size} saved — tap the ★ key to insert",
+                    initiallyExpanded = deepLink.value == "phrases") {
                     Column(Modifier.padding(12.dp)) {
                         phrases.forEach { p ->
                             Row(
@@ -269,6 +291,7 @@ class SettingsActivity : ComponentActivity() {
                             colors = ButtonDefaults.buttonColors(containerColor = accent)
                         ) { Text("Add phrase", color = Color.White, fontWeight = FontWeight.SemiBold) }
                     }
+                }
                 }
 
                 // ===== Voice & AI =====
@@ -466,7 +489,7 @@ class SettingsActivity : ComponentActivity() {
         initiallyExpanded: Boolean = false,
         content: @Composable ColumnScope.() -> Unit
     ) {
-        var expanded by remember { mutableStateOf(initiallyExpanded) }
+        var expanded by remember(initiallyExpanded) { mutableStateOf(initiallyExpanded) }
         SectionLabel(label)
         Group {
             Row(

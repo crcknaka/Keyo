@@ -83,6 +83,14 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private var pinnedClips = mutableStateOf<List<String>>(emptyList())
     private var phrasesState = mutableStateOf<List<String>>(emptyList())
     private var emojiCategory = mutableIntStateOf(0)        // emoji panel category
+    private var isCapsLock = mutableStateOf(false)
+    private var lastShiftTapMs = 0L
+    private var shiftIsAuto = false   // true when Shift was turned on by auto-capitalize (not the user)
+    // Undo last AI rewrite
+    private var showUndoRewrite = mutableStateOf(false)
+    private var rewriteBackup = ""
+    private var rewriteResult = ""
+    private val hideUndoRewrite = Runnable { showUndoRewrite.value = false }
     // Dynamic top toolbar: a freshly-copied snippet shows as a quick-paste chip for a while.
     private var showClipChip = mutableStateOf(false)
     private var lastClip = mutableStateOf("")
@@ -240,6 +248,8 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         secureField = isPassword || noLearning
 
         isShift.value = false
+        isCapsLock.value = false
+        showUndoRewrite.value = false
         maybeAutoCapitalize()
     }
 
@@ -341,21 +351,24 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.Center
                         ) {
+                            val caps by isCapsLock
                             if (index == 2) {
                                 ShiftKey(
-                                    active = shift,
+                                    active = shift || caps,
+                                    locked = caps,
                                     keyColor = keyColor,
                                     accentColor = accentColor,
-                                    iconColor = if (shift) Color.Black else textColor,
+                                    iconColor = if (shift || caps) Color.Black else textColor,
                                     height = keyHeight,
                                     modifier = Modifier.weight(1.3f)
-                                ) { isShift.value = !isShift.value }
+                                ) { onShiftTap() }
                             }
                             row.forEach { char ->
-                                val displayChar = if (shift) char.uppercase() else char.toString()
+                                val up = shift || caps
+                                val displayChar = if (up) char.uppercase() else char.toString()
                                 KeyButton(displayChar, keyColor, textColor, Modifier.weight(1f)) {
-                                    commitChar(if (shift) char.uppercaseChar() else char)
-                                    if (shift) isShift.value = false
+                                    commitChar(if (up) char.uppercaseChar() else char)
+                                    if (shift && !caps) { isShift.value = false; shiftIsAuto = false }
                                 }
                             }
                             if (index == 2) {
@@ -613,6 +626,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     fun TopToolbar(status: String, bgColor: Color, keyColor: Color, textColor: Color, accentColor: Color) {
         val chip by showClipChip
         val clip by lastClip
+        val undo by showUndoRewrite
         Box(
             modifier = Modifier.fillMaxWidth().height(40.dp).padding(horizontal = 4.dp),
             contentAlignment = Alignment.CenterStart
@@ -622,6 +636,24 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     status, color = accentColor, fontSize = 12.sp,
                     modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center
                 )
+                undo -> Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        modifier = Modifier.weight(1f).fillMaxHeight()
+                            .semantics { contentDescription = "Undo rewrite" }
+                            .clickable { performKeyFeedback(); performUndoRewrite() },
+                        contentAlignment = Alignment.CenterStart
+                    ) {
+                        Text("↩  Undo rewrite", color = accentColor, fontSize = 13.sp,
+                            modifier = Modifier.padding(start = 8.dp))
+                    }
+                    Box(
+                        modifier = Modifier.size(36.dp).clickable { showUndoRewrite.value = false },
+                        contentAlignment = Alignment.Center
+                    ) { Text("✕", color = textColor.copy(alpha = 0.6f), fontSize = 14.sp) }
+                }
                 chip && clip.isNotEmpty() -> Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically
@@ -651,19 +683,14 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     horizontalArrangement = Arrangement.spacedBy(2.dp),
                     modifier = Modifier.horizontalScroll(rememberScrollState())
                 ) {
-                    Box(
-                        modifier = Modifier.size(40.dp)
-                            .semantics { contentDescription = "Rewrite / improve text" }
-                            .clickable { keyboardMode.value = "rewrite" },
-                        contentAlignment = Alignment.Center
-                    ) { SparkleGlyph(accentColor, Modifier.size(20.dp)) }
-                    ToolbarIcon("😀", textColor) { emojiCategory.intValue = if (recentEmoji.value.isEmpty()) 1 else 0; keyboardMode.value = "emoji" }
-                    ToolbarIcon("📋", textColor) { keyboardMode.value = "clipboard" }
-                    ToolbarIcon("★", textColor) { keyboardMode.value = "phrases" }
-                    ToolbarIcon("↶", textColor) { performKeyFeedback(); sendCtrlKey(android.view.KeyEvent.KEYCODE_Z) }
-                    ToolbarIcon("↷", textColor) { performKeyFeedback(); sendCtrlKey(android.view.KeyEvent.KEYCODE_Z, withShift = true) }
-                    ToolbarIcon("⬚", textColor) { performKeyFeedback(); selectAll() }
-                    ToolbarIcon("⚙", textColor) { performKeyFeedback(); openSettings() }
+                    ToolbarVec("Rewrite / improve text", { keyboardMode.value = "rewrite" }) { SparkleGlyph(accentColor, Modifier.size(20.dp)) }
+                    ToolbarVec("Emoji", { emojiCategory.intValue = if (recentEmoji.value.isEmpty()) 1 else 0; keyboardMode.value = "emoji" }) { SmileyGlyph(textColor, Modifier.size(21.dp)) }
+                    ToolbarVec("Clipboard", { keyboardMode.value = "clipboard" }) { ClipboardGlyph(textColor, Modifier.size(20.dp)) }
+                    ToolbarVec("Quick phrases", { keyboardMode.value = "phrases" }) { StarGlyph(textColor, Modifier.size(19.dp)) }
+                    ToolbarVec("Undo", { performKeyFeedback(); sendCtrlKey(android.view.KeyEvent.KEYCODE_Z) }) { CurvedArrowGlyph(textColor, false, Modifier.size(20.dp)) }
+                    ToolbarVec("Redo", { performKeyFeedback(); sendCtrlKey(android.view.KeyEvent.KEYCODE_Z, withShift = true) }) { CurvedArrowGlyph(textColor, true, Modifier.size(20.dp)) }
+                    ToolbarVec("Select all", { performKeyFeedback(); selectAll() }) { SelectAllGlyph(textColor, Modifier.size(19.dp)) }
+                    ToolbarVec("Settings", { performKeyFeedback(); openSettings() }) { GearGlyph(textColor, Modifier.size(19.dp)) }
                 }
             }
         }
@@ -677,6 +704,17 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 .clickable { onClick() },
             contentAlignment = Alignment.Center
         ) { Text(glyph, fontSize = 18.sp, color = textColor) }
+    }
+
+    // Toolbar slot that hosts a drawn (vector) icon.
+    @Composable
+    private fun ToolbarVec(desc: String, onClick: () -> Unit, glyph: @Composable () -> Unit) {
+        Box(
+            modifier = Modifier.size(40.dp)
+                .semantics { contentDescription = desc }
+                .clickable { onClick() },
+            contentAlignment = Alignment.Center
+        ) { glyph() }
     }
 
     // A circular bezel/dial knob with tick marks that rotate as you scrub the cursor.
@@ -742,7 +780,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         .semantics { contentDescription = "Suggest emoji for my text" }
                         .clickable {
                             val t = currentTargetText()
-                            if (t.isNotBlank()) {
+                            if (!secureField && t.isNotBlank()) {
                                 suggesting = true
                                 GroqApi.suggestEmojis(t) { res, _ ->
                                     handler.post { suggesting = false; suggestions = splitEmojis(res ?: "") }
@@ -750,7 +788,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                             }
                         },
                     contentAlignment = Alignment.Center
-                ) { SparkleGlyph(if (suggestions.isNotEmpty()) accentColor else textColor.copy(alpha = 0.6f), Modifier.size(17.dp)) }
+                ) { EnterGlyph("search", if (suggestions.isNotEmpty()) accentColor else textColor.copy(alpha = 0.6f), Modifier.size(18.dp)) }
             }
             androidx.compose.material3.Divider(color = textColor.copy(alpha = 0.12f))
 
@@ -845,9 +883,21 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                     Text(clip.replace("\n", " ").take(80),
                                         color = textColor, fontSize = 14.sp, maxLines = 2)
                                 }
+                                // Save to phrases
+                                Box(
+                                    modifier = Modifier.size(38.dp)
+                                        .semantics { contentDescription = "Save to phrases" }
+                                        .clickable {
+                                            KeyboardPrefs.addPhrase(this@KeyoService, clip)
+                                            phrasesState.value = KeyboardPrefs.getPhrases(this@KeyoService)
+                                            statusText.value = "★ Saved to phrases"
+                                            handler.postDelayed({ if (statusText.value.startsWith("★")) statusText.value = "" }, 1200)
+                                        },
+                                    contentAlignment = Alignment.Center
+                                ) { Text("★", color = textColor.copy(alpha = 0.5f), fontSize = 15.sp) }
                                 // Pin toggle
                                 Box(
-                                    modifier = Modifier.size(40.dp)
+                                    modifier = Modifier.size(38.dp)
                                         .semantics { contentDescription = if (pinned) "Unpin" else "Pin" }
                                         .clickable {
                                             KeyboardPrefs.togglePin(this@KeyoService, clip)
@@ -877,6 +927,27 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     ) {
         val phrases by phrasesState
         Column(modifier = Modifier.fillMaxWidth().height(keyHeight * (maxContentRows + 1))) {
+            // Quick actions: save current text, manage in settings
+            Row(
+                modifier = Modifier.fillMaxWidth().height(34.dp).padding(horizontal = 12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("＋ Save current text", color = accentColor, fontSize = 13.sp,
+                    fontWeight = androidx.compose.ui.text.font.FontWeight.Medium,
+                    modifier = Modifier.weight(1f).clickable {
+                        val t = currentTargetText()
+                        if (!secureField && t.isNotBlank()) {
+                            KeyboardPrefs.addPhrase(this@KeyoService, t)
+                            phrasesState.value = KeyboardPrefs.getPhrases(this@KeyoService)
+                            statusText.value = "★ Saved to phrases"
+                            handler.postDelayed({ if (statusText.value.startsWith("★")) statusText.value = "" }, 1200)
+                        }
+                    })
+                Text("Edit ›", color = textColor.copy(alpha = 0.7f), fontSize = 13.sp,
+                    modifier = Modifier.clickable { openSettings("phrases") })
+            }
+            androidx.compose.material3.Divider(color = textColor.copy(alpha = 0.12f))
+
             Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
                 if (phrases.isEmpty()) {
                     Text("Add quick phrases in Settings → Quick phrases",
@@ -975,8 +1046,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                     if (cursorMode) {
                                         dragXVisual = totalDragX
                                         val stepPx = 28f
-                                        while (totalDragX - lastStepX >= stepPx) { moveCursor(false); performKeyFeedback(); lastStepX += stepPx }
-                                        while (totalDragX - lastStepX <= -stepPx) { moveCursor(true); performKeyFeedback(); lastStepX -= stepPx }
+                                        // Only a deliberate Shift (not auto-capitalize) turns swipe into selection
+                                        val sel = (isShift.value && !shiftIsAuto) || isCapsLock.value
+                                        while (totalDragX - lastStepX >= stepPx) { moveCursor(false, sel); performKeyFeedback(); lastStepX += stepPx }
+                                        while (totalDragX - lastStepX <= -stepPx) { moveCursor(true, sel); performKeyFeedback(); lastStepX -= stepPx }
                                     }
                                 }
                                 change.consume()
@@ -1195,6 +1268,124 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         }
     }
 
+    // ---- Toolbar vector icons (same monochrome line style) ----
+    @Composable
+    private fun SmileyGlyph(color: Color, modifier: Modifier) {
+        Canvas(modifier) {
+            val w = size.width; val h = size.height
+            val cx = w / 2f; val cy = h / 2f
+            val r = size.minDimension / 2f * 0.86f
+            val sw = r * 0.16f
+            val stroke = androidx.compose.ui.graphics.drawscope.Stroke(width = sw)
+            drawCircle(color, radius = r, center = androidx.compose.ui.geometry.Offset(cx, cy), style = stroke)
+            drawCircle(color, radius = r * 0.12f, center = androidx.compose.ui.geometry.Offset(cx - r * 0.34f, cy - r * 0.22f))
+            drawCircle(color, radius = r * 0.12f, center = androidx.compose.ui.geometry.Offset(cx + r * 0.34f, cy - r * 0.22f))
+            drawArc(color, startAngle = 25f, sweepAngle = 130f, useCenter = false,
+                topLeft = androidx.compose.ui.geometry.Offset(cx - r * 0.5f, cy - r * 0.35f),
+                size = androidx.compose.ui.geometry.Size(r, r * 0.8f),
+                style = androidx.compose.ui.graphics.drawscope.Stroke(width = sw, cap = androidx.compose.ui.graphics.StrokeCap.Round))
+        }
+    }
+
+    @Composable
+    private fun ClipboardGlyph(color: Color, modifier: Modifier) {
+        Canvas(modifier) {
+            val w = size.width; val h = size.height
+            val sw = h * 0.08f
+            val stroke = androidx.compose.ui.graphics.drawscope.Stroke(width = sw, join = androidx.compose.ui.graphics.StrokeJoin.Round)
+            drawRoundRect(color, topLeft = androidx.compose.ui.geometry.Offset(w * 0.22f, h * 0.20f),
+                size = androidx.compose.ui.geometry.Size(w * 0.56f, h * 0.68f),
+                cornerRadius = androidx.compose.ui.geometry.CornerRadius(w * 0.08f, w * 0.08f), style = stroke)
+            drawRoundRect(color, topLeft = androidx.compose.ui.geometry.Offset(w * 0.38f, h * 0.12f),
+                size = androidx.compose.ui.geometry.Size(w * 0.24f, h * 0.14f),
+                cornerRadius = androidx.compose.ui.geometry.CornerRadius(w * 0.04f, w * 0.04f))
+        }
+    }
+
+    @Composable
+    private fun StarGlyph(color: Color, modifier: Modifier) {
+        Canvas(modifier) {
+            val cx = size.width / 2f; val cy = size.height / 2f
+            val rOut = size.minDimension / 2f * 0.92f
+            val rIn = rOut * 0.42f
+            val path = androidx.compose.ui.graphics.Path()
+            for (i in 0 until 10) {
+                val r = if (i % 2 == 0) rOut else rIn
+                val a = Math.toRadians((-90.0 + i * 36.0))
+                val x = cx + (kotlin.math.cos(a) * r).toFloat()
+                val y = cy + (kotlin.math.sin(a) * r).toFloat()
+                if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+            }
+            path.close()
+            drawPath(path, color)
+        }
+    }
+
+    @Composable
+    private fun GearGlyph(color: Color, modifier: Modifier) {
+        Canvas(modifier) {
+            val cx = size.width / 2f; val cy = size.height / 2f
+            val r = size.minDimension / 2f
+            val sw = r * 0.18f
+            // teeth
+            for (i in 0 until 8) {
+                val a = Math.toRadians((i * 45.0))
+                val ca = kotlin.math.cos(a).toFloat(); val sa = kotlin.math.sin(a).toFloat()
+                drawLine(color,
+                    androidx.compose.ui.geometry.Offset(cx + ca * r * 0.62f, cy + sa * r * 0.62f),
+                    androidx.compose.ui.geometry.Offset(cx + ca * r * 0.92f, cy + sa * r * 0.92f),
+                    strokeWidth = sw * 1.6f, cap = androidx.compose.ui.graphics.StrokeCap.Round)
+            }
+            drawCircle(color, radius = r * 0.55f, center = androidx.compose.ui.geometry.Offset(cx, cy),
+                style = androidx.compose.ui.graphics.drawscope.Stroke(width = sw))
+        }
+    }
+
+    @Composable
+    private fun SelectAllGlyph(color: Color, modifier: Modifier) {
+        Canvas(modifier) {
+            val w = size.width; val h = size.height
+            val sw = h * 0.08f
+            val dashed = androidx.compose.ui.graphics.drawscope.Stroke(
+                width = sw,
+                pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(w * 0.12f, w * 0.08f))
+            )
+            drawRoundRect(color, topLeft = androidx.compose.ui.geometry.Offset(w * 0.16f, h * 0.16f),
+                size = androidx.compose.ui.geometry.Size(w * 0.68f, h * 0.68f),
+                cornerRadius = androidx.compose.ui.geometry.CornerRadius(w * 0.06f, w * 0.06f), style = dashed)
+        }
+    }
+
+    // Circular undo/redo arrow. mirror=true → redo.
+    @Composable
+    private fun CurvedArrowGlyph(color: Color, mirror: Boolean, modifier: Modifier) {
+        Canvas(modifier) {
+            val w = size.width; val h = size.height
+            val cx = w / 2f; val cy = h / 2f
+            val r = size.minDimension / 2f * 0.62f
+            val sw = h * 0.10f
+            val cap = androidx.compose.ui.graphics.StrokeCap.Round
+            val startDeg = 290f
+            val sweepDeg = if (!mirror) 230f else -230f
+            drawArc(color, startDeg, sweepDeg, false,
+                topLeft = androidx.compose.ui.geometry.Offset(cx - r, cy - r),
+                size = androidx.compose.ui.geometry.Size(2 * r, 2 * r),
+                style = androidx.compose.ui.graphics.drawscope.Stroke(width = sw, cap = cap))
+            val endDeg = startDeg + sweepDeg
+            val endRad = Math.toRadians(endDeg.toDouble())
+            val ex = cx + (r * kotlin.math.cos(endRad)).toFloat()
+            val ey = cy + (r * kotlin.math.sin(endRad)).toFloat()
+            val tanDeg = endDeg + (if (sweepDeg > 0) 90f else -90f)
+            val ah = r * 0.7f
+            for (off in listOf(150.0, -150.0)) {
+                val a = Math.toRadians(tanDeg + off)
+                drawLine(color, androidx.compose.ui.geometry.Offset(ex, ey),
+                    androidx.compose.ui.geometry.Offset(ex + (ah * kotlin.math.cos(a)).toFloat(), ey + (ah * kotlin.math.sin(a)).toFloat()),
+                    strokeWidth = sw, cap = cap)
+            }
+        }
+    }
+
     @Composable
     private fun BackspaceGlyph(color: Color, modifier: Modifier) {
         Canvas(modifier) {
@@ -1336,6 +1527,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         iconColor: Color,
         height: androidx.compose.ui.unit.Dp,
         modifier: Modifier,
+        locked: Boolean = false,
         onClick: () -> Unit
     ) {
         val interaction = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
@@ -1367,6 +1559,15 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     close()
                 }
                 drawPath(path, color = iconColor)
+                // Caps-lock indicator: an underline bar
+                if (locked) {
+                    drawLine(
+                        color = iconColor,
+                        start = androidx.compose.ui.geometry.Offset(w * 0.32f, h * 0.96f),
+                        end = androidx.compose.ui.geometry.Offset(w * 0.68f, h * 0.96f),
+                        strokeWidth = h * 0.07f
+                    )
+                }
             }
         }
     }
@@ -1642,6 +1843,12 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         else { c.deleteSurroundingText(target.length, 0); c.commitText(out, 1) }
                     }
                     statusText.value = ""
+                    // Offer a quick undo of the rewrite
+                    rewriteBackup = target
+                    rewriteResult = out
+                    showUndoRewrite.value = true
+                    handler.removeCallbacks(hideUndoRewrite)
+                    handler.postDelayed(hideUndoRewrite, 8000)
                 } else {
                     statusText.value = err ?: "Rewrite failed"
                     handler.postDelayed({ statusText.value = "" }, 2500)
@@ -1839,7 +2046,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         val afterSentence = before.length == 2 && before[1] == ' ' &&
             (before[0] == '.' || before[0] == '!' || before[0] == '?' || before[0] == '\n')
         val afterNewline = before.isNotEmpty() && before.last() == '\n'
-        if (atStart || afterSentence || afterNewline) isShift.value = true
+        if ((atStart || afterSentence || afterNewline) && !isShift.value) {
+            isShift.value = true
+            shiftIsAuto = true
+        }
     }
 
     private fun scheduleSpellcheck() {
@@ -1936,18 +2146,43 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     }
 
     // Move the text cursor one character left/right (space-bar swipe).
-    private fun moveCursor(left: Boolean) {
+    private fun moveCursor(left: Boolean, select: Boolean = false) {
         val ic = currentInputConnection ?: return
         val code = if (left) android.view.KeyEvent.KEYCODE_DPAD_LEFT else android.view.KeyEvent.KEYCODE_DPAD_RIGHT
-        ic.sendKeyEvent(android.view.KeyEvent(android.view.KeyEvent.ACTION_DOWN, code))
-        ic.sendKeyEvent(android.view.KeyEvent(android.view.KeyEvent.ACTION_UP, code))
+        val meta = if (select) android.view.KeyEvent.META_SHIFT_ON or android.view.KeyEvent.META_SHIFT_LEFT_ON else 0
+        ic.sendKeyEvent(android.view.KeyEvent(0, 0, android.view.KeyEvent.ACTION_DOWN, code, 0, meta))
+        ic.sendKeyEvent(android.view.KeyEvent(0, 0, android.view.KeyEvent.ACTION_UP, code, 0, meta))
     }
 
-    // Open Keyo settings directly from the keyboard (long-press the period and pick ⚙).
-    private fun openSettings() {
+    // Shift tap handling: single = one-shot shift, double-tap = caps lock.
+    private fun onShiftTap() {
+        performKeyFeedback()
+        shiftIsAuto = false   // this is a deliberate Shift, so it enables selection on space-swipe
+        val now = System.currentTimeMillis()
+        if (now - lastShiftTapMs < 300) {
+            isCapsLock.value = true
+            isShift.value = true
+        } else if (isCapsLock.value) {
+            isCapsLock.value = false; isShift.value = false
+        } else {
+            isShift.value = !isShift.value
+        }
+        lastShiftTapMs = now
+    }
+
+    private fun performUndoRewrite() {
+        val ic = currentInputConnection ?: return
+        if (rewriteResult.isNotEmpty()) ic.deleteSurroundingText(rewriteResult.length, 0)
+        ic.commitText(rewriteBackup, 1)
+        showUndoRewrite.value = false
+    }
+
+    // Open Keyo settings directly from the keyboard, optionally deep-linked to a section.
+    private fun openSettings(section: String? = null) {
         try {
             startActivity(Intent(this, SettingsActivity::class.java).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                if (section != null) putExtra("section", section)
             })
         } catch (e: Exception) {
             android.util.Log.e("Keyo", "openSettings failed", e)
