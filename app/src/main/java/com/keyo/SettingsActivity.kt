@@ -135,6 +135,30 @@ class SettingsActivity : ComponentActivity() {
                         if (micOk) openAppSettings() else requestPermission.launch(Manifest.permission.RECORD_AUDIO)
                     }
                 }
+                Hint("One-time setup — complete the three steps to start using Keyo.")
+
+                // ===== How to use =====
+                ExpandableSection("How to use", "Gestures & shortcuts") {
+                    Column(Modifier.padding(horizontal = 16.dp, vertical = 10.dp)) {
+                        listOf(
+                            "Dictate" to "Long-press the space bar and speak; release to insert.",
+                            "Move cursor" to "Swipe left/right on the space bar.",
+                            "Select text" to "Hold Shift, then swipe the space bar.",
+                            "AI task (voice)" to "Hold the comma/✨ key (left of space) and speak a command — call, SMS, alarm, write a message, etc.",
+                            "Improve & format" to "Tap ✨ in the top bar: rewrite, translate, change tone, bold/italic. Works on selected text (or the whole message).",
+                            "Caps Lock" to "Double-tap Shift; tap again to release.",
+                            "Accents & extra symbols" to "Long-press a letter and slide to the variant.",
+                            "Quick settings" to "Long-press the period and pick the ⚙ icon.",
+                            "Switch language" to "Tap the 🌐 key (right of comma) or swipe the space bar.",
+                            "Emoji · Clipboard · Phrases" to "Open them from the icons in the top bar."
+                        ).forEach { (a, b) ->
+                            Column(Modifier.padding(vertical = 5.dp)) {
+                                Text(a, fontSize = 14.sp, fontWeight = FontWeight.Medium, color = textPrimary)
+                                Text(b, fontSize = 12.sp, color = textMuted)
+                            }
+                        }
+                    }
+                }
 
                 // ===== Languages =====
                 SectionLabel("Languages")
@@ -149,14 +173,14 @@ class SettingsActivity : ComponentActivity() {
                         }
                     }
                 }
-                Hint("Switch with the 🌐 key or by swiping the space bar.")
+                Hint("Switch with the 🌐 key or by swiping the space bar. Latvian diacritics (ā č ē ī š ž…) are on long-press.")
 
                 // ===== Keyboard size (collapsible visual editor) =====
                 var keyH by remember { mutableStateOf(KeyboardPrefs.getKeyHeight(this@SettingsActivity)) }
                 var vGap by remember { mutableStateOf(KeyboardPrefs.getVGap(this@SettingsActivity)) }
                 var hGap by remember { mutableStateOf(KeyboardPrefs.getHGap(this@SettingsActivity)) }
                 var testText by remember { mutableStateOf("") }
-                ExpandableSection("Keyboard size", "Height ${keyH}dp · spacing ${vGap}/${hGap}") {
+                ExpandableSection("Keyboard size", "Height ${keyH}dp · spacing ${vGap}/${hGap} — tap to adjust") {
                     SliderRow("Key height", keyH, "dp", KeyboardPrefs.KEY_HEIGHT_RANGE) {
                         keyH = it; KeyboardPrefs.setKeyHeight(this@SettingsActivity, it)
                     }
@@ -303,6 +327,7 @@ class SettingsActivity : ComponentActivity() {
 
                 ModelSelector(
                     title = "Transcription model",
+                    subtitle = "Cleans up dictation and powers live spellcheck",
                     models = KeyboardPrefs.AVAILABLE_MODELS,
                     selected = selectedModel
                 ) { modelId ->
@@ -312,6 +337,7 @@ class SettingsActivity : ComponentActivity() {
                 }
                 ModelSelector(
                     title = "AI assistant model",
+                    subtitle = "Powers ✨ Rewrite and the hold-to-speak AI tasks",
                     models = KeyboardPrefs.AVAILABLE_MODELS,
                     selected = selectedAiModel
                 ) { modelId ->
@@ -320,7 +346,7 @@ class SettingsActivity : ComponentActivity() {
                     GroqApi.aiModel = modelId
                 }
                 Group {
-                    ToggleRow("Auto-correction", "LLM cleans up voice transcription", autocorrect) {
+                    ToggleRow("Auto-correction", "Tidies up dictation: punctuation, fillers, casing", autocorrect) {
                         autocorrect = it; KeyboardPrefs.setAutocorrectEnabled(this@SettingsActivity, it)
                     }
                     Divider(color = divider, thickness = 1.dp)
@@ -328,6 +354,7 @@ class SettingsActivity : ComponentActivity() {
                         spellcheck = it; KeyboardPrefs.setSpellcheckEnabled(this@SettingsActivity, it)
                     }
                 }
+                Hint("Voice, spellcheck and AI use the Groq API (set the key below). They're disabled in password fields.")
 
                 // ===== Groq API key (collapsible) =====
                 var apiKey by remember { mutableStateOf(KeyboardPrefs.getApiKey(this@SettingsActivity)) }
@@ -637,6 +664,7 @@ class SettingsActivity : ComponentActivity() {
     @Composable
     private fun ModelSelector(
         title: String,
+        subtitle: String,
         models: List<Pair<String, String>>,
         selected: String,
         onSelect: (String) -> Unit
@@ -648,6 +676,7 @@ class SettingsActivity : ComponentActivity() {
                 RowScaffold(onClick = { expanded = true }) {
                     Column(Modifier.weight(1f)) {
                         Text(title, fontSize = 15.sp, fontWeight = FontWeight.Medium, color = textPrimary)
+                        Text(subtitle, fontSize = 12.sp, color = textMuted)
                         Text(currentLabel, fontSize = 12.sp, color = accent)
                     }
                     Text("▾", fontSize = 16.sp, color = textMuted)

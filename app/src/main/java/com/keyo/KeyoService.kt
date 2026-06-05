@@ -1140,42 +1140,32 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         accentColor: Color
     ) {
         var sub by remember { mutableStateOf("") }
+        val items = when (sub) {
+            "tone" -> REWRITE_TONE
+            "translate" -> REWRITE_TRANSLATE
+            else -> REWRITE_MAIN
+        }
         Column(modifier = Modifier.fillMaxWidth().height(keyHeight * (maxContentRows + 1))) {
-            // Formatting chips + back
-            Row(
-                modifier = Modifier.fillMaxWidth().height(40.dp).padding(horizontal = 10.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                FormatChip("𝐁", textColor, keyColor) { applyFormatToSelection(true) }
-                Spacer(Modifier.width(8.dp))
-                FormatChip("𝐼", textColor, keyColor) { applyFormatToSelection(false) }
-                Spacer(Modifier.weight(1f))
-                if (sub.isNotEmpty()) {
-                    Text("‹ Back", color = accentColor, fontSize = 14.sp,
-                        modifier = Modifier.clickable { sub = "" })
-                }
-            }
-            androidx.compose.material3.Divider(color = textColor.copy(alpha = 0.12f))
-
-            val items = when (sub) {
-                "tone" -> REWRITE_TONE
-                "translate" -> REWRITE_TRANSLATE
-                else -> REWRITE_MAIN
-            }
             androidx.compose.foundation.lazy.LazyColumn(modifier = Modifier.fillMaxWidth().weight(1f)) {
+                if (sub.isNotEmpty()) {
+                    item {
+                        RewriteRow("‹  Back", false, accentColor, accentColor) { sub = "" }
+                        androidx.compose.material3.Divider(color = textColor.copy(alpha = 0.06f))
+                    }
+                } else {
+                    // Formatting actions (apply to the selected text), styled like the other rows
+                    item {
+                        RewriteRow("𝐁   Bold selection", false, textColor, accentColor) { applyFormatToSelection(true) }
+                        androidx.compose.material3.Divider(color = textColor.copy(alpha = 0.06f))
+                        RewriteRow("𝐼   Italic selection", false, textColor, accentColor) { applyFormatToSelection(false) }
+                        androidx.compose.material3.Divider(color = textColor.copy(alpha = 0.12f))
+                    }
+                }
                 items(items.size) { i ->
                     val (label, instr, subKey) = items[i]
-                    Row(
-                        modifier = Modifier.fillMaxWidth()
-                            .clickable {
-                                if (subKey != null) sub = subKey
-                                else if (instr != null) runRewrite(instr)
-                            }
-                            .padding(horizontal = 16.dp, vertical = 12.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(label, color = textColor, fontSize = 15.sp, modifier = Modifier.weight(1f))
-                        if (subKey != null) Text("›", color = accentColor, fontSize = 18.sp)
+                    RewriteRow(label, subKey != null, textColor, accentColor) {
+                        if (subKey != null) sub = subKey
+                        else if (instr != null) runRewrite(instr)
                     }
                     androidx.compose.material3.Divider(color = textColor.copy(alpha = 0.06f))
                 }
@@ -1185,14 +1175,16 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     }
 
     @Composable
-    private fun FormatChip(label: String, textColor: Color, keyColor: Color, onClick: () -> Unit) {
-        Box(
-            modifier = Modifier.height(30.dp).widthIn(min = 46.dp)
-                .background(keyColor, RoundedCornerShape(8.dp))
+    private fun RewriteRow(label: String, hasArrow: Boolean, labelColor: Color, accentColor: Color, onClick: () -> Unit) {
+        Row(
+            modifier = Modifier.fillMaxWidth()
                 .clickable { onClick() }
-                .padding(horizontal = 14.dp),
-            contentAlignment = Alignment.Center
-        ) { Text(label, color = textColor, fontSize = 16.sp) }
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(label, color = labelColor, fontSize = 15.sp, modifier = Modifier.weight(1f))
+            if (hasArrow) Text("›", color = accentColor, fontSize = 18.sp)
+        }
     }
 
     @Composable
@@ -1326,17 +1318,32 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         Canvas(modifier) {
             val cx = size.width / 2f; val cy = size.height / 2f
             val r = size.minDimension / 2f
-            val sw = r * 0.18f
-            // teeth
-            for (i in 0 until 8) {
-                val a = Math.toRadians((i * 45.0))
-                val ca = kotlin.math.cos(a).toFloat(); val sa = kotlin.math.sin(a).toFloat()
-                drawLine(color,
-                    androidx.compose.ui.geometry.Offset(cx + ca * r * 0.62f, cy + sa * r * 0.62f),
-                    androidx.compose.ui.geometry.Offset(cx + ca * r * 0.92f, cy + sa * r * 0.92f),
-                    strokeWidth = sw * 1.6f, cap = androidx.compose.ui.graphics.StrokeCap.Round)
+            val sw = r * 0.13f
+            val teeth = 8
+            val step = 360.0 / teeth
+            val tw = step * 0.5          // angular width of each tooth
+            val rOut = r * 0.94f
+            val rIn = r * 0.66f
+            fun pt(angDeg: Double, rad: Float) = androidx.compose.ui.geometry.Offset(
+                cx + (kotlin.math.cos(Math.toRadians(angDeg)) * rad).toFloat(),
+                cy + (kotlin.math.sin(Math.toRadians(angDeg)) * rad).toFloat()
+            )
+            val path = androidx.compose.ui.graphics.Path()
+            for (i in 0 until teeth) {
+                val c = i * step
+                val corners = listOf(
+                    (c - tw / 2) to rIn, (c - tw / 2) to rOut,
+                    (c + tw / 2) to rOut, (c + tw / 2) to rIn
+                )
+                corners.forEachIndexed { idx, (ang, rad) ->
+                    val o = pt(ang, rad)
+                    if (i == 0 && idx == 0) path.moveTo(o.x, o.y) else path.lineTo(o.x, o.y)
+                }
             }
-            drawCircle(color, radius = r * 0.55f, center = androidx.compose.ui.geometry.Offset(cx, cy),
+            path.close()
+            drawPath(path, color, style = androidx.compose.ui.graphics.drawscope.Stroke(
+                width = sw, join = androidx.compose.ui.graphics.StrokeJoin.Round))
+            drawCircle(color, radius = r * 0.30f, center = androidx.compose.ui.geometry.Offset(cx, cy),
                 style = androidx.compose.ui.graphics.drawscope.Stroke(width = sw))
         }
     }
@@ -1356,33 +1363,40 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         }
     }
 
-    // Circular undo/redo arrow. mirror=true → redo.
+    // Circular undo/redo arrow (≈300° arc + a solid triangular arrowhead). mirror=true → redo.
     @Composable
     private fun CurvedArrowGlyph(color: Color, mirror: Boolean, modifier: Modifier) {
         Canvas(modifier) {
             val w = size.width; val h = size.height
             val cx = w / 2f; val cy = h / 2f
-            val r = size.minDimension / 2f * 0.62f
+            val r = size.minDimension / 2f * 0.56f
             val sw = h * 0.10f
-            val cap = androidx.compose.ui.graphics.StrokeCap.Round
-            val startDeg = 290f
-            val sweepDeg = if (!mirror) 230f else -230f
-            drawArc(color, startDeg, sweepDeg, false,
+            fun rad(d: Double) = Math.toRadians(d)
+            val startDeg = if (!mirror) 70.0 else 110.0
+            val sweepDeg = if (!mirror) -300.0 else 300.0
+            drawArc(color, startDeg.toFloat(), sweepDeg.toFloat(), false,
                 topLeft = androidx.compose.ui.geometry.Offset(cx - r, cy - r),
                 size = androidx.compose.ui.geometry.Size(2 * r, 2 * r),
-                style = androidx.compose.ui.graphics.drawscope.Stroke(width = sw, cap = cap))
+                style = androidx.compose.ui.graphics.drawscope.Stroke(width = sw, cap = androidx.compose.ui.graphics.StrokeCap.Round))
+            // Solid triangular arrowhead at the arc's end, aligned with the tangent
             val endDeg = startDeg + sweepDeg
-            val endRad = Math.toRadians(endDeg.toDouble())
-            val ex = cx + (r * kotlin.math.cos(endRad)).toFloat()
-            val ey = cy + (r * kotlin.math.sin(endRad)).toFloat()
-            val tanDeg = endDeg + (if (sweepDeg > 0) 90f else -90f)
-            val ah = r * 0.7f
-            for (off in listOf(150.0, -150.0)) {
-                val a = Math.toRadians(tanDeg + off)
-                drawLine(color, androidx.compose.ui.geometry.Offset(ex, ey),
-                    androidx.compose.ui.geometry.Offset(ex + (ah * kotlin.math.cos(a)).toFloat(), ey + (ah * kotlin.math.sin(a)).toFloat()),
-                    strokeWidth = sw, cap = cap)
+            val ex = cx + (r * kotlin.math.cos(rad(endDeg))).toFloat()
+            val ey = cy + (r * kotlin.math.sin(rad(endDeg))).toFloat()
+            val tan = endDeg + (if (sweepDeg < 0) -90.0 else 90.0)
+            val ah = r * 0.9f
+            val tipX = ex + (kotlin.math.cos(rad(tan)) * ah * 0.5).toFloat()
+            val tipY = ey + (kotlin.math.sin(rad(tan)) * ah * 0.5).toFloat()
+            val bx = ex - (kotlin.math.cos(rad(tan)) * ah * 0.5).toFloat()
+            val by = ey - (kotlin.math.sin(rad(tan)) * ah * 0.5).toFloat()
+            val px = kotlin.math.cos(rad(tan + 90)).toFloat() * ah * 0.5f
+            val py = kotlin.math.sin(rad(tan + 90)).toFloat() * ah * 0.5f
+            val tri = androidx.compose.ui.graphics.Path().apply {
+                moveTo(tipX, tipY)
+                lineTo(bx + px, by + py)
+                lineTo(bx - px, by - py)
+                close()
             }
+            drawPath(tri, color)
         }
     }
 
