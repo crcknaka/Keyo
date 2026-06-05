@@ -79,6 +79,11 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     // to the network: no spellcheck, no voice transcription, no AI.
     private var secureField = false
 
+    // Cached hot-path settings (refreshed in reloadPrefs) to avoid SharedPreferences reads per keystroke.
+    private var doubleSpaceOn = true
+    private var autoCapOn = true
+    private var spellcheckOn = true
+
     private var clipHistory = mutableStateOf<List<String>>(emptyList())
     private var pinnedClips = mutableStateOf<List<String>>(emptyList())
     private var phrasesState = mutableStateOf<List<String>>(emptyList())
@@ -138,6 +143,9 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         pinnedClips.value = KeyboardPrefs.getPinned(this)
         recentEmoji.value = KeyboardPrefs.getRecentEmoji(this)
         phrasesState.value = KeyboardPrefs.getPhrases(this)
+        doubleSpaceOn = KeyboardPrefs.isDoubleSpacePeriod(this)
+        autoCapOn = KeyboardPrefs.isAutoCap(this)
+        spellcheckOn = KeyboardPrefs.isSpellcheckEnabled(this)
     }
 
     // Max content rows any mode shows — keeps the keyboard a fixed height so it never
@@ -303,7 +311,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 .padding(horizontal = 2.dp, vertical = 4.dp)
         ) {
             // Dynamic top toolbar (Gboard-style). Priority: status > quick-paste chip > icons.
-            TopToolbar(status, bgColor, keyColor, textColor, accentColor)
+            TopToolbar(status, textColor, accentColor)
 
             if (mode == "emoji") {
                 EmojiPanel(keyHeight, keyColor, textColor, accentColor)
@@ -623,7 +631,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
 
     // Dynamic top toolbar (Gboard-style): status text, a quick-paste chip, or action icons.
     @Composable
-    fun TopToolbar(status: String, bgColor: Color, keyColor: Color, textColor: Color, accentColor: Color) {
+    fun TopToolbar(status: String, textColor: Color, accentColor: Color) {
         val chip by showClipChip
         val clip by lastClip
         val undo by showUndoRewrite
@@ -683,7 +691,32 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     horizontalArrangement = Arrangement.spacedBy(2.dp),
                     modifier = Modifier.horizontalScroll(rememberScrollState())
                 ) {
-                    ToolbarVec("Rewrite / improve text", { keyboardMode.value = "rewrite" }) { SparkleGlyph(accentColor, Modifier.size(20.dp)) }
+                    Box(
+                        modifier = Modifier.size(40.dp)
+                            .semantics { contentDescription = "Rewrite (tap) or hold to speak an instruction" }
+                            .pointerInput(Unit) {
+                                awaitEachGesture {
+                                    awaitFirstDown()
+                                    var longPressed = false
+                                    val job = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
+                                        kotlinx.coroutines.delay(400)
+                                        longPressed = true
+                                        startCustomRewriteRecording()
+                                    }
+                                    try {
+                                        while (true) {
+                                            val e = awaitPointerEvent()
+                                            val c = e.changes.firstOrNull() ?: break
+                                            if (!c.pressed) { c.consume(); break }
+                                            c.consume()
+                                        }
+                                    } catch (_: kotlinx.coroutines.CancellationException) {}
+                                    job.cancel()
+                                    if (longPressed) stopCustomRewriteRecording() else keyboardMode.value = "rewrite"
+                                }
+                            },
+                        contentAlignment = Alignment.Center
+                    ) { SparkleGlyph(accentColor, Modifier.size(20.dp)) }
                     ToolbarVec("Emoji", { emojiCategory.intValue = if (recentEmoji.value.isEmpty()) 1 else 0; keyboardMode.value = "emoji" }) { SmileyGlyph(textColor, Modifier.size(21.dp)) }
                     ToolbarVec("Clipboard", { keyboardMode.value = "clipboard" }) { ClipboardGlyph(textColor, Modifier.size(20.dp)) }
                     ToolbarVec("Quick phrases", { keyboardMode.value = "phrases" }) { StarGlyph(textColor, Modifier.size(19.dp)) }
@@ -821,7 +854,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     }
                 }
             }
-            PanelBottomBar(keyHeight, keyColor, textColor, accentColor)
+            PanelBottomBar(keyColor, textColor, accentColor)
         }
     }
 
@@ -913,7 +946,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     }
                 }
             }
-            PanelBottomBar(keyHeight, keyColor, textColor, accentColor)
+            PanelBottomBar(keyColor, textColor, accentColor)
         }
     }
 
@@ -970,7 +1003,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     }
                 }
             }
-            PanelBottomBar(keyHeight, keyColor, textColor, accentColor)
+            PanelBottomBar(keyColor, textColor, accentColor)
         }
     }
 
@@ -1010,6 +1043,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 .pointerInput(Unit) {
                     awaitEachGesture {
                         val down = awaitFirstDown()
+                        @Suppress("VARIABLE_WITH_REDUNDANT_INITIALIZER")
                         var totalDragX = 0f
                         var longPressed = false
                         var cursorMode = false
@@ -1121,6 +1155,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         Triple<String, String?, String?>("Friendly", "Rewrite in a warm, friendly tone; keep the language.", null),
         Triple<String, String?, String?>("Bullet points", "Reformat as a short bullet-point list; keep the language.", null),
         Triple<String, String?, String?>("Add emoji", "Add a few fitting emoji without changing the wording; keep the language.", null),
+        Triple<String, String?, String?>("Continue writing", null, "continue"),
         Triple<String, String?, String?>("Tone…", null, "tone"),
         Triple<String, String?, String?>("Translate…", null, "translate")
     )
@@ -1150,8 +1185,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             "translate" -> REWRITE_TRANSLATE
             else -> REWRITE_MAIN
         }
+        val listState = androidx.compose.foundation.lazy.rememberLazyListState()
+        LaunchedEffect(sub) { listState.scrollToItem(0) }  // always start a submenu from the top
         Column(modifier = Modifier.fillMaxWidth().height(keyHeight * (maxContentRows + 1))) {
-            androidx.compose.foundation.lazy.LazyColumn(modifier = Modifier.fillMaxWidth().weight(1f)) {
+            androidx.compose.foundation.lazy.LazyColumn(state = listState, modifier = Modifier.fillMaxWidth().weight(1f)) {
                 if (sub.isNotEmpty()) {
                     item {
                         RewriteRow("‹  Back", false, accentColor, accentColor) { sub = "" }
@@ -1160,14 +1197,17 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 }
                 items(items.size) { i ->
                     val (label, instr, subKey) = items[i]
-                    RewriteRow(label, subKey != null, textColor, accentColor) {
-                        if (subKey != null) sub = subKey
-                        else if (instr != null) runRewrite(instr)
+                    RewriteRow(label, subKey != null && subKey != "continue", textColor, accentColor) {
+                        when {
+                            subKey == "continue" -> runContinue()
+                            subKey != null -> sub = subKey
+                            instr != null -> runRewrite(instr)
+                        }
                     }
                     androidx.compose.material3.Divider(color = textColor.copy(alpha = 0.06f))
                 }
             }
-            PanelBottomBar(keyHeight, keyColor, textColor, accentColor)
+            PanelBottomBar(keyColor, textColor, accentColor)
         }
     }
 
@@ -1186,7 +1226,6 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
 
     @Composable
     private fun PanelBottomBar(
-        keyHeight: androidx.compose.ui.unit.Dp,
         keyColor: Color,
         textColor: Color,
         accentColor: Color
@@ -1875,6 +1914,37 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         }
     }
 
+    // Continue writing: append an AI-generated continuation at the cursor (does not replace).
+    private fun runContinue() {
+        if (secureField) {
+            statusText.value = "🔒 AI is off in password fields"
+            handler.postDelayed({ if (statusText.value.startsWith("🔒")) statusText.value = "" }, 1500)
+            return
+        }
+        val before = currentInputConnection?.getTextBeforeCursor(4000, 0)?.toString() ?: ""
+        if (before.isBlank()) {
+            statusText.value = "✨ Nothing to continue"
+            handler.postDelayed({ if (statusText.value.startsWith("✨")) statusText.value = "" }, 1500)
+            return
+        }
+        keyboardMode.value = "abc"
+        statusText.value = "✨ Writing…"
+        GroqApi.rewrite(before, "Continue this text naturally from where it ends. Output ONLY the continuation to append — do NOT repeat the existing text.") { res, err ->
+            handler.post {
+                if (res != null) {
+                    val out = formatEmphasis(res)
+                    val sep = if (before.isNotEmpty() && !before.last().isWhitespace() &&
+                        out.isNotEmpty() && !out.first().isWhitespace()) " " else ""
+                    currentInputConnection?.commitText(sep + out, 1)
+                    statusText.value = ""
+                } else {
+                    statusText.value = err ?: "Failed"
+                    handler.postDelayed({ statusText.value = "" }, 2500)
+                }
+            }
+        }
+    }
+
     @Composable
     fun KeyButton(
         label: String,
@@ -2041,7 +2111,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private fun commitChar(char: Char) {
         val ic = currentInputConnection
         // Double-space -> ". " (only after a word character)
-        if (char == ' ' && KeyboardPrefs.isDoubleSpacePeriod(this)) {
+        if (char == ' ' && doubleSpaceOn) {
             val before = ic?.getTextBeforeCursor(2, 0)?.toString() ?: ""
             if (before.length == 2 && before[1] == ' ' && before[0].isLetterOrDigit()) {
                 ic?.deleteSurroundingText(1, 0)
@@ -2058,7 +2128,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
 
     // Auto-capitalize: turn shift on at the start of input / a new sentence.
     private fun maybeAutoCapitalize() {
-        if (!KeyboardPrefs.isAutoCap(this)) return
+        if (!autoCapOn) return
         val before = currentInputConnection?.getTextBeforeCursor(2, 0)?.toString() ?: ""
         val atStart = before.isEmpty()
         val afterSentence = before.length == 2 && before[1] == ' ' &&
@@ -2072,7 +2142,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
 
     private fun scheduleSpellcheck() {
         if (secureField) return  // never send text from password/incognito fields
-        if (!KeyboardPrefs.isSpellcheckEnabled(this)) return
+        if (!spellcheckOn) return
         spellcheckRunnable?.let { spellcheckHandler.removeCallbacks(it) }
         spellcheckRunnable = Runnable { runSpellcheck() }
         spellcheckHandler.postDelayed(spellcheckRunnable!!, 2500) // 2.5s after last keystroke
@@ -2329,6 +2399,49 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
 
     // --- AI Assistant mode ---
     private val aiAudioRecorder = AudioRecorder()
+
+    // --- Custom rewrite via voice (long-press the ✨ toolbar icon, speak an instruction) ---
+    private val rewriteRecorder = AudioRecorder()
+    private var customRecording = false
+
+    private fun startCustomRewriteRecording() {
+        if (secureField) {
+            statusText.value = "🔒 AI is off in password fields"
+            handler.postDelayed({ if (statusText.value.startsWith("🔒")) statusText.value = "" }, 1500)
+            return
+        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            statusText.value = "⚠ Mic permission needed"
+            return
+        }
+        if (currentTargetText().isBlank()) {
+            statusText.value = "✨ Type or select text first"
+            handler.postDelayed({ if (statusText.value.startsWith("✨")) statusText.value = "" }, 1500)
+            return
+        }
+        if (rewriteRecorder.start()) {
+            customRecording = true
+            statusText.value = "🎤 Say how to change the text…"
+        }
+    }
+
+    private fun stopCustomRewriteRecording() {
+        if (!customRecording) return
+        customRecording = false
+        val f = File(cacheDir, "rewrite_voice.wav")
+        if (rewriteRecorder.stop(f)) {
+            statusText.value = "⏳ Transcribing…"
+            GroqApi.transcribe(f) { instr, err ->
+                handler.post {
+                    if (!instr.isNullOrBlank()) runRewrite(instr.trim())
+                    else {
+                        statusText.value = err ?: "Couldn't hear that"
+                        handler.postDelayed({ statusText.value = "" }, 2000)
+                    }
+                }
+            }
+        }
+    }
 
     private fun startAIRecording() {
         try {

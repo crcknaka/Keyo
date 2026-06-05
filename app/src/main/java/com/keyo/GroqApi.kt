@@ -22,7 +22,7 @@ object GroqApi {
         .build()
     // API key: user-supplied value (from settings) overrides the build-time default.
     var apiKey: String = BuildConfig.GROQ_API_KEY
-    var model: String = "llama-3.3-70b-versatile"        // for 🎤 transcription cleanup + spellcheck
+    var model: String = "openai/gpt-oss-20b"             // for 🎤 dictation cleanup + ✨ Rewrite (fast)
     var aiModel: String = "openai/gpt-oss-120b"           // for 🤖 AI assistant + tools
 
     // AI assistant conversation history (last N turns)
@@ -33,6 +33,27 @@ object GroqApi {
 
     fun clearAiHistory() {
         aiHistory.clear()
+    }
+
+    private fun usingDefaultKey() = apiKey == BuildConfig.GROQ_API_KEY
+
+    // Per https://console.groq.com/docs/errors — short, actionable messages.
+    fun friendlyError(code: Int, body: String?): String {
+        val serverMsg = try {
+            org.json.JSONObject(body ?: "").getJSONObject("error").getString("message")
+        } catch (_: Exception) { null }
+        return when (code) {
+            429 -> if (usingDefaultKey())
+                "Too many requests on the shared key — add your own free Groq key in Settings"
+            else "Too many requests — wait a few seconds and try again"
+            401, 403 -> "Invalid API key — check Settings → Groq API key"
+            413 -> "Text is too long for the model"
+            422 -> serverMsg?.take(100) ?: "Request couldn't be processed (422)"
+            498 -> "Groq is at capacity — try again shortly"
+            499 -> "Request cancelled"
+            500, 502, 503 -> "Groq is temporarily unavailable — try again"
+            else -> serverMsg?.take(100) ?: "API error $code"
+        }
     }
 
     /** Validate the current API key with a tiny request. callback(ok, errorMessage). */
@@ -54,13 +75,9 @@ object GroqApi {
         client.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) = callback(false, e.message ?: "Network error")
             override fun onResponse(call: Call, response: Response) {
-                response.use {
-                    when {
-                        it.isSuccessful -> callback(true, null)
-                        it.code == 401 -> callback(false, "Invalid key (401)")
-                        else -> callback(false, "HTTP ${it.code}")
-                    }
-                }
+                val b = response.body?.string()
+                if (response.isSuccessful) callback(true, null)
+                else callback(false, friendlyError(response.code, b))
             }
         })
     }
@@ -94,7 +111,7 @@ object GroqApi {
                         callback(null, "Parse error: ${e.message}")
                     }
                 } else {
-                    callback(null, "API error ${response.code}: $responseBody")
+                    callback(null, friendlyError(response.code, responseBody))
                 }
             }
         })
@@ -106,68 +123,22 @@ object GroqApi {
             "output ONLY the resulting text — no explanations, no quotes, no preamble. " +
             "Keep the original language unless the instruction says to translate. " +
             "NEVER output HTML or markdown tags; for emphasis use markers ⟦b⟧bold⟦/b⟧ and ⟦i⟧italic⟦/i⟧."
-        val json = JSONObject().apply {
-            put("model", model)
-            put("messages", JSONArray().apply {
-                put(JSONObject().apply { put("role", "system"); put("content", sys) })
-                put(JSONObject().apply { put("role", "user"); put("content", "Instruction: $instruction\n\nText:\n$text") })
-            })
-            put("temperature", 0.4)
-            put("max_tokens", 2048)
+        val messages = JSONArray().apply {
+            put(JSONObject().apply { put("role", "system"); put("content", sys) })
+            put(JSONObject().apply { put("role", "user"); put("content", "Instruction: $instruction\n\nText:\n$text") })
         }
-        val request = Request.Builder()
-            .url("https://api.groq.com/openai/v1/chat/completions")
-            .addHeader("Authorization", "Bearer $apiKey")
-            .addHeader("Content-Type", "application/json")
-            .post(json.toString().toRequestBody("application/json".toMediaType()))
-            .build()
-        client.newCall(request).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) = callback(null, "Network error: ${e.message}")
-            override fun onResponse(call: Call, response: Response) {
-                val body = response.body?.string()
-                if (response.isSuccessful && body != null) {
-                    try {
-                        val content = JSONObject(body).getJSONArray("choices").getJSONObject(0)
-                            .getJSONObject("message").getString("content")
-                        callback(content.trim(), null)
-                    } catch (e: Exception) { callback(null, "Parse error: ${e.message}") }
-                } else callback(null, "API error ${response.code}")
-            }
-        })
+        chat(model, messages, 0.4, 2048, 0, callback)
     }
 
     /** Find emoji matching a query (any language). Returns a string of emoji characters. */
     fun suggestEmojis(query: String, callback: (String?, String?) -> Unit) {
         val sys = "You are an emoji search engine. For the given word or phrase (any language), reply with " +
             "ONLY relevant emoji characters (10-30 of them), most relevant first. No words, no explanations."
-        val json = JSONObject().apply {
-            put("model", "llama-3.1-8b-instant")
-            put("messages", JSONArray().apply {
-                put(JSONObject().apply { put("role", "system"); put("content", sys) })
-                put(JSONObject().apply { put("role", "user"); put("content", query) })
-            })
-            put("temperature", 0.3)
-            put("max_tokens", 200)
+        val messages = JSONArray().apply {
+            put(JSONObject().apply { put("role", "system"); put("content", sys) })
+            put(JSONObject().apply { put("role", "user"); put("content", query) })
         }
-        val request = Request.Builder()
-            .url("https://api.groq.com/openai/v1/chat/completions")
-            .addHeader("Authorization", "Bearer $apiKey")
-            .addHeader("Content-Type", "application/json")
-            .post(json.toString().toRequestBody("application/json".toMediaType()))
-            .build()
-        client.newCall(request).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) = callback(null, e.message)
-            override fun onResponse(call: Call, response: Response) {
-                val body = response.body?.string()
-                if (response.isSuccessful && body != null) {
-                    try {
-                        val content = JSONObject(body).getJSONArray("choices").getJSONObject(0)
-                            .getJSONObject("message").getString("content")
-                        callback(content.trim(), null)
-                    } catch (e: Exception) { callback(null, e.message) }
-                } else callback(null, "API error ${response.code}")
-            }
-        })
+        chat("llama-3.1-8b-instant", messages, 0.3, 200, 0, callback)
     }
 
     fun executeTask(task: String, context: Context? = null, callback: (String?, String?) -> Unit) {
@@ -211,7 +182,7 @@ Rules:
                 callback(result, null)
             } catch (e: Exception) {
                 Log.e(TAG, "executeTask failed", e)
-                callback(null, "Error: ${e.message}")
+                callback(null, e.message ?: "Failed")
             }
         }
     }
@@ -318,118 +289,92 @@ Rules:
         return "Too many execution steps"
     }
 
-    private fun callGroqSync(json: JSONObject): String? {
+    // Shared chat-completion call with automatic retry/back-off on 429 (rate limit) and 5xx.
+    private fun chat(
+        model: String,
+        messages: JSONArray,
+        temperature: Double,
+        maxTokens: Int,
+        attempt: Int = 0,
+        callback: (String?, String?) -> Unit
+    ) {
+        val json = JSONObject().apply {
+            put("model", model)
+            put("messages", messages)
+            put("temperature", temperature)
+            put("max_tokens", maxTokens)
+        }
         val request = Request.Builder()
             .url("https://api.groq.com/openai/v1/chat/completions")
             .addHeader("Authorization", "Bearer $apiKey")
             .addHeader("Content-Type", "application/json")
             .post(json.toString().toRequestBody("application/json".toMediaType()))
             .build()
+        client.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) = callback(null, "Network error: ${e.message}")
+            override fun onResponse(call: Call, response: Response) {
+                val body = response.body?.string()
+                when {
+                    response.isSuccessful && body != null -> {
+                        try {
+                            val content = JSONObject(body).getJSONArray("choices").getJSONObject(0)
+                                .getJSONObject("message").getString("content")
+                            callback(content.trim(), null)
+                        } catch (e: Exception) { callback(null, "Parse error: ${e.message}") }
+                    }
+                    (response.code == 429 || response.code in 500..599) && attempt < 2 -> {
+                        try { Thread.sleep(1000L * (attempt + 1)) } catch (_: InterruptedException) {}
+                        chat(model, messages, temperature, maxTokens, attempt + 1, callback)
+                    }
+                    else -> callback(null, friendlyError(response.code, body))
+                }
+            }
+        })
+    }
 
-        val response = client.newCall(request).execute()
-        val body = response.body?.string()
-        if (!response.isSuccessful) {
+    private fun callGroqSync(json: JSONObject): String? {
+        var attempt = 0
+        while (true) {
+            val request = Request.Builder()
+                .url("https://api.groq.com/openai/v1/chat/completions")
+                .addHeader("Authorization", "Bearer $apiKey")
+                .addHeader("Content-Type", "application/json")
+                .post(json.toString().toRequestBody("application/json".toMediaType()))
+                .build()
+            val response = client.newCall(request).execute()
+            val body = response.body?.string()
+            if (response.isSuccessful) return body
+            if ((response.code == 429 || response.code in 500..599) && attempt < 2) {
+                attempt++
+                try { Thread.sleep(1000L * attempt) } catch (_: InterruptedException) {}
+                continue
+            }
             Log.e(TAG, "Groq API error ${response.code}: $body")
-            throw IOException("API error ${response.code}")
+            throw IOException(friendlyError(response.code, body))
         }
-        return body
     }
 
     private const val TAG = "GroqApi"
 
     fun spellcheck(text: String, callback: (String?, String?) -> Unit) {
-        val json = JSONObject().apply {
-            put("model", "llama-3.1-8b-instant") // Fast model for spellcheck
-            put("messages", JSONArray().apply {
-                put(JSONObject().apply {
-                    put("role", "system")
-                    put("content", "You are a spellcheck tool. Fix typos and minor errors in the text. Rules: 1) ONLY fix obvious typos and misspellings. 2) Do NOT change meaning, style, or word choice. 3) Do NOT add or remove words. 4) Do NOT change punctuation unless clearly wrong. 5) If text has no errors, output it EXACTLY as is. 6) Output ONLY the corrected text, nothing else. 7) Support English, Russian, Latvian, and mixed text.")
-                })
-                put(JSONObject().apply {
-                    put("role", "user")
-                    put("content", text)
-                })
+        val messages = JSONArray().apply {
+            put(JSONObject().apply {
+                put("role", "system")
+                put("content", "You are a spellcheck tool. Fix typos and minor errors in the text. Rules: 1) ONLY fix obvious typos and misspellings. 2) Do NOT change meaning, style, or word choice. 3) Do NOT add or remove words. 4) Do NOT change punctuation unless clearly wrong. 5) If text has no errors, output it EXACTLY as is. 6) Output ONLY the corrected text, nothing else. 7) Support English, Russian, Latvian, and mixed text.")
             })
-            put("temperature", 0.1)
-            put("max_tokens", 1024)
+            put(JSONObject().apply { put("role", "user"); put("content", text) })
         }
-
-        val request = Request.Builder()
-            .url("https://api.groq.com/openai/v1/chat/completions")
-            .addHeader("Authorization", "Bearer $apiKey")
-            .addHeader("Content-Type", "application/json")
-            .post(json.toString().toRequestBody("application/json".toMediaType()))
-            .build()
-
-        client.newCall(request).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) {
-                callback(null, "Network error: ${e.message}")
-            }
-            override fun onResponse(call: Call, response: Response) {
-                val responseBody = response.body?.string()
-                if (response.isSuccessful && responseBody != null) {
-                    try {
-                        val content = JSONObject(responseBody)
-                            .getJSONArray("choices")
-                            .getJSONObject(0)
-                            .getJSONObject("message")
-                            .getString("content")
-                        callback(content.trim(), null)
-                    } catch (e: Exception) {
-                        callback(null, "Parse error: ${e.message}")
-                    }
-                } else {
-                    callback(null, "API error ${response.code}")
-                }
-            }
-        })
+        chat("llama-3.1-8b-instant", messages, 0.1, 1024, 0, callback)
     }
 
     fun cleanupText(rawText: String, callback: (String?, String?) -> Unit) {
-        val json = JSONObject().apply {
-            put("model", model)
-            put("messages", JSONArray().apply {
-                put(JSONObject().apply {
-                    put("role", "system")
-                    put("content", "You are a speech-to-text cleanup tool. Take raw transcription and output the SAME text but cleaned up. Rules: 1) Keep the EXACT meaning and intent — if the user said a question, output a question. NEVER answer questions, just clean them up. 2) Fix punctuation, capitalization, minor grammar. 3) Remove filler words (uh, um, эээ, ммм), false starts, repetitions. 4) If there's a mix of languages (English, Russian, Latvian), preserve them as spoken. 5) Output ONLY the cleaned text. Do NOT add anything, do NOT answer, do NOT explain.")
-                })
-                put(JSONObject().apply {
-                    put("role", "user")
-                    put("content", rawText)
-                })
+        val messages = JSONArray().apply {
+            put(JSONObject().apply {
+                put("role", "system")
+                put("content", "You are a speech-to-text cleanup tool. Take raw transcription and output the SAME text but cleaned up. Rules: 1) Keep the EXACT meaning and intent — if the user said a question, output a question. NEVER answer questions, just clean them up. 2) Fix punctuation, capitalization, minor grammar. 3) Remove filler words (uh, um, эээ, ммм), false starts, repetitions. 4) If there's a mix of languages (English, Russian, Latvian), preserve them as spoken. 5) Output ONLY the cleaned text. Do NOT add anything, do NOT answer, do NOT explain.")
             })
-            put("temperature", 0.3)
-            put("max_tokens", 2048)
+            put(JSONObject().apply { put("role", "user"); put("content", rawText) })
         }
-
-        val request = Request.Builder()
-            .url("https://api.groq.com/openai/v1/chat/completions")
-            .addHeader("Authorization", "Bearer $apiKey")
-            .addHeader("Content-Type", "application/json")
-            .post(json.toString().toRequestBody("application/json".toMediaType()))
-            .build()
-
-        client.newCall(request).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) {
-                callback(null, "Network error: ${e.message}")
-            }
-            override fun onResponse(call: Call, response: Response) {
-                val responseBody = response.body?.string()
-                if (response.isSuccessful && responseBody != null) {
-                    try {
-                        val content = JSONObject(responseBody)
-                            .getJSONArray("choices")
-                            .getJSONObject(0)
-                            .getJSONObject("message")
-                            .getString("content")
-                        callback(content.trim(), null)
-                    } catch (e: Exception) {
-                        callback(null, "Parse error: ${e.message}")
-                    }
-                } else {
-                    callback(null, "API error ${response.code}: $responseBody")
-                }
-            }
-        })
+        chat(model, messages, 0.3, 2048, 0, callback)
     }
 }

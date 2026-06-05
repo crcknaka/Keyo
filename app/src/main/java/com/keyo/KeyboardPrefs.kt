@@ -46,7 +46,7 @@ object KeyboardPrefs {
         prefs(context).unregisterOnSharedPreferenceChangeListener(l)
 
     fun getModel(context: Context): String {
-        return prefs(context).getString(KEY_MODEL, "llama-3.3-70b-versatile") ?: "llama-3.3-70b-versatile"
+        return prefs(context).getString(KEY_MODEL, "openai/gpt-oss-20b") ?: "openai/gpt-oss-20b"
     }
 
     fun setModel(context: Context, model: String) {
