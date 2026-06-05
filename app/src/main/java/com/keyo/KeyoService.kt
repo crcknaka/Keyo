@@ -250,6 +250,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         isShift.value = false
         isCapsLock.value = false
         showUndoRewrite.value = false
+        keyboardMode.value = "abc"   // always open as the normal keyboard, ready to type
         maybeAutoCapitalize()
     }
 
@@ -280,7 +281,6 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     @Composable
     fun KeyboardLayout() {
         val lang by currentLang
-        val recording by isRecording
         val status by statusText
         val shift by isShift
         val mode by keyboardMode
@@ -1014,6 +1014,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         var longPressed = false
                         var cursorMode = false
                         var lastStepX = 0f
+                        var selectedDuringSwipe = false
                         micCancelled = false
                         micDragX = 0f
                         spacePressed = true
@@ -1048,8 +1049,8 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                         val stepPx = 28f
                                         // Only a deliberate Shift (not auto-capitalize) turns swipe into selection
                                         val sel = (isShift.value && !shiftIsAuto) || isCapsLock.value
-                                        while (totalDragX - lastStepX >= stepPx) { moveCursor(false, sel); performKeyFeedback(); lastStepX += stepPx }
-                                        while (totalDragX - lastStepX <= -stepPx) { moveCursor(true, sel); performKeyFeedback(); lastStepX -= stepPx }
+                                        while (totalDragX - lastStepX >= stepPx) { moveCursor(false, sel); performKeyFeedback(); lastStepX += stepPx; selectedDuringSwipe = sel }
+                                        while (totalDragX - lastStepX <= -stepPx) { moveCursor(true, sel); performKeyFeedback(); lastStepX -= stepPx; selectedDuringSwipe = sel }
                                     }
                                 }
                                 change.consume()
@@ -1066,6 +1067,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         } else if (!cursorMode) {
                             performKeyFeedback()
                             commitChar(' ')
+                        }
+                        // Consume the armed (manual) Shift after a selection swipe so typing isn't capitalized
+                        if (selectedDuringSwipe && isShift.value && !shiftIsAuto && !isCapsLock.value) {
+                            isShift.value = false
                         }
                     }
                 },
@@ -1151,14 +1156,6 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     item {
                         RewriteRow("‹  Back", false, accentColor, accentColor) { sub = "" }
                         androidx.compose.material3.Divider(color = textColor.copy(alpha = 0.06f))
-                    }
-                } else {
-                    // Formatting actions (apply to the selected text), styled like the other rows
-                    item {
-                        RewriteRow("𝐁   Bold selection", false, textColor, accentColor) { applyFormatToSelection(true) }
-                        androidx.compose.material3.Divider(color = textColor.copy(alpha = 0.06f))
-                        RewriteRow("𝐼   Italic selection", false, textColor, accentColor) { applyFormatToSelection(false) }
-                        androidx.compose.material3.Divider(color = textColor.copy(alpha = 0.12f))
                     }
                 }
                 items(items.size) { i ->
@@ -1544,18 +1541,37 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         locked: Boolean = false,
         onClick: () -> Unit
     ) {
-        val interaction = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
-        val pressed by interaction.collectIsPressedAsState()
+        var pressed by remember { mutableStateOf(false) }
         val base = if (active) accentColor else keyColor
         Box(
             modifier = modifier
                 .height(height)
                 .padding(horizontal = keyHGapDp.intValue.dp, vertical = keyVGapDp.intValue.dp)
                 .background(if (pressed) lerp(base, Color.Black, 0.22f) else base, RoundedCornerShape(6.dp))
-                .semantics { contentDescription = "Shift" }
-                .clickable(interactionSource = interaction, indication = null) {
-                    performKeyFeedback()
-                    onClick()
+                .semantics { contentDescription = "Shift. Hold to select text by swiping the space bar" }
+                .pointerInput(Unit) {
+                    awaitEachGesture {
+                        awaitFirstDown()
+                        pressed = true
+                        var longPressed = false
+                        // Hold Shift to arm text-selection mode (with a haptic cue).
+                        val job = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
+                            kotlinx.coroutines.delay(250)
+                            longPressed = true
+                            armSelection()
+                        }
+                        try {
+                            while (true) {
+                                val e = awaitPointerEvent()
+                                val c = e.changes.firstOrNull() ?: break
+                                if (!c.pressed) { c.consume(); break }
+                                c.consume()
+                            }
+                        } catch (_: kotlinx.coroutines.CancellationException) {}
+                        job.cancel()
+                        pressed = false
+                        if (!longPressed) onClick()
+                    }
                 },
             contentAlignment = Alignment.Center
         ) {
@@ -1794,18 +1810,6 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         var t = Regex("⟦b⟧(.*?)⟦/b⟧", RegexOption.DOT_MATCHES_ALL).replace(text) { applyBold(it.groupValues[1]) }
         t = Regex("⟦i⟧(.*?)⟦/i⟧", RegexOption.DOT_MATCHES_ALL).replace(t) { applyItalic(it.groupValues[1]) }
         return t.replace("⟦b⟧", "").replace("⟦/b⟧", "").replace("⟦i⟧", "").replace("⟦/i⟧", "")
-    }
-
-    private fun applyFormatToSelection(bold: Boolean) {
-        val ic = currentInputConnection ?: return
-        val sel = ic.getSelectedText(0)
-        if (sel.isNullOrEmpty()) {
-            statusText.value = "Select text to format"
-            handler.postDelayed({ if (statusText.value.startsWith("Select")) statusText.value = "" }, 1500)
-            return
-        }
-        performKeyFeedback()
-        ic.commitText(if (bold) applyBold(sel.toString()) else applyItalic(sel.toString()), 1)
     }
 
     // Selected text, or the text just before the cursor (for AI features).
@@ -2182,6 +2186,15 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             isShift.value = !isShift.value
         }
         lastShiftTapMs = now
+    }
+
+    // Hold-Shift: arm selection mode (swipe the space bar to select) with a haptic cue.
+    private fun armSelection() {
+        isShift.value = true
+        shiftIsAuto = false
+        performKeyFeedback()
+        statusText.value = "⇧ Swipe space to select"
+        handler.postDelayed({ if (statusText.value.startsWith("⇧")) statusText.value = "" }, 1500)
     }
 
     private fun performUndoRewrite() {
