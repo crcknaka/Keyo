@@ -474,6 +474,21 @@ class SettingsActivity : ComponentActivity() {
                     textAlign = TextAlign.Center,
                     modifier = Modifier.fillMaxWidth()
                 )
+                Spacer(Modifier.height(10.dp))
+                Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("Brought to you by SitesPro", fontSize = 12.sp, color = textFaint)
+                    Text(
+                        "sitespro.org",
+                        fontSize = 13.sp, color = accent, fontWeight = FontWeight.Medium,
+                        modifier = Modifier
+                            .padding(top = 2.dp)
+                            .clickable {
+                                try {
+                                    startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse("https://sitespro.org")))
+                                } catch (_: Exception) {}
+                            }
+                    )
+                }
                 Spacer(Modifier.height(28.dp))
             }
         }
