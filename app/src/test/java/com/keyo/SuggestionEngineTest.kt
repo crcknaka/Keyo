@@ -1,6 +1,7 @@
 package com.keyo
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -87,6 +88,48 @@ class SuggestionEngineTest {
 
     @Test fun corrections_emptyForKnownWord() {
         assertTrue(SuggestionEngine.correctionsFrom("world", words, wordSet, emptyMap(), 3).isEmpty())
+    }
+
+    @Test fun corrections_contextPreferredWinsTies() {
+        val vocabList = listOf("help", "hell")   // "help" ranks higher by frequency (index 0)
+        val set = vocabList.toSet()
+        // No context: frequency wins -> "help" leads.
+        assertEquals("help", SuggestionEngine.correctionsFrom("helo", vocabList, set, emptyMap(), 2).first())
+        // Context prefers "hell" (a follower of the previous word) -> it leads despite lower frequency.
+        assertEquals("hell", SuggestionEngine.correctionsFrom("helo", vocabList, set, emptyMap(), 2, prefer = setOf("hell")).first())
+    }
+
+    // --- spatial autocorrect (adjacent-key fat-finger) ---
+
+    // QWERTY-ish neighbours for the keys used below.
+    private val nb = mapOf(
+        't' to setOf('r', 'y', 'g'), 'r' to setOf('e', 't', 'f'), 'e' to setOf('w', 'r', 'd'),
+        'w' to setOf('q', 'e', 's'), 'y' to setOf('t', 'u', 'h')
+    )
+
+    @Test fun adjacentSubs_trueForTwoAdjacentSubstitutions() {
+        // "rwst" -> "test": r→t and w→e are both adjacent keys
+        assertTrue(SuggestionEngine.allAdjacentSubs("rwst", "test", nb))
+    }
+
+    @Test fun adjacentSubs_falseForSameWordOrNonAdjacent() {
+        assertFalse(SuggestionEngine.allAdjacentSubs("test", "test", nb))
+        assertFalse(SuggestionEngine.allAdjacentSubs("zest", "test", nb))   // z→t not adjacent
+        assertFalse(SuggestionEngine.allAdjacentSubs("tests", "test", nb))  // different length
+    }
+
+    @Test fun pickAutocorrect_appliesTopSingleEdit() {
+        // single insertion is accepted regardless of adjacency (unchanged behaviour)
+        assertEquals("hello", SuggestionEngine.pickAutocorrect("helo", listOf("hello"), emptyMap()))
+    }
+
+    @Test fun pickAutocorrect_appliesConfidentDoubleFatFinger() {
+        assertEquals("test", SuggestionEngine.pickAutocorrect("rwst", listOf("test"), nb))
+    }
+
+    @Test fun pickAutocorrect_rejectsNonAdjacentDoubleEdit() {
+        // "tezr" -> "test" is two edits but z→s is not an adjacent key -> not auto-applied
+        assertNull(SuggestionEngine.pickAutocorrect("tezr", listOf("test"), nb))
     }
 
     // --- nextFrom (bigram prediction) ---

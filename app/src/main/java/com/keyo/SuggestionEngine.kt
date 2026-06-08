@@ -22,6 +22,10 @@ object SuggestionEngine {
     // Cache of merged dictionaries keyed by the sorted language set (e.g. "en+lv"), so a
     // multilingual keyboard (English + Latvian share one Latin layout) builds the union once.
     private val mergedByLangs = HashMap<String, Vocab>()
+    // Bundled bigram model per language: prev-word -> followers, most-frequent first (from a corpus,
+    // assets/dict/bigram_<lang>.txt). Gives next-word prediction / context from day one, before the
+    // user's own [UserDictionary] bigrams have learned anything.
+    private val bundledBigrams = HashMap<String, Map<String, List<String>>>()
 
     fun isReady(): Boolean = loaded
 
@@ -44,6 +48,18 @@ object SuggestionEngine {
                 val folded = HashSet<String>(words.size * 2)
                 words.forEach { folded.add(fold(it)) }
                 byLang[lang] = Vocab(words, folded)
+                // Bundled bigram model (prev \t f1 f2 … ), if present for this language.
+                val bg = HashMap<String, List<String>>()
+                try {
+                    context.assets.open("dict/bigram_$lang.txt").bufferedReader().useLines { seq ->
+                        seq.forEach { line ->
+                            val tab = line.indexOf('\t')
+                            if (tab > 0 && tab < line.length - 1)
+                                bg[line.substring(0, tab)] = line.substring(tab + 1).split(' ')
+                        }
+                    }
+                } catch (_: Exception) { /* missing model -> no bundled context for this language */ }
+                bundledBigrams[lang] = bg
             }
             loaded = true
         }
@@ -86,14 +102,39 @@ object SuggestionEngine {
      *  word is already known. The user's learned words are included as high-priority targets. */
     fun corrections(wordLower: String, lang: String, learnedUni: Map<String, Int>, limit: Int = 2): List<String> =
         corrections(wordLower, listOf(lang), learnedUni, limit)
-    fun corrections(wordLower: String, langs: List<String>, learnedUni: Map<String, Int>, limit: Int = 2): List<String> {
+    fun corrections(wordLower: String, langs: List<String>, learnedUni: Map<String, Int>, limit: Int = 2, maxEdits: Int = 0, prefer: Set<String> = emptySet()): List<String> {
         val v = vocab(langs) ?: return emptyList()
-        return correctionsFrom(wordLower, v.words, v.set, learnedUni, limit)
+        return correctionsFrom(wordLower, v.words, v.set, learnedUni, limit, maxEdits = maxEdits, prefer = prefer)
     }
 
     /** Predicted next words after [prevLower], from the user's learned bigrams. */
     fun nextWords(prevLower: String, learnedBi: Map<String, Map<String, Int>>, limit: Int = 3): List<String> =
         nextFrom(prevLower, learnedBi, limit)
+
+    /** Merged "what tends to follow [prevLower]" with weights, combining the bundled bigram model
+     *  ([langs]) with the user's learned bigrams (weighted heavily, since personal). Empty when
+     *  nothing is known. Drives next-word prediction, glide context and context-aware correction. */
+    fun followerWeights(prevLower: String, langs: List<String>, learnedBi: Map<String, Map<String, Int>>): Map<String, Int> {
+        val p = fold(prevLower)
+        val out = HashMap<String, Int>()
+        for (lang in langs) {
+            val foll = bundledBigrams[lang]?.get(p) ?: continue
+            for (i in foll.indices) {
+                val weight = (8 - i).coerceAtLeast(1)   // rank 0 -> 8, … tail -> 1
+                val w = foll[i]
+                if (weight > (out[w] ?: 0)) out[w] = weight
+            }
+        }
+        learnedBi[prevLower]?.forEach { (w, c) -> out[w] = (out[w] ?: 0) + c * 4 }   // personal wins
+        return out
+    }
+
+    /** Context-aware next-word prediction: bundled model + learned bigrams, best first. */
+    fun nextWords(prevLower: String, langs: List<String>, learnedBi: Map<String, Map<String, Int>>, limit: Int = 3): List<String> {
+        val w = followerWeights(prevLower, langs, learnedBi)
+        if (w.isEmpty()) return emptyList()
+        return w.entries.sortedByDescending { it.value }.take(limit).map { it.key }
+    }
 
     /** The frequency-ordered bundled word list for [langs] (most frequent first). For glide typing. */
     fun wordList(lang: String): List<String> = vocab(lang)?.words ?: emptyList()
@@ -212,28 +253,64 @@ object SuggestionEngine {
         vocabSet: Set<String>,
         learnedUni: Map<String, Int>,
         limit: Int = 2,
-        scanLimit: Int = 6000
+        scanLimit: Int = 6000,
+        maxEdits: Int = 0,
+        prefer: Set<String> = emptySet()
     ): List<String> {
         if (word.length < 3 || limit <= 0) return emptyList()
         val fw = fold(word)
         if (vocabSet.contains(fw) || learnedUni.containsKey(word)) return emptyList()
-        val maxDist = if (word.length <= 4) 1 else 2
-        // Each candidate scored by (distance, source rank). Learned words use rank -1 so they win ties.
+        // Default: 1 edit for short words, 2 for longer. [maxEdits] > 0 overrides — the spatial
+        // autocorrect path asks for 2 even on short words, then filters to adjacent-key subs only.
+        val maxDist = if (maxEdits > 0) maxEdits else if (word.length <= 4) 1 else 2
+        // Each candidate scored by (distance, source rank). At equal distance: words that fit the
+        // sentence context ([prefer], i.e. likely followers of the previous word) win (rank -2),
+        // then the user's learned words (-1), then the frequency-ordered bundled list.
         val seen = HashSet<String>()
         val scored = ArrayList<Triple<String, Int, Int>>()
         for (lw in learnedUni.keys) {
             if (lw == word || kotlin.math.abs(lw.length - word.length) > maxDist) continue
             val d = editDistanceAtMost(fw, fold(lw), maxDist)
-            if (d in 1..maxDist && seen.add(fold(lw))) scored.add(Triple(lw, d, -1))
+            if (d in 1..maxDist && seen.add(fold(lw))) scored.add(Triple(lw, d, if (lw in prefer) -2 else -1))
         }
         val n = minOf(scanLimit, words.size)
         for (rank in 0 until n) {
             val w = words[rank]
             if (kotlin.math.abs(w.length - word.length) > maxDist) continue
             val d = editDistanceAtMost(fw, fold(w), maxDist)
-            if (d in 1..maxDist && seen.add(fold(w))) scored.add(Triple(w, d, rank))
+            if (d in 1..maxDist && seen.add(fold(w))) scored.add(Triple(w, d, if (w in prefer) -2 else rank))
         }
         return scored.sortedWith(compareBy({ it.second }, { it.third })).map { it.first }.take(limit)
+    }
+
+    /** True when [b] differs from [a] only by 1–2 substitutions, each onto a *physically adjacent*
+     *  key (per [neighbors]). I.e. [b] is a plausible fat-finger mistype of [a]. Same length only —
+     *  insertions/deletions are handled by ordinary edit-distance correction, not the spatial path. */
+    internal fun allAdjacentSubs(a: String, b: String, neighbors: Map<Char, Set<Char>>): Boolean {
+        val fa = fold(a); val fb = fold(b)
+        if (fa.length != fb.length || fa == fb) return false
+        var subs = 0
+        for (i in fa.indices) if (fa[i] != fb[i]) {
+            subs++
+            if (subs > 2) return false
+            if (fb[i] !in (neighbors[fa[i]] ?: return false)) return false
+        }
+        return subs in 1..2
+    }
+
+    /** Choose a correction to auto-apply for [typed] on a word boundary, or null to leave it as-is.
+     *  [cands] is ranked best-first (as from [corrections]). Accepts the top single-edit candidate
+     *  (any edit kind — unchanged behaviour), OR a two-edit candidate when both edits are adjacent-key
+     *  substitutions ([allAdjacentSubs]) — a confident double fat-finger the old single-edit rule missed. */
+    internal fun pickAutocorrect(typed: String, cands: List<String>, neighbors: Map<Char, Set<Char>>): String? {
+        val ft = fold(typed)
+        for (c in cands) {
+            when (editDistanceAtMost(ft, fold(c), 2)) {
+                1 -> return c
+                2 -> if (allAdjacentSubs(typed, c, neighbors)) return c
+            }
+        }
+        return null
     }
 
     /** Top next-word predictions for [prev] from the learned bigram table. */

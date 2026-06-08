@@ -2113,6 +2113,26 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         return (s / keyBounds.size).coerceAtLeast(1f)
     }
 
+    // Physical key-adjacency map (each letter -> the keys within ~1.7 key-widths of it), used by
+    // spatial autocorrect to recognise fat-finger taps. Rebuilt lazily from the current layout's
+    // keyBounds and invalidated (cleared) alongside keyBounds on every language/layout switch.
+    private var keyNeighbors: Map<Char, Set<Char>> = emptyMap()
+    private fun neighbors(): Map<Char, Set<Char>> {
+        if (keyNeighbors.isEmpty() && keyBounds.size >= 2) {
+            val entries = keyBounds.entries.toList()
+            val thr = avgKeyWidth() * 1.7f
+            val thr2 = thr * thr
+            val m = HashMap<Char, MutableSet<Char>>(entries.size * 2)
+            for (i in entries.indices) for (j in entries.indices) if (i != j) {
+                val a = entries[i]; val b = entries[j]
+                if ((a.value.center - b.value.center).getDistanceSquared() <= thr2)
+                    m.getOrPut(a.key) { HashSet() }.add(b.key)
+            }
+            keyNeighbors = m
+        }
+        return keyNeighbors
+    }
+
     /** Resample a polyline to exactly [n] points spaced evenly along its length (a $1-recognizer step). */
     private fun resample(pts: List<Offset>, n: Int): List<Offset> {
         if (pts.isEmpty()) return emptyList()
@@ -2150,7 +2170,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         val keyW = avgKeyWidth()
         // Context: words the user has actually typed/glided after [prev] get a boost, so common
         // phrases win over equally-shaped but unrelated words (learned over time, empty at first).
-        val followers = prev?.lowercase()?.let { UserDictionary.bigrams()[it] }
+        val followers = prev?.lowercase()?.let { SuggestionEngine.followerWeights(it, dictLangs(), UserDictionary.bigrams()) }
         val words = SuggestionEngine.wordList(dictLangs())
         val scored = ArrayList<Pair<String, Float>>()
         var matched = 0
@@ -2343,7 +2363,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             // Next-word prediction right after "<word> ".
             val prev = wordBeforeTrailingSpace()
             if (prev != null) {
-                val nexts = SuggestionEngine.nextWords(prev.lowercase(), UserDictionary.bigrams(), 3)
+                val nexts = SuggestionEngine.nextWords(prev.lowercase(), langs, UserDictionary.bigrams(), 3)
                 setSuggestions(nexts, nexts.firstOrNull())
             } else setSuggestions(emptyList(), null)
             return
@@ -2363,7 +2383,11 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         } else if (!known) {
             // No completions and not a known word -> likely a typo. Offer corrections like Gboard:
             // [typed | best correction (bold) | a longer form of it]. Space applies the best one.
-            val corr = SuggestionEngine.corrections(lower, langs, uni, 2)
+            // Context: prefer a fix that fits the previous word (bundled + learned bigrams).
+            val prevW = wordBefore(word)
+            val prefer = if (prevW != null)
+                SuggestionEngine.followerWeights(prevW.lowercase(), langs, UserDictionary.bigrams()).keys else emptySet()
+            val corr = SuggestionEngine.corrections(lower, langs, uni, 2, prefer = prefer)
             if (corr.isNotEmpty()) {
                 primary = matchCase(word, corr[0])
                 list.add(primary)
@@ -2442,10 +2466,15 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         if (autocorrectTypingOn && SuggestionEngine.isReady() && word.length >= 3 &&
             !revertedWords.contains(SuggestionEngine.fold(learned))) {
             try {
-                val corr = SuggestionEngine.correct(learned, dictLangs(), UserDictionary.unigrams())
-                if (corr != null && SuggestionEngine.fold(corr) != SuggestionEngine.fold(learned) &&
-                    SuggestionEngine.editDistanceAtMost(
-                        SuggestionEngine.fold(learned), SuggestionEngine.fold(corr), 1) == 1) {
+                // Spatial-aware: among ranked corrections, apply the top single-edit fix (as before),
+                // or a confident double fat-finger (two adjacent-key substitutions) the old rule missed.
+                // Context (bundled + learned bigrams of the previous word) breaks ties toward a fix
+                // that actually fits the sentence.
+                val prefer = if (prev != null)
+                    SuggestionEngine.followerWeights(prev.lowercase(), dictLangs(), UserDictionary.bigrams()).keys else emptySet()
+                val cands = SuggestionEngine.corrections(learned, dictLangs(), UserDictionary.unigrams(), 8, maxEdits = 2, prefer = prefer)
+                val corr = SuggestionEngine.pickAutocorrect(learned, cands, neighbors())
+                if (corr != null && SuggestionEngine.fold(corr) != SuggestionEngine.fold(learned)) {
                     finalWord = matchCase(word, corr)
                     learned = corr
                 }
@@ -2573,6 +2602,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         currentLang.value = next
         KeyboardPrefs.setCurrentLanguage(this, next)
         keyBounds.clear()      // new layout's keys re-register their positions for glide typing
+        keyNeighbors = emptyMap()   // recomputed lazily for the new layout
         syncImeSubtype(next)   // best-effort: tell the OS our language (UI already switched)
         updateSuggestions()
     }
@@ -2623,7 +2653,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             val layoutChanged = layoutOf(lang) != layoutOf(currentLang.value)
             currentLang.value = lang
             KeyboardPrefs.setCurrentLanguage(this, lang)
-            if (layoutChanged) keyBounds.clear()   // en<->lv keep the same Latin key positions
+            if (layoutChanged) { keyBounds.clear(); keyNeighbors = emptyMap() }   // en<->lv keep the same Latin key positions
             handler.post { updateSuggestions() }
         }
     }

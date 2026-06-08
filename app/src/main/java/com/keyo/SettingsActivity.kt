@@ -183,7 +183,7 @@ class SettingsActivity : ComponentActivity() {
 
             Spacer(Modifier.height(24.dp))
             Text(
-                "Keyo v${BuildConfig.VERSION_NAME} (build ${BuildConfig.VERSION_CODE})",
+                "Keyo v${BuildConfig.VERSION_NAME}",
                 fontSize = 12.sp, color = textFaint, textAlign = TextAlign.Center,
                 modifier = Modifier.fillMaxWidth()
             )
@@ -498,7 +498,7 @@ class SettingsActivity : ComponentActivity() {
                     Text("Keyo", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = textPrimary)
                     Text("AI voice keyboard", fontSize = 13.sp, color = textMuted)
                     Spacer(Modifier.height(10.dp))
-                    Text("v${BuildConfig.VERSION_NAME}  ·  build ${BuildConfig.VERSION_CODE}", fontSize = 13.sp, color = textFaint)
+                    Text("v${BuildConfig.VERSION_NAME}", fontSize = 13.sp, color = textFaint)
                     Spacer(Modifier.height(14.dp))
                     Text("Long-press the space bar to dictate, hold the ✨ key to run a task.",
                         fontSize = 13.sp, color = textMuted)
