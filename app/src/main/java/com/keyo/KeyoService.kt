@@ -65,6 +65,9 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private var isShift = mutableStateOf(false)
     private var keyboardMode = mutableStateOf("abc") // "abc", "123", "symbols", "numpad"
     private var imeActionId = mutableIntStateOf(android.view.inputmethod.EditorInfo.IME_ACTION_NONE)
+    // Multi-line fields (and fields that ask for no enter action) get a real newline Enter, like Gboard.
+    private var fieldMultiline = mutableStateOf(false)
+    private var fieldNoEnterAction = mutableStateOf(false)
     private var showNumberRow = mutableStateOf(true)
     // Visual sizing (tunable live via the Settings sliders)
     private var keyHeightDp = mutableIntStateOf(KeyboardPrefs.DEFAULT_KEY_HEIGHT)
@@ -239,6 +242,12 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         // Store IME action for enter key behavior
         imeActionId.intValue = info?.imeOptions?.and(android.view.inputmethod.EditorInfo.IME_MASK_ACTION)
             ?: android.view.inputmethod.EditorInfo.IME_ACTION_NONE
+        // Multi-line text fields should insert a newline on Enter (Gboard behavior), not fire an action.
+        val it0 = info?.inputType ?: 0
+        fieldMultiline.value = (it0 and android.text.InputType.TYPE_MASK_CLASS) == android.text.InputType.TYPE_CLASS_TEXT &&
+            (it0 and (android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE or android.text.InputType.TYPE_TEXT_FLAG_IME_MULTI_LINE)) != 0
+        fieldNoEnterAction.value = ((info?.imeOptions ?: 0) and
+            android.view.inputmethod.EditorInfo.IME_FLAG_NO_ENTER_ACTION) != 0
 
         // Detect password / incognito fields — disable all network features there.
         val inputType = info?.inputType ?: 0
@@ -598,27 +607,33 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 // Period — long press shows ? , ! -
                 KeyButton(".", keyColor, textColor, Modifier.weight(0.9f)) { commitChar('.') }
 
-                // Enter / Submit
+                // Enter / Submit — Gboard-style: a real Enter (newline) by default, an action
+                // icon only when the field explicitly asks for one (search/send/go/next).
                 val imeAction by imeActionId
+                val multiline by fieldMultiline
+                val noEnterAction by fieldNoEnterAction
                 val isTextMode = mode == "123" || mode == "symbols" || mode == "numpad"
-                val hasImeAction = imeAction != android.view.inputmethod.EditorInfo.IME_ACTION_NONE
-                        && imeAction != android.view.inputmethod.EditorInfo.IME_ACTION_UNSPECIFIED
+                // Treat the key as a plain newline Enter in text/symbol modes, multi-line fields,
+                // or when the field opts out of the enter action.
+                val plainEnter = isTextMode || multiline || noEnterAction
+                val hasImeAction = !plainEnter &&
+                        imeAction != android.view.inputmethod.EditorInfo.IME_ACTION_NONE &&
+                        imeAction != android.view.inputmethod.EditorInfo.IME_ACTION_UNSPECIFIED
 
                 val enterKind = when {
-                    isTextMode -> "return"
-                    hasImeAction -> when (imeAction) {
+                    !hasImeAction -> "return"
+                    else -> when (imeAction) {
                         android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH -> "search"
                         android.view.inputmethod.EditorInfo.IME_ACTION_SEND -> "send"
                         android.view.inputmethod.EditorInfo.IME_ACTION_GO -> "send"
-                        android.view.inputmethod.EditorInfo.IME_ACTION_DONE -> "done"
                         android.view.inputmethod.EditorInfo.IME_ACTION_NEXT -> "next"
-                        else -> "send"
+                        // IME_ACTION_DONE and anything else fall back to the familiar Enter arrow.
+                        else -> "return"
                     }
-                    else -> "return"
                 }
 
                 EnterKey(enterKind, accentColor, Color.Black, keyHeight, Modifier.weight(1.0f)) {
-                    if (isTextMode || !hasImeAction) {
+                    if (!hasImeAction) {
                         commitChar('\n')
                     } else {
                         currentInputConnection?.performEditorAction(imeAction)
@@ -1459,7 +1474,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         }
     }
 
-    // Enter / action glyph. kind: "return" | "done" | "search" | "send" | "next"
+    // Enter / action glyph. kind: "return" | "search" | "send" | "next"
     @Composable
     private fun EnterGlyph(kind: String, color: Color, modifier: Modifier) {
         Canvas(modifier) {
@@ -1471,12 +1486,6 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             )
             fun o(x: Float, y: Float) = androidx.compose.ui.geometry.Offset(x * w, y * h)
             when (kind) {
-                "done" -> {
-                    val p = androidx.compose.ui.graphics.Path().apply {
-                        moveTo(w * 0.22f, h * 0.55f); lineTo(w * 0.42f, h * 0.74f); lineTo(w * 0.80f, h * 0.28f)
-                    }
-                    drawPath(p, color, style = stroke)
-                }
                 "search" -> {
                     drawCircle(color, radius = w * 0.22f, center = o(0.44f, 0.44f), style = stroke)
                     drawLine(color, o(0.60f, 0.60f), o(0.80f, 0.80f), sw, cap)
