@@ -19,6 +19,9 @@ object SuggestionEngine {
 
     @Volatile private var loaded = false
     private val byLang = HashMap<String, Vocab>()
+    // Cache of merged dictionaries keyed by the sorted language set (e.g. "en+lv"), so a
+    // multilingual keyboard (English + Latvian share one Latin layout) builds the union once.
+    private val mergedByLangs = HashMap<String, Vocab>()
 
     fun isReady(): Boolean = loaded
 
@@ -48,25 +51,59 @@ object SuggestionEngine {
 
     private fun vocab(lang: String): Vocab? = byLang[lang] ?: byLang["en"]
 
+    /** Vocab covering every language in [langs], merged. One language returns its own Vocab; several
+     *  (e.g. English + Latvian on a shared Latin keyboard) are interleaved by frequency rank and
+     *  deduped, then cached. Empty/unknown langs fall back to English. */
+    private fun vocab(langs: List<String>): Vocab? {
+        if (langs.size <= 1) return vocab(langs.firstOrNull() ?: return byLang["en"])
+        val key = langs.toSortedSet().joinToString("+")
+        mergedByLangs[key]?.let { return it }
+        val parts = langs.toSortedSet().mapNotNull { byLang[it] }.filter { it.words.isNotEmpty() }
+        if (parts.size <= 1) return parts.firstOrNull() ?: byLang["en"]
+        val words = mergeRanked(parts.map { it.words })
+        val folded = HashSet<String>(words.size * 2)
+        words.forEach { folded.add(fold(it)) }
+        return Vocab(words, folded).also { mergedByLangs[key] = it }
+    }
+
     /** Completions that extend [prefixLower] (all lowercase), personalised words first. */
-    fun complete(prefixLower: String, lang: String, learnedUni: Map<String, Int>, limit: Int = 3): List<String> {
-        val v = vocab(lang) ?: return emptyList()
+    fun complete(prefixLower: String, lang: String, learnedUni: Map<String, Int>, limit: Int = 3): List<String> =
+        complete(prefixLower, listOf(lang), learnedUni, limit)
+    fun complete(prefixLower: String, langs: List<String>, learnedUni: Map<String, Int>, limit: Int = 3): List<String> {
+        val v = vocab(langs) ?: return emptyList()
         return completeFrom(prefixLower, v.words, learnedUni, limit)
     }
 
     /** Best correction for [wordLower], or null if it is already known or nothing close is found. */
-    fun correct(wordLower: String, lang: String, learnedUni: Map<String, Int>): String? {
-        val v = vocab(lang) ?: return null
+    fun correct(wordLower: String, lang: String, learnedUni: Map<String, Int>): String? =
+        correct(wordLower, listOf(lang), learnedUni)
+    fun correct(wordLower: String, langs: List<String>, learnedUni: Map<String, Int>): String? {
+        val v = vocab(langs) ?: return null
         return correctFrom(wordLower, v.words, v.set, learnedUni)
+    }
+
+    /** Up to [limit] closest known words to [wordLower] (typo candidates), best first; empty if the
+     *  word is already known. The user's learned words are included as high-priority targets. */
+    fun corrections(wordLower: String, lang: String, learnedUni: Map<String, Int>, limit: Int = 2): List<String> =
+        corrections(wordLower, listOf(lang), learnedUni, limit)
+    fun corrections(wordLower: String, langs: List<String>, learnedUni: Map<String, Int>, limit: Int = 2): List<String> {
+        val v = vocab(langs) ?: return emptyList()
+        return correctionsFrom(wordLower, v.words, v.set, learnedUni, limit)
     }
 
     /** Predicted next words after [prevLower], from the user's learned bigrams. */
     fun nextWords(prevLower: String, learnedBi: Map<String, Map<String, Int>>, limit: Int = 3): List<String> =
         nextFrom(prevLower, learnedBi, limit)
 
-    fun isKnown(wordLower: String, lang: String, learnedUni: Map<String, Int>): Boolean {
+    /** The frequency-ordered bundled word list for [langs] (most frequent first). For glide typing. */
+    fun wordList(lang: String): List<String> = vocab(lang)?.words ?: emptyList()
+    fun wordList(langs: List<String>): List<String> = vocab(langs)?.words ?: emptyList()
+
+    fun isKnown(wordLower: String, lang: String, learnedUni: Map<String, Int>): Boolean =
+        isKnown(wordLower, listOf(lang), learnedUni)
+    fun isKnown(wordLower: String, langs: List<String>, learnedUni: Map<String, Int>): Boolean {
         if (learnedUni.containsKey(wordLower)) return true
-        return vocab(lang)?.set?.contains(fold(wordLower)) == true
+        return vocab(langs)?.set?.contains(fold(wordLower)) == true
     }
 
     /** Treat ё and е as the same letter (Russian text routinely omits ё). No-op for en/lv. */
@@ -76,6 +113,24 @@ object SuggestionEngine {
     // ---------------------------------------------------------------------------------------------
     // Pure algorithms (no Android dependency) — unit-tested directly.
     // ---------------------------------------------------------------------------------------------
+
+    /** Merge several frequency-ordered word lists into one. Round-robins by rank (each list's rank-0
+     *  word, then every rank-1 word, …) so both languages keep equal footing, and dedupes by exact
+     *  word — the first (best-ranked) occurrence wins. Backs the bilingual Latin keyboard. */
+    internal fun mergeRanked(lists: List<List<String>>): List<String> {
+        val parts = lists.filter { it.isNotEmpty() }
+        if (parts.size <= 1) return parts.firstOrNull() ?: emptyList()
+        val out = ArrayList<String>(parts.sumOf { it.size })
+        val seen = HashSet<String>(out.size)
+        var i = 0
+        var more = true
+        while (more) {
+            more = false
+            for (l in parts) if (i < l.size) { val w = l[i]; if (seen.add(w)) out.add(w); more = true }
+            i++
+        }
+        return out
+    }
 
     /** Words that start with [prefix] and are longer than it; learned words (by count) first, then
      *  the frequency-ordered [words]. */
@@ -103,33 +158,48 @@ object SuggestionEngine {
         return out.toList()
     }
 
-    /** Closest dictionary word to [word] within a small edit distance, or null. Scans only the most
-     *  frequent [scanLimit] words to bound cost; returns null when [word] is already known. */
+    /** Closest dictionary/learned word to [word] within a small edit distance, or null when [word]
+     *  is already known. Thin wrapper over [correctionsFrom]. */
     internal fun correctFrom(
         word: String,
         words: List<String>,
         vocabSet: Set<String>,
         learnedUni: Map<String, Int>,
         scanLimit: Int = 6000
-    ): String? {
-        if (word.length < 3) return null
+    ): String? = correctionsFrom(word, words, vocabSet, learnedUni, 1, scanLimit).firstOrNull()
+
+    /** Ranked typo corrections for [word]: closest edit distance first, and at equal distance the
+     *  user's learned words rank above the bundled list, which is ordered by frequency. Returns an
+     *  empty list when [word] is already known (bundled or learned) or shorter than 3 letters.
+     *  Scans the user's whole learned vocab plus the most frequent [scanLimit] bundled words. */
+    internal fun correctionsFrom(
+        word: String,
+        words: List<String>,
+        vocabSet: Set<String>,
+        learnedUni: Map<String, Int>,
+        limit: Int = 2,
+        scanLimit: Int = 6000
+    ): List<String> {
+        if (word.length < 3 || limit <= 0) return emptyList()
         val fw = fold(word)
-        if (vocabSet.contains(fw) || learnedUni.containsKey(word)) return null
+        if (vocabSet.contains(fw) || learnedUni.containsKey(word)) return emptyList()
         val maxDist = if (word.length <= 4) 1 else 2
-        var best: String? = null
-        var bestDist = maxDist + 1
-        var bestRank = Int.MAX_VALUE
-        val limit = minOf(scanLimit, words.size)
-        for (rank in 0 until limit) {
+        // Each candidate scored by (distance, source rank). Learned words use rank -1 so they win ties.
+        val seen = HashSet<String>()
+        val scored = ArrayList<Triple<String, Int, Int>>()
+        for (lw in learnedUni.keys) {
+            if (lw == word || kotlin.math.abs(lw.length - word.length) > maxDist) continue
+            val d = editDistanceAtMost(fw, fold(lw), maxDist)
+            if (d in 1..maxDist && seen.add(fold(lw))) scored.add(Triple(lw, d, -1))
+        }
+        val n = minOf(scanLimit, words.size)
+        for (rank in 0 until n) {
             val w = words[rank]
             if (kotlin.math.abs(w.length - word.length) > maxDist) continue
             val d = editDistanceAtMost(fw, fold(w), maxDist)
-            if (d <= maxDist && (d < bestDist || (d == bestDist && rank < bestRank))) {
-                best = w; bestDist = d; bestRank = rank
-                if (d == 1 && rank < 200) break // a very common, one-edit-away word is good enough
-            }
+            if (d in 1..maxDist && seen.add(fold(w))) scored.add(Triple(w, d, rank))
         }
-        return best
+        return scored.sortedWith(compareBy({ it.second }, { it.third })).map { it.first }.take(limit)
     }
 
     /** Top next-word predictions for [prev] from the learned bigram table. */

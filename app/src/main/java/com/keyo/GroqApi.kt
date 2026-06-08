@@ -367,17 +367,6 @@ Rules:
 
     private const val TAG = "GroqApi"
 
-    fun spellcheck(text: String, callback: (String?, String?) -> Unit) {
-        val messages = JSONArray().apply {
-            put(JSONObject().apply {
-                put("role", "system")
-                put("content", "You are a spellcheck tool. Fix typos and minor errors in the text. Rules: 1) ONLY fix obvious typos and misspellings. 2) Do NOT change meaning, style, or word choice. 3) Do NOT add or remove words. 4) Do NOT change punctuation unless clearly wrong. 5) If text has no errors, output it EXACTLY as is. 6) Output ONLY the corrected text, nothing else. 7) Support English, Russian, Latvian, and mixed text.")
-            })
-            put(JSONObject().apply { put("role", "user"); put("content", text) })
-        }
-        chat("llama-3.1-8b-instant", messages, 0.1, 1024, 0, callback)
-    }
-
     fun cleanupText(rawText: String, callback: (String?, String?) -> Unit) {
         val messages = JSONArray().apply {
             put(JSONObject().apply {

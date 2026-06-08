@@ -174,7 +174,7 @@ class SettingsActivity : ComponentActivity() {
                         }
                     }
                 }
-                Hint("Switch with the 🌐 key or by swiping the space bar. Latvian diacritics (ā č ē ī š ž…) are on long-press.")
+                Hint("English and Latvian share one Latin keyboard — enable both for a bilingual layout whose suggestions, autocorrect and glide draw from both, with no language switching. Latvian diacritics (ā č ē ī š ž…) are on long-press. The 🌐 key (or a space-bar swipe) flips between Latin and Russian.")
 
                 // ===== Keyboard size (collapsible visual editor) =====
                 var keyH by remember { mutableStateOf(KeyboardPrefs.getKeyHeight(this@SettingsActivity)) }
@@ -253,6 +253,7 @@ class SettingsActivity : ComponentActivity() {
                 var autoCap by remember { mutableStateOf(KeyboardPrefs.isAutoCap(this@SettingsActivity)) }
                 var suggestions by remember { mutableStateOf(KeyboardPrefs.isSuggestionsEnabled(this@SettingsActivity)) }
                 var autoCorrectTyping by remember { mutableStateOf(KeyboardPrefs.isAutocorrectTyping(this@SettingsActivity)) }
+                var swipeTyping by remember { mutableStateOf(KeyboardPrefs.isSwipeTyping(this@SettingsActivity)) }
                 Group {
                     ChoiceRow("Haptics", KeyboardPrefs.HAPTIC_LEVELS, haptic) {
                         haptic = it; KeyboardPrefs.setHapticStrength(this@SettingsActivity, it)
@@ -266,7 +267,11 @@ class SettingsActivity : ComponentActivity() {
                         suggestions = it; KeyboardPrefs.setSuggestionsEnabled(this@SettingsActivity, it)
                     }
                     HorizontalDivider(color = divider, thickness = 1.dp)
-                    ToggleRow("Auto-correct while typing", "Fix the previous word on space", autoCorrectTyping) {
+                    ToggleRow("Glide typing", "Slide across letters to type a word", swipeTyping) {
+                        swipeTyping = it; KeyboardPrefs.setSwipeTyping(this@SettingsActivity, it)
+                    }
+                    HorizontalDivider(color = divider, thickness = 1.dp)
+                    ToggleRow("Auto-correct while typing", "Fixes the previous word on space; Backspace reverts", autoCorrectTyping) {
                         autoCorrectTyping = it; KeyboardPrefs.setAutocorrectTyping(this@SettingsActivity, it)
                     }
                     HorizontalDivider(color = divider, thickness = 1.dp)
@@ -425,11 +430,10 @@ class SettingsActivity : ComponentActivity() {
                 var selectedModel by remember { mutableStateOf(KeyboardPrefs.getModel(this@SettingsActivity)) }
                 var selectedAiModel by remember { mutableStateOf(KeyboardPrefs.getAiModel(this@SettingsActivity)) }
                 var autocorrect by remember { mutableStateOf(KeyboardPrefs.isAutocorrectEnabled(this@SettingsActivity)) }
-                var spellcheck by remember { mutableStateOf(KeyboardPrefs.isSpellcheckEnabled(this@SettingsActivity)) }
 
                 ModelSelector(
                     title = "Transcription model",
-                    subtitle = "Cleans up dictation and powers live spellcheck",
+                    subtitle = "Cleans up dictation",
                     models = KeyboardPrefs.AVAILABLE_MODELS,
                     selected = selectedModel
                 ) { modelId ->
@@ -451,12 +455,8 @@ class SettingsActivity : ComponentActivity() {
                     ToggleRow("Auto-correction", "Tidies up dictation: punctuation, fillers, casing", autocorrect) {
                         autocorrect = it; KeyboardPrefs.setAutocorrectEnabled(this@SettingsActivity, it)
                     }
-                    HorizontalDivider(color = divider, thickness = 1.dp)
-                    ToggleRow("Live spellcheck", "Fixes typos while typing (after a short pause)", spellcheck) {
-                        spellcheck = it; KeyboardPrefs.setSpellcheckEnabled(this@SettingsActivity, it)
-                    }
                 }
-                Hint("Voice, spellcheck and AI use the Groq API (set the key below). They're disabled in password fields.")
+                Hint("Voice and AI use the Groq API (set the key below). They're disabled in password fields.")
 
                 // ===== Groq API key (collapsible) =====
                 var apiKey by remember { mutableStateOf(KeyboardPrefs.getApiKey(this@SettingsActivity)) }

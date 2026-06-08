@@ -67,6 +67,28 @@ class SuggestionEngineTest {
         assertNull(SuggestionEngine.correctFrom("teh", words, wordSet, mapOf("teh" to 3)))
     }
 
+    @Test fun correct_fixesTypoOfLearnedWordOutsideBundledDict() {
+        // "awesome" lives only in the user's learned vocab; a typo of it must still correct.
+        assertEquals("awesome", SuggestionEngine.correctFrom("awesom", words, wordSet, mapOf("awesome" to 4)))
+    }
+
+    // --- correctionsFrom (multiple typo candidates for the suggestion strip) ---
+
+    @Test fun corrections_returnsMultipleByDistanceThenFrequency() {
+        // both "hello" (insertion) and "help" (substitution) are one edit from "helo"
+        assertEquals(listOf("hello", "help"), SuggestionEngine.correctionsFrom("helo", words, wordSet, emptyMap(), 2))
+    }
+
+    @Test fun corrections_prefersLearnedAtEqualDistance() {
+        // a learned word one edit away outranks an equally-close bundled word
+        val out = SuggestionEngine.correctionsFrom("helo", words, wordSet, mapOf("helm" to 5), 3)
+        assertEquals("helm", out.first())
+    }
+
+    @Test fun corrections_emptyForKnownWord() {
+        assertTrue(SuggestionEngine.correctionsFrom("world", words, wordSet, emptyMap(), 3).isEmpty())
+    }
+
     // --- nextFrom (bigram prediction) ---
 
     private val bigrams = mapOf("good" to mapOf("morning" to 5, "night" to 3, "luck" to 1))
@@ -77,6 +99,27 @@ class SuggestionEngineTest {
 
     @Test fun next_returnsEmptyForUnknownPrev() {
         assertTrue(SuggestionEngine.nextFrom("bad", bigrams, 3).isEmpty())
+    }
+
+    // --- mergeRanked (bilingual Latin keyboard: English + Latvian word lists) ---
+
+    @Test fun merge_interleavesByRankAndDedups() {
+        val en = listOf("the", "and", "test")
+        val lv = listOf("un", "test", "ir")
+        // round-robin by rank: the, un, and, test(en), [test(lv) deduped], ir
+        assertEquals(listOf("the", "un", "and", "test", "ir"), SuggestionEngine.mergeRanked(listOf(en, lv)))
+    }
+
+    @Test fun merge_singleOrEmptyListsPassThrough() {
+        val en = listOf("hello", "world")
+        assertEquals(en, SuggestionEngine.mergeRanked(listOf(en, emptyList())))
+        assertTrue(SuggestionEngine.mergeRanked(listOf(emptyList(), emptyList())).isEmpty())
+    }
+
+    @Test fun merge_keepsBothLanguagesReachable() {
+        // A frequent English word and a frequent Latvian word both survive the merge.
+        val merged = SuggestionEngine.mergeRanked(listOf(listOf("hello"), listOf("paldies")))
+        assertTrue(merged.contains("hello") && merged.contains("paldies"))
     }
 
     // --- ё / е equivalence (Russian) ---

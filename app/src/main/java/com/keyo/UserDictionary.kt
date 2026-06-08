@@ -81,18 +81,28 @@ object UserDictionary {
         bigram.values.forEach { if (it.remove(w) != null) dirty = true }
     }
 
-    /** Record that [word] was typed (optionally following [prev]). Both should be lowercase. */
-    fun learn(prev: String?, word: String) {
+    /**
+     * Record that [word] was typed (optionally following [prev]). Both should be lowercase.
+     *
+     * [bumpUnigram] adds the word to the personal vocabulary so it counts as "known" (shows in
+     * completion suggestions, stops being auto-corrected). Pass `false` for plain typing so words
+     * only enter the dictionary on an explicit suggestion tap — see KeyoService.finishWord. The
+     * next-word (bigram) pattern is always recorded, since that's prediction, not the dictionary.
+     */
+    fun learn(prev: String?, word: String, bumpUnigram: Boolean = true) {
         if (word.length < 2 || word.length > 32) return
-        unigram[word] = (unigram[word] ?: 0) + 1
+        if (bumpUnigram) {
+            unigram[word] = (unigram[word] ?: 0) + 1
+            if (unigram.size > MAX_UNIGRAMS) pruneSmallest(unigram, MAX_UNIGRAMS)
+            dirty = true
+        }
         if (!prev.isNullOrEmpty()) {
             val followers = bigram.getOrPut(prev) { HashMap() }
             followers[word] = (followers[word] ?: 0) + 1
             if (followers.size > MAX_FOLLOWERS) pruneSmallest(followers, MAX_FOLLOWERS)
+            if (bigram.size > MAX_BIGRAM_KEYS) pruneBigramKeys()
+            dirty = true
         }
-        dirty = true
-        if (unigram.size > MAX_UNIGRAMS) pruneSmallest(unigram, MAX_UNIGRAMS)
-        if (bigram.size > MAX_BIGRAM_KEYS) pruneBigramKeys()
     }
 
     /** Persist if there are unsaved changes. Cheap to call repeatedly. */

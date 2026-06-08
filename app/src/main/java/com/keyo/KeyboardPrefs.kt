@@ -9,7 +9,6 @@ object KeyboardPrefs {
     private const val KEY_MODEL = "ai_model"
     private const val KEY_AI_MODEL = "ai_assistant_model"
     private const val KEY_AUTOCORRECT = "autocorrect_enabled"
-    private const val KEY_SPELLCHECK = "spellcheck_enabled"
     private const val KEY_NUMBER_ROW = "number_row_enabled"
     private const val KEY_KEY_HEIGHT = "key_height"   // row height in dp
     private const val KEY_HGAP = "key_hgap"           // horizontal gap between keys, dp
@@ -29,6 +28,7 @@ object KeyboardPrefs {
     private const val KEY_AUTO_CAP = "auto_capitalize"
     private const val KEY_SUGGESTIONS = "suggestions_enabled"
     private const val KEY_AUTOCORRECT_TYPING = "autocorrect_typing"
+    private const val KEY_SWIPE_TYPING = "swipe_typing"
 
     // Defaults / ranges for the visual size editor.
     const val DEFAULT_KEY_HEIGHT = 48
@@ -69,14 +69,6 @@ object KeyboardPrefs {
 
     fun setAutocorrectEnabled(context: Context, enabled: Boolean) {
         prefs(context).edit().putBoolean(KEY_AUTOCORRECT, enabled).apply()
-    }
-
-    fun isSpellcheckEnabled(context: Context): Boolean {
-        return prefs(context).getBoolean(KEY_SPELLCHECK, true)
-    }
-
-    fun setSpellcheckEnabled(context: Context, enabled: Boolean) {
-        prefs(context).edit().putBoolean(KEY_SPELLCHECK, enabled).apply()
     }
 
     fun isNumberRowEnabled(context: Context): Boolean {
@@ -250,9 +242,13 @@ object KeyboardPrefs {
     fun isSuggestionsEnabled(context: Context) = prefs(context).getBoolean(KEY_SUGGESTIONS, true)
     fun setSuggestionsEnabled(context: Context, v: Boolean) = prefs(context).edit().putBoolean(KEY_SUGGESTIONS, v).apply()
 
-    /** Automatically fix the previous word on space (off by default — the bundled dictionary is small). */
-    fun isAutocorrectTyping(context: Context) = prefs(context).getBoolean(KEY_AUTOCORRECT_TYPING, false)
+    /** Automatically fix the previous word on space (Gboard-style, offline dictionary). On by default. */
+    fun isAutocorrectTyping(context: Context) = prefs(context).getBoolean(KEY_AUTOCORRECT_TYPING, true)
     fun setAutocorrectTyping(context: Context, v: Boolean) = prefs(context).edit().putBoolean(KEY_AUTOCORRECT_TYPING, v).apply()
+
+    /** Glide / swipe typing — slide across letters to type a word. On by default. */
+    fun isSwipeTyping(context: Context) = prefs(context).getBoolean(KEY_SWIPE_TYPING, true)
+    fun setSwipeTyping(context: Context, v: Boolean) = prefs(context).edit().putBoolean(KEY_SWIPE_TYPING, v).apply()
 
     private fun saveClips(context: Context, list: List<String>) {
         val arr = JSONArray()

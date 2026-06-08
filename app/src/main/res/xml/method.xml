@@ -1,16 +1,24 @@
 <?xml version="1.0" encoding="utf-8"?>
 <input-method xmlns:android="http://schemas.android.com/apk/res/android"
     android:settingsActivity="com.keyo.SettingsActivity">
+    <!-- Three keyboard subtypes. On an en-US device only English is implicitly enabled; the user can
+         enable Russian/Latvian in system keyboard settings to see them as separate keyboards (Gboard
+         style). When the active subtype changes (here or from the system picker) the editor's spell
+         checker can follow the language — see onCurrentInputMethodSubtypeChanged in KeyoService. -->
     <subtype
         android:label="English"
+        android:languageTag="en-US"
         android:imeSubtypeLocale="en_US"
+        android:isAsciiCapable="true"
         android:imeSubtypeMode="keyboard" />
     <subtype
         android:label="Russian"
+        android:languageTag="ru-RU"
         android:imeSubtypeLocale="ru_RU"
         android:imeSubtypeMode="keyboard" />
     <subtype
         android:label="Latvian"
+        android:languageTag="lv-LV"
         android:imeSubtypeLocale="lv_LV"
         android:imeSubtypeMode="keyboard" />
 </input-method>
