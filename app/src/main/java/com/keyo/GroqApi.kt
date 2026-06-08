@@ -141,7 +141,12 @@ object GroqApi {
         chat("llama-3.1-8b-instant", messages, 0.3, 200, 0, callback)
     }
 
-    fun executeTask(task: String, context: Context? = null, callback: (String?, String?) -> Unit) {
+    fun executeTask(
+        task: String,
+        context: Context? = null,
+        confirm: (suspend (String) -> Boolean)? = null,
+        callback: (String?, String?) -> Unit
+    ) {
         // Clear history if inactive for too long
         val now = System.currentTimeMillis()
         if (now - lastAiActivityMs > CONTEXT_TIMEOUT_MS) {
@@ -178,7 +183,7 @@ Rules:
         // Use coroutine for tool execution loop
         CoroutineScope(Dispatchers.IO).launch {
             try {
-                val result = executeWithTools(task, messages, context, maxRounds = 5)
+                val result = executeWithTools(task, messages, context, maxRounds = 5, confirm = confirm)
                 callback(result, null)
             } catch (e: Exception) {
                 Log.e(TAG, "executeTask failed", e)
@@ -191,7 +196,8 @@ Rules:
         originalTask: String,
         messages: JSONArray,
         context: Context?,
-        maxRounds: Int
+        maxRounds: Int,
+        confirm: (suspend (String) -> Boolean)? = null
     ): String {
         var currentMessages = messages
         val hasTools = context != null && ToolRegistry.all().isNotEmpty()
@@ -239,7 +245,12 @@ Rules:
                     val toolResult = if (context != null) {
                         val tool = ToolRegistry.get(toolName)
                         if (tool != null) {
-                            try {
+                            // Ask the user to approve consequential actions (call, SMS) first.
+                            val approved = if (tool.sensitive && confirm != null)
+                                confirm(tool.confirmSummary(toolArgs)) else true
+                            if (!approved) {
+                                ToolResult(false, "User declined the action; do not retry it.")
+                            } else try {
                                 withContext(Dispatchers.Main) {
                                     tool.execute(context, toolArgs)
                                 }

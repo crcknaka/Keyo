@@ -27,6 +27,8 @@ object KeyboardPrefs {
     private const val KEY_RECENT_EMOJI = "recent_emoji"
     private const val KEY_DOUBLE_SPACE = "double_space_period"
     private const val KEY_AUTO_CAP = "auto_capitalize"
+    private const val KEY_SUGGESTIONS = "suggestions_enabled"
+    private const val KEY_AUTOCORRECT_TYPING = "autocorrect_typing"
 
     // Defaults / ranges for the visual size editor.
     const val DEFAULT_KEY_HEIGHT = 48
@@ -243,6 +245,14 @@ object KeyboardPrefs {
     fun setDoubleSpacePeriod(context: Context, v: Boolean) = prefs(context).edit().putBoolean(KEY_DOUBLE_SPACE, v).apply()
     fun isAutoCap(context: Context) = prefs(context).getBoolean(KEY_AUTO_CAP, true)
     fun setAutoCap(context: Context, v: Boolean) = prefs(context).edit().putBoolean(KEY_AUTO_CAP, v).apply()
+
+    /** Show the live word-suggestion strip while typing. */
+    fun isSuggestionsEnabled(context: Context) = prefs(context).getBoolean(KEY_SUGGESTIONS, true)
+    fun setSuggestionsEnabled(context: Context, v: Boolean) = prefs(context).edit().putBoolean(KEY_SUGGESTIONS, v).apply()
+
+    /** Automatically fix the previous word on space (off by default — the bundled dictionary is small). */
+    fun isAutocorrectTyping(context: Context) = prefs(context).getBoolean(KEY_AUTOCORRECT_TYPING, false)
+    fun setAutocorrectTyping(context: Context, v: Boolean) = prefs(context).edit().putBoolean(KEY_AUTOCORRECT_TYPING, v).apply()
 
     private fun saveClips(context: Context, list: List<String>) {
         val arr = JSONArray()

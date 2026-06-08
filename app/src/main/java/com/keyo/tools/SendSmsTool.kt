@@ -11,6 +11,9 @@ class SendSmsTool : Tool {
     override val uiLabel = "💬 SMS"
     override val uiExample = "Text: running 10 min late"
     override val description = "Open SMS app to send a text message to a contact or phone number"
+    override val sensitive = true
+    override fun confirmSummary(args: JSONObject) =
+        "Text ${args.optString("contact")}: “${args.optString("message")}”?"
     override val parameters = JSONObject("""
         {
             "type": "object",

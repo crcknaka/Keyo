@@ -251,6 +251,8 @@ class SettingsActivity : ComponentActivity() {
                 var sound by remember { mutableStateOf(KeyboardPrefs.isSoundEnabled(this@SettingsActivity)) }
                 var dblSpace by remember { mutableStateOf(KeyboardPrefs.isDoubleSpacePeriod(this@SettingsActivity)) }
                 var autoCap by remember { mutableStateOf(KeyboardPrefs.isAutoCap(this@SettingsActivity)) }
+                var suggestions by remember { mutableStateOf(KeyboardPrefs.isSuggestionsEnabled(this@SettingsActivity)) }
+                var autoCorrectTyping by remember { mutableStateOf(KeyboardPrefs.isAutocorrectTyping(this@SettingsActivity)) }
                 Group {
                     ChoiceRow("Haptics", KeyboardPrefs.HAPTIC_LEVELS, haptic) {
                         haptic = it; KeyboardPrefs.setHapticStrength(this@SettingsActivity, it)
@@ -258,6 +260,14 @@ class SettingsActivity : ComponentActivity() {
                     HorizontalDivider(color = divider, thickness = 1.dp)
                     ToggleRow("Key sound", "Play a click on every key", sound) {
                         sound = it; KeyboardPrefs.setSoundEnabled(this@SettingsActivity, it)
+                    }
+                    HorizontalDivider(color = divider, thickness = 1.dp)
+                    ToggleRow("Word suggestions", "Show suggestions while typing; tap to insert", suggestions) {
+                        suggestions = it; KeyboardPrefs.setSuggestionsEnabled(this@SettingsActivity, it)
+                    }
+                    HorizontalDivider(color = divider, thickness = 1.dp)
+                    ToggleRow("Auto-correct while typing", "Fix the previous word on space", autoCorrectTyping) {
+                        autoCorrectTyping = it; KeyboardPrefs.setAutocorrectTyping(this@SettingsActivity, it)
                     }
                     HorizontalDivider(color = divider, thickness = 1.dp)
                     ToggleRow("Double-space → period", "Two spaces insert \". \"", dblSpace) {
@@ -317,6 +327,97 @@ class SettingsActivity : ComponentActivity() {
                         ) { Text("Add phrase", color = Color.White, fontWeight = FontWeight.SemiBold) }
                     }
                 }
+                }
+
+                // ===== Personal dictionary =====
+                var dictWords by remember { mutableStateOf(emptyList<String>()) }
+                var dictQuery by remember { mutableStateOf("") }
+                var newWord by remember { mutableStateOf("") }
+                LaunchedEffect(Unit) {
+                    UserDictionary.ensureLoaded(this@SettingsActivity)
+                    dictWords = UserDictionary.wordsByFrequency()
+                }
+                fun refreshDict() { dictWords = UserDictionary.wordsByFrequency() }
+                ExpandableSection("Personal dictionary",
+                    "${dictWords.size} learned words — add, edit or remove") {
+                    Column(Modifier.padding(12.dp)) {
+                        OutlinedTextField(
+                            value = newWord,
+                            onValueChange = { newWord = it },
+                            placeholder = { Text("Add a word…", color = textFaint) },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedTextColor = textPrimary, unfocusedTextColor = textPrimary,
+                                focusedBorderColor = accent, unfocusedBorderColor = border, cursorColor = accent
+                            )
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        Button(
+                            onClick = {
+                                if (UserDictionary.addWord(newWord)) {
+                                    UserDictionary.save(this@SettingsActivity)
+                                    newWord = ""; refreshDict()
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(10.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = accent)
+                        ) { Text("Add word", color = Color.White, fontWeight = FontWeight.SemiBold) }
+
+                        if (dictWords.isEmpty()) {
+                            Spacer(Modifier.height(10.dp))
+                            Text(
+                                "Words you type are learned automatically and will appear here.",
+                                color = textMuted, fontSize = 13.sp
+                            )
+                        } else {
+                            Spacer(Modifier.height(12.dp))
+                            OutlinedTextField(
+                                value = dictQuery,
+                                onValueChange = { dictQuery = it },
+                                placeholder = { Text("Search words…", color = textFaint) },
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth(),
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedTextColor = textPrimary, unfocusedTextColor = textPrimary,
+                                    focusedBorderColor = accent, unfocusedBorderColor = border, cursorColor = accent
+                                )
+                            )
+                            Spacer(Modifier.height(8.dp))
+                            val q = dictQuery.trim().lowercase()
+                            val filtered = if (q.isEmpty()) dictWords else dictWords.filter { it.contains(q) }
+                            val shown = filtered.take(200)
+                            shown.forEach { w ->
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    // Tap a word to load it into the field for editing (then Add the new form).
+                                    Text(w, color = textPrimary, fontSize = 14.sp, maxLines = 1,
+                                        modifier = Modifier.weight(1f).padding(end = 8.dp)
+                                            .clickable { newWord = w })
+                                    Text("✕", color = textMuted, fontSize = 16.sp,
+                                        modifier = Modifier.clickable {
+                                            UserDictionary.removeWord(w)
+                                            UserDictionary.save(this@SettingsActivity); refreshDict()
+                                        })
+                                }
+                                HorizontalDivider(color = divider, thickness = 1.dp)
+                            }
+                            if (filtered.size > shown.size) {
+                                Spacer(Modifier.height(8.dp))
+                                Text("+${filtered.size - shown.size} more — narrow with search",
+                                    color = textMuted, fontSize = 12.sp)
+                            }
+                            Spacer(Modifier.height(10.dp))
+                            Text("Clear all", color = Color(0xFFE5484D), fontSize = 14.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.clickable {
+                                    UserDictionary.clear(this@SettingsActivity); refreshDict(); dictQuery = ""
+                                })
+                        }
+                    }
                 }
 
                 // ===== Voice & AI =====

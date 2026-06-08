@@ -93,6 +93,8 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private var doubleSpaceOn = true
     private var autoCapOn = true
     private var spellcheckOn = true
+    private var suggestionsOn = true
+    private var autocorrectTypingOn = false
 
     private var clipHistory = mutableStateOf<List<String>>(emptyList())
     private var pinnedClips = mutableStateOf<List<String>>(emptyList())
@@ -110,6 +112,19 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private var showClipChip = mutableStateOf(false)
     private var lastClip = mutableStateOf("")
     private val hideClipChip = Runnable { showClipChip.value = false }
+
+    // Track C — live suggestion strip. When the user is typing a word we show suggestions here;
+    // when idle the same row shows the toolbar menu. `toolbarPinned` lets the user open the menu
+    // while typing (via a small chevron) and is auto-reset once the row goes idle.
+    private var suggestions = mutableStateOf<List<String>>(emptyList())
+    private var primarySuggestion = mutableStateOf<String?>(null)
+    private var toolbarPinned = mutableStateOf(false)
+    private val saveUserDict = Runnable { UserDictionary.save(this) }
+
+    // Track D — confirmation prompt for consequential AI actions (call / SMS). When set, a bar with
+    // Confirm / Cancel appears; the assistant's tool loop suspends on `confirmDeferred` until tapped.
+    private var pendingConfirm = mutableStateOf<String?>(null)
+    private var confirmDeferred: kotlinx.coroutines.CompletableDeferred<Boolean>? = null
 
     private val clipboardManager: android.content.ClipboardManager? by lazy {
         getSystemService(android.content.Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
@@ -156,6 +171,8 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         doubleSpaceOn = KeyboardPrefs.isDoubleSpacePeriod(this)
         autoCapOn = KeyboardPrefs.isAutoCap(this)
         spellcheckOn = KeyboardPrefs.isSpellcheckEnabled(this)
+        suggestionsOn = KeyboardPrefs.isSuggestionsEnabled(this)
+        autocorrectTypingOn = KeyboardPrefs.isAutocorrectTyping(this)
     }
 
     // Max content rows any mode shows — keeps the keyboard a fixed height so it never
@@ -174,6 +191,11 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         reloadPrefs()
         KeyboardPrefs.registerChangeListener(this, prefListener)
         clipboardManager?.addPrimaryClipChangedListener(clipListener)
+        // Load the suggestion dictionaries + the user's learned vocabulary off the main thread.
+        serviceScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            UserDictionary.ensureLoaded(this@KeyoService)
+            SuggestionEngine.ensureLoaded(this@KeyoService)
+        }
     }
 
     private fun installLifecycleOwnerOnDecorView() {
@@ -274,7 +296,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         isShift.value = false
         isCapsLock.value = false
         showUndoRewrite.value = false
+        setSuggestions(emptyList(), null)
+        confirmDeferred?.complete(false); confirmDeferred = null; pendingConfirm.value = null
         keyboardMode.value = "abc"   // always open as the normal keyboard, ready to type
+        syncImeSubtype(currentLang.value)   // keep the editor's spell checker on the right language
         maybeAutoCapitalize()
     }
 
@@ -301,6 +326,8 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         // Cancel pending delayed work and all launched coroutines so nothing fires after teardown.
         handler.removeCallbacksAndMessages(null)
         spellcheckHandler.removeCallbacksAndMessages(null)
+        UserDictionary.save(this)
+        confirmDeferred?.complete(false); confirmDeferred = null
         serviceJob.cancel()
         lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
         super.onDestroy()
@@ -332,6 +359,34 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         ) {
             // Dynamic top toolbar (Gboard-style). Priority: status > quick-paste chip > icons.
             TopToolbar(status, textColor, accentColor)
+
+            // Confirmation bar for consequential AI actions (call / SMS).
+            val confirmText by pendingConfirm
+            confirmText?.let { summary ->
+                Row(
+                    modifier = Modifier.fillMaxWidth()
+                        .padding(horizontal = 6.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        summary, color = textColor, fontSize = 13.sp,
+                        maxLines = 2, modifier = Modifier.weight(1f).padding(end = 8.dp)
+                    )
+                    Box(
+                        modifier = Modifier
+                            .background(keyColor, RoundedCornerShape(8.dp))
+                            .clickable { resolveConfirm(false) }
+                            .padding(horizontal = 14.dp, vertical = 7.dp)
+                    ) { Text("Cancel", color = textColor, fontSize = 13.sp) }
+                    Spacer(Modifier.width(6.dp))
+                    Box(
+                        modifier = Modifier
+                            .background(accentColor, RoundedCornerShape(8.dp))
+                            .clickable { resolveConfirm(true) }
+                            .padding(horizontal = 14.dp, vertical = 7.dp)
+                    ) { Text("Confirm", color = Color.Black, fontSize = 13.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold) }
+                }
+            }
 
             if (mode == "emoji") {
                 EmojiPanel(keyHeight, keyColor, textColor, accentColor)
@@ -661,6 +716,9 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         val chip by showClipChip
         val clip by lastClip
         val undo by showUndoRewrite
+        val sugg by suggestions
+        val primary by primarySuggestion
+        val pinned by toolbarPinned
         Box(
             modifier = Modifier.fillMaxWidth().height(40.dp).padding(horizontal = 4.dp),
             contentAlignment = Alignment.CenterStart
@@ -670,6 +728,39 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     status, color = accentColor, fontSize = 12.sp,
                     modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center
                 )
+                // While typing (and the menu isn't pinned open) the row shows live suggestions.
+                sugg.isNotEmpty() && !pinned -> Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    sugg.forEachIndexed { i, s ->
+                        if (i > 0) Box(
+                            Modifier.width(1.dp).height(20.dp).background(textColor.copy(alpha = 0.15f))
+                        )
+                        val isPrimary = s == primary
+                        Box(
+                            modifier = Modifier.weight(1f).fillMaxHeight()
+                                .semantics { contentDescription = "Insert $s" }
+                                .clickable { applySuggestion(s) },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                s,
+                                color = if (isPrimary) accentColor else textColor,
+                                fontSize = 15.sp,
+                                fontWeight = if (isPrimary) androidx.compose.ui.text.font.FontWeight.SemiBold
+                                             else androidx.compose.ui.text.font.FontWeight.Normal,
+                                maxLines = 1
+                            )
+                        }
+                    }
+                    Box(
+                        modifier = Modifier.size(34.dp)
+                            .semantics { contentDescription = "Open toolbar" }
+                            .clickable { toolbarPinned.value = true },
+                        contentAlignment = Alignment.Center
+                    ) { Text("⋯", color = textColor.copy(alpha = 0.6f), fontSize = 18.sp) }
+                }
                 undo -> Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically
@@ -717,6 +808,13 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     horizontalArrangement = Arrangement.spacedBy(2.dp),
                     modifier = Modifier.horizontalScroll(rememberScrollState())
                 ) {
+                    // When typing, a chevron returns from the pinned menu back to suggestions.
+                    if (sugg.isNotEmpty()) Box(
+                        modifier = Modifier.size(40.dp)
+                            .semantics { contentDescription = "Back to suggestions" }
+                            .clickable { toolbarPinned.value = false },
+                        contentAlignment = Alignment.Center
+                    ) { Text("‹", color = accentColor, fontSize = 22.sp) }
                     Box(
                         modifier = Modifier.size(40.dp)
                             .semantics { contentDescription = "Rewrite (tap) or hold to speak an instruction" }
@@ -1884,12 +1982,164 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 ic?.commitText(". ", 1)
                 scheduleSpellcheck()
                 maybeAutoCapitalize()
+                updateSuggestions()
                 return
             }
         }
+        // Finishing a word (space / newline / sentence punctuation): optionally autocorrect it, learn it.
+        if (char == ' ' || char == '\n' || char in ".,!?;:") finishWord()
         ic?.commitText(char.toString(), 1)
         scheduleSpellcheck()
         maybeAutoCapitalize()
+        updateSuggestions()
+    }
+
+    // ---- Track C: word suggestions / learning -------------------------------------------------
+
+    /** The run of word characters immediately before the cursor (the word being typed). */
+    private fun currentWordBeforeCursor(): String {
+        val before = currentInputConnection?.getTextBeforeCursor(48, 0)?.toString() ?: return ""
+        val sb = StringBuilder()
+        for (i in before.indices.reversed()) {
+            val c = before[i]
+            if (c.isLetter() || c == '\'' || c == '-') sb.append(c) else break
+        }
+        return sb.reverse().toString()
+    }
+
+    /** The word preceding [currentWord] (text before the cursor still ends with currentWord). */
+    private fun wordBefore(currentWord: String): String? {
+        val before = currentInputConnection?.getTextBeforeCursor(96, 0)?.toString() ?: return null
+        if (!before.endsWith(currentWord)) return null
+        val head = before.dropLast(currentWord.length).trimEnd()
+        return trailingWord(head)
+    }
+
+    /** When the text before the cursor ends with "<word> " (single space), returns that word. */
+    private fun wordBeforeTrailingSpace(): String? {
+        val before = currentInputConnection?.getTextBeforeCursor(64, 0)?.toString() ?: return null
+        if (before.isEmpty() || before.last() != ' ') return null
+        return trailingWord(before.trimEnd(' '))
+    }
+
+    private fun trailingWord(s: String): String? {
+        if (s.isEmpty()) return null
+        val sb = StringBuilder()
+        for (i in s.indices.reversed()) {
+            val c = s[i]
+            if (c.isLetter() || c == '\'' || c == '-') sb.append(c) else break
+        }
+        return if (sb.isEmpty()) null else sb.reverse().toString()
+    }
+
+    /** Apply the typed word's capitalization pattern (ALL-CAPS / Title / lower) to [candidate]. */
+    private fun matchCase(typed: String, candidate: String): String = when {
+        typed.isEmpty() -> candidate
+        typed.length > 1 && typed.all { it.isUpperCase() } -> candidate.uppercase()
+        typed[0].isUpperCase() -> candidate.replaceFirstChar { it.uppercase() }
+        else -> candidate
+    }
+
+    private fun setSuggestions(list: List<String>, primary: String?) {
+        suggestions.value = list
+        primarySuggestion.value = primary
+        if (list.isEmpty()) toolbarPinned.value = false   // idle row -> menu returns next time
+    }
+
+    /** Recompute the suggestion strip from the text around the cursor. */
+    private fun updateSuggestions() {
+        if (secureField || !suggestionsOn || !SuggestionEngine.isReady()) {
+            setSuggestions(emptyList(), null); return
+        }
+        val lang = currentLang.value
+        val word = currentWordBeforeCursor()
+        if (word.isNotEmpty()) {
+            val lower = word.lowercase()
+            val comp = SuggestionEngine.complete(lower, lang, UserDictionary.unigrams(), 3)
+            val known = SuggestionEngine.isKnown(lower, lang, UserDictionary.unigrams())
+            val list = LinkedHashSet<String>()
+            list.add(word)                                  // always keep what you typed available
+            comp.forEach { list.add(matchCase(word, it)) }
+            val primary = if (!known && comp.isNotEmpty()) matchCase(word, comp[0]) else word
+            setSuggestions(list.take(3), primary)
+        } else {
+            // Next-word prediction right after "<word> ".
+            val prev = wordBeforeTrailingSpace()
+            if (prev != null) {
+                val nexts = SuggestionEngine.nextWords(prev.lowercase(), UserDictionary.bigrams(), 3)
+                setSuggestions(nexts, nexts.firstOrNull())
+            } else setSuggestions(emptyList(), null)
+        }
+    }
+
+    /** Replace the in-progress word (or insert a predicted next word) with [s] and learn it. */
+    private fun applySuggestion(s: String) {
+        performKeyFeedback()
+        val ic = currentInputConnection ?: return
+        val word = currentWordBeforeCursor()
+        val prev: String?
+        if (word.isNotEmpty()) {
+            prev = wordBefore(word)
+            ic.deleteSurroundingText(word.length, 0)
+        } else {
+            prev = wordBeforeTrailingSpace()
+        }
+        ic.commitText("$s ", 1)
+        UserDictionary.learn(prev?.lowercase(), s.lowercase())
+        scheduleUserDictSave()
+        isShift.value = false; shiftIsAuto = false
+        updateSuggestions()
+    }
+
+    /** On a word boundary: autocorrect the finished word (if enabled) and record it for learning. */
+    private fun finishWord() {
+        if (secureField) return
+        val word = currentWordBeforeCursor()
+        if (word.isEmpty()) return
+        val prev = wordBefore(word)
+        var learned = word.lowercase()
+        if (autocorrectTypingOn && SuggestionEngine.isReady() && word.length >= 4) {
+            val corr = SuggestionEngine.correct(learned, currentLang.value, UserDictionary.unigrams())
+            // Only auto-apply safe single-edit fixes; bigger guesses stay as tap suggestions.
+            if (corr != null && corr != learned &&
+                SuggestionEngine.editDistanceAtMost(learned, corr, 1) == 1) {
+                currentInputConnection?.deleteSurroundingText(word.length, 0)
+                currentInputConnection?.commitText(matchCase(word, corr), 1)
+                learned = corr
+            }
+        }
+        UserDictionary.learn(prev?.lowercase(), learned)
+        scheduleUserDictSave()
+    }
+
+    private fun scheduleUserDictSave() {
+        handler.removeCallbacks(saveUserDict)
+        handler.postDelayed(saveUserDict, 4000)
+    }
+
+    override fun onUpdateSelection(
+        oldSelStart: Int, oldSelEnd: Int, newSelStart: Int, newSelEnd: Int,
+        candidatesStart: Int, candidatesEnd: Int
+    ) {
+        super.onUpdateSelection(oldSelStart, oldSelEnd, newSelStart, newSelEnd, candidatesStart, candidatesEnd)
+        updateSuggestions()
+    }
+
+    /** Show a confirm bar with [summary] and suspend until the user approves or cancels. */
+    private suspend fun requestConfirm(summary: String): Boolean {
+        val d = kotlinx.coroutines.CompletableDeferred<Boolean>()
+        confirmDeferred = d
+        handler.post { pendingConfirm.value = summary }
+        val ok = try { d.await() } catch (_: Exception) { false }
+        handler.post { pendingConfirm.value = null }
+        return ok
+    }
+
+    private fun resolveConfirm(ok: Boolean) {
+        performKeyFeedback()
+        confirmDeferred?.complete(ok)
+        confirmDeferred = null
+        pendingConfirm.value = null
     }
 
     // Auto-capitalize: turn shift on at the start of input / a new sentence.
@@ -1984,6 +2234,28 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         val next = enabled[(idx + 1) % enabled.size]
         currentLang.value = next
         KeyboardPrefs.setCurrentLanguage(this, next)
+        syncImeSubtype(next)
+        updateSuggestions()
+    }
+
+    /**
+     * Tell the system which language we're typing in by switching our IME subtype. The editor's
+     * spell checker follows the active subtype's locale — without this it checks (e.g.) Russian text
+     * against English and red-underlines correct words. Best-effort; guarded for OEM quirks.
+     */
+    private fun syncImeSubtype(lang: String) {
+        try {
+            val imm = getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as? android.view.inputmethod.InputMethodManager ?: return
+            val me = imm.enabledInputMethodList.firstOrNull { it.packageName == packageName } ?: return
+            val subtypes = imm.getEnabledInputMethodSubtypeList(me, true)
+            val match = subtypes.firstOrNull { st ->
+                val tag = try { st.languageTag } catch (_: Throwable) { "" }
+                @Suppress("DEPRECATION") val loc = st.locale ?: ""
+                tag.startsWith(lang, ignoreCase = true) || loc.startsWith(lang, ignoreCase = true)
+            } ?: return
+            @Suppress("DEPRECATION")
+            imm.setCurrentInputMethodSubtype(match)
+        } catch (_: Throwable) { /* best-effort: some OEMs restrict this */ }
     }
 
     // Send a Ctrl(+Shift)+key combo (used for undo/redo). Works in editors that support it.
@@ -2253,7 +2525,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 GroqApi.transcribe(audioFile) { text, error ->
                     if (text != null) {
                         handler.post { statusText.value = "🤖 Executing: $text" }
-                        GroqApi.executeTask(text, this@KeyoService) { result, taskError ->
+                        GroqApi.executeTask(text, this@KeyoService, confirm = { summary -> requestConfirm(summary) }) { result, taskError ->
                             handler.post {
                                 try {
                                     if (result != null) {

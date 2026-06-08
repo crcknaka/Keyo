@@ -12,6 +12,8 @@ class PhoneCallTool : Tool {
     override val uiLabel = "📞 Call"
     override val uiExample = "Call Mom"
     override val description = "Make a phone call to a contact by name or phone number. Opens the dialer."
+    override val sensitive = true
+    override fun confirmSummary(args: JSONObject) = "Call ${args.optString("contact")}?"
     override val parameters = JSONObject("""
         {
             "type": "object",

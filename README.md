@@ -18,8 +18,12 @@ Alongside a normal multi-language keyboard it adds:
 - 🤖 **AI assistant** — hold the 🤖 key and say a task; the model can call tools on your phone
   (call a contact, send an SMS, set an alarm/timer, open an app, toggle the flashlight, change
   volume/brightness, search the web, read the clipboard, translate, write text, and more).
+  Consequential actions (calling, texting) ask for an on-keyboard **Confirm / Cancel** first.
 - 📝 **Live spellcheck & auto-correction** — typos are fixed as you type and voice input is
   tidied automatically.
+- ⌨️ **Word suggestions** — an offline dictionary (EN/RU/LV) powers a dynamic suggestion strip:
+  completions and next-word predictions while you type, the toolbar menu when you're idle. It
+  learns your own words and phrases over time. Optional auto-correct on space.
 
 ## Features
 

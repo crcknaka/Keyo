@@ -19,6 +19,15 @@ interface Tool {
     val uiExample: String get() = ""
 
     /**
+     * True for consequential actions (calling, texting) that should be confirmed by the user
+     * before they run. The keyboard shows [confirmSummary] and only executes on approval.
+     */
+    val sensitive: Boolean get() = false
+
+    /** Human-readable description of what is about to happen, shown in the confirmation prompt. */
+    fun confirmSummary(args: JSONObject): String = name
+
+    /**
      * Execute the tool with given arguments.
      * Returns a result string to feed back to the LLM.
      */
