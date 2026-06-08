@@ -126,11 +126,11 @@ class SettingsActivity : ComponentActivity() {
                     SetupRow("Enable keyboard", if (kbEnabled) "Enabled" else "Turn Keyo on in system settings", kbEnabled) {
                         startActivity(Intent(Settings.ACTION_INPUT_METHOD_SETTINGS))
                     }
-                    Divider(color = divider, thickness = 1.dp)
+                    HorizontalDivider(color = divider, thickness = 1.dp)
                     SetupRow("Switch to Keyo", if (isDefault) "Currently active" else "Pick Keyo as the keyboard", isDefault) {
                         (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager).showInputMethodPicker()
                     }
-                    Divider(color = divider, thickness = 1.dp)
+                    HorizontalDivider(color = divider, thickness = 1.dp)
                     SetupRow("Microphone", if (micOk) "Granted" else "Required for voice input", micOk) {
                         if (micOk) openAppSettings() else requestPermission.launch(Manifest.permission.RECORD_AUDIO)
                     }
@@ -167,7 +167,7 @@ class SettingsActivity : ComponentActivity() {
                 var enabledLangs by remember { mutableStateOf(KeyboardPrefs.getEnabledLanguages(this@SettingsActivity)) }
                 Group {
                     KeyboardPrefs.SUPPORTED_LANGUAGES.forEachIndexed { i, (code, name) ->
-                        if (i > 0) Divider(color = divider, thickness = 1.dp)
+                        if (i > 0) HorizontalDivider(color = divider, thickness = 1.dp)
                         CheckRow("${flags[code] ?: "🏳"}   $name", enabledLangs.contains(code)) { want ->
                             KeyboardPrefs.setLanguageEnabled(this@SettingsActivity, code, want)
                             enabledLangs = KeyboardPrefs.getEnabledLanguages(this@SettingsActivity)
@@ -185,11 +185,11 @@ class SettingsActivity : ComponentActivity() {
                     SliderRow("Key height", keyH, "dp", KeyboardPrefs.KEY_HEIGHT_RANGE) {
                         keyH = it; KeyboardPrefs.setKeyHeight(this@SettingsActivity, it)
                     }
-                    Divider(color = divider, thickness = 1.dp)
+                    HorizontalDivider(color = divider, thickness = 1.dp)
                     SliderRow("Vertical spacing", vGap, "dp", KeyboardPrefs.GAP_RANGE) {
                         vGap = it; KeyboardPrefs.setVGap(this@SettingsActivity, it)
                     }
-                    Divider(color = divider, thickness = 1.dp)
+                    HorizontalDivider(color = divider, thickness = 1.dp)
                     SliderRow("Horizontal spacing", hGap, "dp", KeyboardPrefs.GAP_RANGE) {
                         hGap = it; KeyboardPrefs.setHGap(this@SettingsActivity, it)
                     }
@@ -255,15 +255,15 @@ class SettingsActivity : ComponentActivity() {
                     ChoiceRow("Haptics", KeyboardPrefs.HAPTIC_LEVELS, haptic) {
                         haptic = it; KeyboardPrefs.setHapticStrength(this@SettingsActivity, it)
                     }
-                    Divider(color = divider, thickness = 1.dp)
+                    HorizontalDivider(color = divider, thickness = 1.dp)
                     ToggleRow("Key sound", "Play a click on every key", sound) {
                         sound = it; KeyboardPrefs.setSoundEnabled(this@SettingsActivity, it)
                     }
-                    Divider(color = divider, thickness = 1.dp)
+                    HorizontalDivider(color = divider, thickness = 1.dp)
                     ToggleRow("Double-space → period", "Two spaces insert \". \"", dblSpace) {
                         dblSpace = it; KeyboardPrefs.setDoubleSpacePeriod(this@SettingsActivity, it)
                     }
-                    Divider(color = divider, thickness = 1.dp)
+                    HorizontalDivider(color = divider, thickness = 1.dp)
                     ToggleRow("Auto-capitalize", "Capitalize the start of sentences", autoCap) {
                         autoCap = it; KeyboardPrefs.setAutoCap(this@SettingsActivity, it)
                     }
@@ -289,7 +289,7 @@ class SettingsActivity : ComponentActivity() {
                                         phrases = KeyboardPrefs.getPhrases(this@SettingsActivity)
                                     })
                             }
-                            Divider(color = divider, thickness = 1.dp)
+                            HorizontalDivider(color = divider, thickness = 1.dp)
                         }
                         Spacer(Modifier.height(8.dp))
                         OutlinedTextField(
@@ -350,7 +350,7 @@ class SettingsActivity : ComponentActivity() {
                     ToggleRow("Auto-correction", "Tidies up dictation: punctuation, fillers, casing", autocorrect) {
                         autocorrect = it; KeyboardPrefs.setAutocorrectEnabled(this@SettingsActivity, it)
                     }
-                    Divider(color = divider, thickness = 1.dp)
+                    HorizontalDivider(color = divider, thickness = 1.dp)
                     ToggleRow("Live spellcheck", "Fixes typos while typing (after a short pause)", spellcheck) {
                         spellcheck = it; KeyboardPrefs.setSpellcheckEnabled(this@SettingsActivity, it)
                     }
@@ -544,7 +544,7 @@ class SettingsActivity : ComponentActivity() {
                 Text(if (expanded) "⌃" else "⌄", fontSize = 16.sp, color = textFaint)
             }
             if (expanded) {
-                Divider(color = divider, thickness = 1.dp)
+                HorizontalDivider(color = divider, thickness = 1.dp)
                 content()
             }
         }

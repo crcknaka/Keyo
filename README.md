@@ -37,10 +37,11 @@ Alongside a normal multi-language keyboard it adds:
 
 ## Tech stack
 
-- Kotlin · Jetpack Compose (Material 3)
+- Kotlin 2.2 · Jetpack Compose (Material 3)
 - `InputMethodService` keyboard rendered through a `ComposeView`
 - Groq API (Whisper transcription + chat/tool-calling) via OkHttp
-- `minSdk` 26 · `targetSdk` 34 · JDK 17
+- `minSdk` 26 · `targetSdk` 34 · `compileSdk` 36 · JDK 17
+- Built with AGP 8.11 · Gradle 8.14 · JUnit unit tests · GitHub Actions CI
 
 ## Getting started
 
