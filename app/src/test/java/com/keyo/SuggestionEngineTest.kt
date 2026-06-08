@@ -122,6 +122,24 @@ class SuggestionEngineTest {
         assertTrue(merged.contains("hello") && merged.contains("paldies"))
     }
 
+    // --- foldKey (glide skeleton: diacritics collapse to base keys) ---
+
+    @Test fun foldKey_collapsesAllLatvianDiacritics() {
+        // ā č ē ģ ī ķ ļ ņ š ū ž  ->  a c e g i k l n s u z
+        assertEquals("acegiklnsuz", SuggestionEngine.foldKey("āčēģīķļņšūž"))
+    }
+
+    @Test fun foldKey_realWordsBecomeBaseSkeleton() {
+        assertEquals("est", SuggestionEngine.foldKey("ēst"))
+        assertEquals("vins", SuggestionEngine.foldKey("viņš"))
+        assertEquals("latviesu", SuggestionEngine.foldKey("latviešu"))
+    }
+
+    @Test fun foldKey_leavesPlainWordsUntouched_andStillFoldsYo() {
+        assertEquals("keyboard", SuggestionEngine.foldKey("keyboard")) // ASCII pass-through
+        assertEquals("еще", SuggestionEngine.foldKey("ещё"))           // ё→е from fold() still applies
+    }
+
     // --- ё / е equivalence (Russian) ---
 
     private val ru = listOf("ещё", "её", "всё", "серьёзно", "это")

@@ -2142,8 +2142,8 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
      *  (nearest 2 keys) since the finger can land slightly off the intended first/last letter. */
     private fun decodeGlide(path: List<Offset>, prev: String?): List<String> {
         if (path.size < 2 || keyBounds.isEmpty() || !SuggestionEngine.isReady()) return emptyList()
-        val firstFolds = nearestKeys(path.first(), 2).map { SuggestionEngine.fold(it.toString())[0] }.toHashSet()
-        val lastFolds = nearestKeys(path.last(), 2).map { SuggestionEngine.fold(it.toString())[0] }.toHashSet()
+        val firstFolds = nearestKeys(path.first(), 2).map { SuggestionEngine.foldKey(it.toString())[0] }.toHashSet()
+        val lastFolds = nearestKeys(path.last(), 2).map { SuggestionEngine.foldKey(it.toString())[0] }.toHashSet()
         if (firstFolds.isEmpty() || lastFolds.isEmpty()) return emptyList()
         val n = 32
         val swipeR = resample(path, n)
@@ -2157,7 +2157,9 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         for (rank in words.indices) {
             val w = words[rank]
             if (w.length < 2) continue
-            val fw = SuggestionEngine.fold(w)
+            // Match on the base-key skeleton: a glide crosses base letters only, so diacritic words
+            // ("ēst", "viņš") are decoded by their e-s-t / v-i-n-s path; the dict supplies the accents.
+            val fw = SuggestionEngine.foldKey(w)
             if (fw[0] !in firstFolds || fw[fw.length - 1] !in lastFolds) continue
             var ok = true
             val ideal = ArrayList<Offset>(fw.length)

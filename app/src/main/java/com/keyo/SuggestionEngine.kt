@@ -110,6 +110,40 @@ object SuggestionEngine {
     internal fun fold(s: String): String =
         if (s.indexOf('ё') >= 0 || s.indexOf('Ё') >= 0) s.replace('ё', 'е').replace('Ё', 'Е') else s
 
+    /** Accented letters reachable via long-press, mapped to the base key they sit on. A glide only
+     *  ever crosses base keys (you can't slide to a long-press accent), so for glide matching a word
+     *  like "ēst" is the e-s-t skeleton. Mirrors the accents in KeyoService.altChars. */
+    private val accentBase = mapOf(
+        'ā' to 'a','à' to 'a','á' to 'a','â' to 'a','ã' to 'a','å' to 'a','æ' to 'a',
+        'ē' to 'e','è' to 'e','é' to 'e','ê' to 'e','ë' to 'e','ė' to 'e','ę' to 'e',
+        'ī' to 'i','ì' to 'i','í' to 'i','î' to 'i','ï' to 'i','į' to 'i',
+        'ō' to 'o','ö' to 'o','ò' to 'o','ó' to 'o','ô' to 'o','õ' to 'o','ø' to 'o',
+        'ū' to 'u','ü' to 'u','ù' to 'u','ú' to 'u','û' to 'u','ų' to 'u',
+        'š' to 's','ś' to 's','ß' to 's',
+        'č' to 'c','ç' to 'c','ć' to 'c',
+        'ņ' to 'n','ñ' to 'n','ń' to 'n',
+        'ž' to 'z','ź' to 'z','ż' to 'z',
+        'ģ' to 'g','ğ' to 'g',
+        'ķ' to 'k',
+        'ļ' to 'l','ł' to 'l',
+        'ŗ' to 'r',
+        'ý' to 'y','ÿ' to 'y',
+        'đ' to 'd'
+    )
+
+    /** Fold for glide geometry/matching: [fold] (ё→е) plus every long-press accent collapsed to its
+     *  base key, so diacritic words (Latvian ā č ē ģ ī ķ ļ ņ š ū ž …) match a base-letter swipe. Used
+     *  ONLY for glide — tap typing and suggestions keep ē and e distinct via [fold]. */
+    fun foldKey(s: String): String {
+        val f = fold(s)
+        var i = 0
+        while (i < f.length) { if (accentBase.containsKey(f[i])) break; i++ }
+        if (i == f.length) return f   // pure base letters — nothing to collapse
+        val sb = StringBuilder(f.length)
+        for (c in f) sb.append(accentBase[c] ?: c)
+        return sb.toString()
+    }
+
     // ---------------------------------------------------------------------------------------------
     // Pure algorithms (no Android dependency) — unit-tested directly.
     // ---------------------------------------------------------------------------------------------
