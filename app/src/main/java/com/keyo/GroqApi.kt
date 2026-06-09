@@ -157,7 +157,7 @@ object GroqApi {
         val systemPrompt = """You are a keyboard AI assistant with tools. You can execute actions on the user's phone AND generate text.
 
 Rules:
-- If the user asks to DO something (call, SMS, alarm, timer, open app, flashlight, search, volume, etc.) — USE THE APPROPRIATE TOOL.
+- If the user asks to DO something (alarm, timer, open app, flashlight, search, volume, etc.) — USE THE APPROPRIATE TOOL.
 - If the user asks to WRITE/COMPOSE text — output the text directly without tools.
 - If user asks to write/say something in a specific language, translate and output in that language.
 - If user asks to compose something (email, message, etc.), write it directly.
@@ -245,7 +245,7 @@ Rules:
                     val toolResult = if (context != null) {
                         val tool = ToolRegistry.get(toolName)
                         if (tool != null) {
-                            // Ask the user to approve consequential actions (call, SMS) first.
+                            // Ask the user to approve any tool flagged sensitive before running it.
                             val approved = if (tool.sensitive && confirm != null)
                                 confirm(tool.confirmSummary(toolArgs)) else true
                             if (!approved) {

@@ -29,6 +29,7 @@ object KeyboardPrefs {
     private const val KEY_SUGGESTIONS = "suggestions_enabled"
     private const val KEY_AUTOCORRECT_TYPING = "autocorrect_typing"
     private const val KEY_SWIPE_TYPING = "swipe_typing"
+    private const val KEY_LIVE_DICTATION = "live_dictation"
 
     // Defaults / ranges for the visual size editor.
     const val DEFAULT_KEY_HEIGHT = 48
@@ -202,7 +203,8 @@ object KeyboardPrefs {
         prefs(context).edit().putString(key, a.toString()).apply()
     }
 
-    // Pinned clips (kept above history, never auto-evicted)
+    // Pinned clips (kept above clipboard history, never auto-evicted). These double as saved
+    // templates — they replaced the old "quick phrases" feature.
     fun getPinned(context: Context) = getList(context, KEY_PINNED)
     fun isPinned(context: Context, text: String) = getPinned(context).contains(text)
     fun togglePin(context: Context, text: String) {
@@ -210,17 +212,25 @@ object KeyboardPrefs {
         if (!cur.remove(text)) cur.add(0, text)
         putList(context, KEY_PINNED, cur)
     }
-
-    // Quick phrases / templates (user-defined)
-    fun getPhrases(context: Context) = getList(context, KEY_PHRASES)
-    fun addPhrase(context: Context, text: String) {
+    fun addPinned(context: Context, text: String) {
         if (text.isBlank()) return
-        val cur = getPhrases(context).toMutableList()
-        cur.remove(text); cur.add(text)
-        putList(context, KEY_PHRASES, cur)
+        val cur = getPinned(context).toMutableList()
+        cur.remove(text); cur.add(0, text)
+        while (cur.size > 50) cur.removeAt(cur.size - 1)
+        putList(context, KEY_PINNED, cur)
     }
-    fun removePhrase(context: Context, text: String) {
-        putList(context, KEY_PHRASES, getPhrases(context).filter { it != text })
+    fun removePinned(context: Context, text: String) {
+        putList(context, KEY_PINNED, getPinned(context).filter { it != text })
+    }
+
+    /** One-time merge of the retired "quick phrases" into pinned clips, then clears the old store. */
+    fun migratePhrasesToPinned(context: Context) {
+        val phrases = getList(context, KEY_PHRASES)
+        if (phrases.isEmpty()) return
+        val pinned = getPinned(context).toMutableList()
+        phrases.forEach { if (it.isNotBlank() && it !in pinned) pinned.add(it) }
+        putList(context, KEY_PINNED, pinned)
+        prefs(context).edit().remove(KEY_PHRASES).apply()
     }
 
     // Recently-used emoji
@@ -249,6 +259,11 @@ object KeyboardPrefs {
     /** Glide / swipe typing — slide across letters to type a word. On by default. */
     fun isSwipeTyping(context: Context) = prefs(context).getBoolean(KEY_SWIPE_TYPING, true)
     fun setSwipeTyping(context: Context, v: Boolean) = prefs(context).edit().putBoolean(KEY_SWIPE_TYPING, v).apply()
+
+    /** Live dictation — show the transcript growing in the field while you speak (more API calls).
+     *  Off by default; the standard path transcribes once on release. */
+    fun isLiveDictation(context: Context) = prefs(context).getBoolean(KEY_LIVE_DICTATION, false)
+    fun setLiveDictation(context: Context, v: Boolean) = prefs(context).edit().putBoolean(KEY_LIVE_DICTATION, v).apply()
 
     private fun saveClips(context: Context, list: List<String>) {
         val arr = JSONArray()

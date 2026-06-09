@@ -76,6 +76,16 @@ class AudioRecorder {
         }
     }
 
+    /** Write the audio captured SO FAR to [outputFile] as WAV without stopping the recording.
+     *  Used by live dictation to transcribe the growing utterance periodically. */
+    fun snapshot(outputFile: File): Boolean {
+        if (!isRecording) return false
+        val pcmBytes: ByteArray
+        synchronized(pcmData) { pcmBytes = pcmData.toByteArray() }
+        if (pcmBytes.isEmpty()) return false
+        return try { writeWav(outputFile, pcmBytes); true } catch (e: Exception) { false }
+    }
+
     private fun writeWav(file: File, pcmData: ByteArray) {
         val channels = 1
         val bitsPerSample = 16

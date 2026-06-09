@@ -143,7 +143,7 @@ class SettingsActivity : ComponentActivity() {
         val enabled = KeyboardPrefs.getEnabledLanguages(this@SettingsActivity)
         val langNames = KeyboardPrefs.SUPPORTED_LANGUAGES
             .filter { it.first in enabled }.joinToString(" · ") { it.second }
-        val phraseCount = KeyboardPrefs.getPhrases(this@SettingsActivity).size
+        val pinnedCount = KeyboardPrefs.getPinned(this@SettingsActivity).size
         var dictCount by remember { mutableStateOf(0) }
         LaunchedEffect(Unit) {
             UserDictionary.ensureLoaded(this@SettingsActivity)
@@ -174,7 +174,7 @@ class SettingsActivity : ComponentActivity() {
             }
             Spacer(Modifier.height(8.dp))
             Group {
-                NavTile("📝", "Phrases & dictionary", "$phraseCount phrases · $dictCount words") { onOpen("phrases") }
+                NavTile("📋", "Clips & dictionary", "$pinnedCount pinned · $dictCount words") { onOpen("phrases") }
                 Sep()
                 NavTile("💡", "Help & gestures", "Dictation, cursor, shortcuts") { onOpen("help") }
                 Sep()
@@ -349,6 +349,7 @@ class SettingsActivity : ComponentActivity() {
         var selectedModel by remember { mutableStateOf(KeyboardPrefs.getModel(this@SettingsActivity)) }
         var selectedAiModel by remember { mutableStateOf(KeyboardPrefs.getAiModel(this@SettingsActivity)) }
         var autocorrect by remember { mutableStateOf(KeyboardPrefs.isAutocorrectEnabled(this@SettingsActivity)) }
+        var liveDictation by remember { mutableStateOf(KeyboardPrefs.isLiveDictation(this@SettingsActivity)) }
 
         SubScreen("Voice & AI", onBack) {
             SectionLabel("Models")
@@ -359,6 +360,10 @@ class SettingsActivity : ComponentActivity() {
                 selectedAiModel = id; KeyboardPrefs.setAiModel(this@SettingsActivity, id); GroqApi.aiModel = id
             }
             Group {
+                ToggleRow("Live dictation", "Show words in the field as you speak (uses more data)", liveDictation) {
+                    liveDictation = it; KeyboardPrefs.setLiveDictation(this@SettingsActivity, it)
+                }
+                Sep()
                 ToggleRow("Dictation cleanup", "Tidies up dictation: punctuation, fillers, casing", autocorrect) {
                     autocorrect = it; KeyboardPrefs.setAutocorrectEnabled(this@SettingsActivity, it)
                 }
@@ -374,7 +379,7 @@ class SettingsActivity : ComponentActivity() {
 
     @Composable
     private fun PhrasesScreen(onBack: () -> Unit) {
-        var phrases by remember { mutableStateOf(KeyboardPrefs.getPhrases(this@SettingsActivity)) }
+        var pinned by remember { mutableStateOf(KeyboardPrefs.getPinned(this@SettingsActivity)) }
         var newPhrase by remember { mutableStateOf("") }
 
         var dictWords by remember { mutableStateOf(emptyList<String>()) }
@@ -387,32 +392,32 @@ class SettingsActivity : ComponentActivity() {
         }
         fun refreshDict() { dictWords = UserDictionary.wordsByFrequency() }
 
-        SubScreen("Phrases & dictionary", onBack) {
-            SectionLabel("Quick phrases")
+        SubScreen("Clips & dictionary", onBack) {
+            SectionLabel("Pinned clips")
             Group {
                 Column(Modifier.padding(12.dp)) {
-                    if (phrases.isEmpty()) {
-                        Text("No phrases yet. Add templates you reuse — tap the ★ key on the keyboard to insert them.",
+                    if (pinned.isEmpty()) {
+                        Text("No pinned clips yet. Pin text from the clipboard panel (📋), or add reusable templates here — they stay at the top of the clipboard.",
                             color = textMuted, fontSize = 13.sp, modifier = Modifier.padding(vertical = 4.dp))
                     }
-                    phrases.forEach { p ->
+                    pinned.forEach { p ->
                         Row(
                             modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(p.replace("\n", " ").take(80), color = textPrimary, fontSize = 14.sp,
                                 maxLines = 2, modifier = Modifier.weight(1f).padding(end = 8.dp))
-                            DeleteGlyph { KeyboardPrefs.removePhrase(this@SettingsActivity, p); phrases = KeyboardPrefs.getPhrases(this@SettingsActivity) }
+                            DeleteGlyph { KeyboardPrefs.removePinned(this@SettingsActivity, p); pinned = KeyboardPrefs.getPinned(this@SettingsActivity) }
                         }
                         HorizontalDivider(color = divider, thickness = 1.dp)
                     }
                     Spacer(Modifier.height(10.dp))
-                    PlainField(newPhrase, "New phrase or template…") { newPhrase = it }
+                    PlainField(newPhrase, "New pinned clip or template…") { newPhrase = it }
                     Spacer(Modifier.height(8.dp))
-                    PrimaryButton("Add phrase") {
+                    PrimaryButton("Add pinned clip") {
                         if (newPhrase.isNotBlank()) {
-                            KeyboardPrefs.addPhrase(this@SettingsActivity, newPhrase.trim())
-                            phrases = KeyboardPrefs.getPhrases(this@SettingsActivity); newPhrase = ""
+                            KeyboardPrefs.addPinned(this@SettingsActivity, newPhrase.trim())
+                            pinned = KeyboardPrefs.getPinned(this@SettingsActivity); newPhrase = ""
                         }
                     }
                 }
@@ -482,7 +487,7 @@ class SettingsActivity : ComponentActivity() {
             "Dictate" to "Long-press the space bar and speak; release to insert.",
             "Move cursor" to "Swipe left/right on the space bar.",
             "Select text" to "Hold Shift, then swipe the space bar.",
-            "AI task (voice)" to "Hold the comma/✨ key (left of space) and speak a command — call, SMS, alarm, write a message, etc.",
+            "AI task (voice)" to "Hold the comma/✨ key (left of space) and speak a command — alarm, timer, open app, search, write a message, etc.",
             "Improve text" to "Tap ✨ in the top bar: fix grammar, shorten, change tone, translate, continue writing. Works on selected text (or the whole message).",
             "Custom rewrite (voice)" to "Hold the ✨ icon and speak an instruction (e.g. \"make it rhyme\").",
             "Caps Lock" to "Double-tap Shift; tap again to release.",

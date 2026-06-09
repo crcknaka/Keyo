@@ -36,8 +36,6 @@ object ToolRegistry {
     }
 
     fun init() {
-        register(PhoneCallTool())
-        register(SendSmsTool())
         register(SetAlarmTool())
         register(SetTimerTool())
         register(OpenAppTool())

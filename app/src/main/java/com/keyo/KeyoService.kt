@@ -64,6 +64,30 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
 
     private val audioRecorder = AudioRecorder()
     private val handler = Handler(Looper.getMainLooper())
+    // Live dictation: while recording, periodically transcribe the audio-so-far and show it as a
+    // growing composing region (the final commitText on release replaces it). One transcription in
+    // flight at a time (liveBusy). Off unless KeyboardPrefs.isLiveDictation.
+    private var liveBusy = false
+    private val liveDictationTick = object : Runnable {
+        override fun run() {
+            if (!audioRecorder.isActive()) return
+            if (!liveBusy) {
+                val f = File(cacheDir, "voice_live.wav")
+                if (audioRecorder.snapshot(f)) {
+                    liveBusy = true
+                    GroqApi.transcribe(f) { text, _ ->
+                        handler.post {
+                            liveBusy = false
+                            if (audioRecorder.isActive() && !text.isNullOrBlank()) {
+                                try { currentInputConnection?.setComposingText(text, 1) } catch (_: Exception) {}
+                            }
+                        }
+                    }
+                }
+            }
+            handler.postDelayed(this, 1600)
+        }
+    }
     // One lifecycle-scoped coroutine scope for the whole service. Cancelled in onDestroy() so no
     // launched job (long-press timers, AI/voice callbacks) can outlive the keyboard and touch
     // destroyed Compose state.
@@ -93,9 +117,13 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private var soundEnabled = mutableStateOf(false)
     private var themeId = mutableStateOf("catppuccin")
 
-    // True for password / no-personalized-learning fields. In these we never send anything
-    // to the network: no voice transcription, no AI.
+    // True only for PASSWORD fields. In these we never send anything to the network (no voice
+    // transcription, no AI), show no suggestions and use no composing region.
     private var secureField = false
+    // True for password OR no-personalized-learning fields (e.g. Chrome incognito). Here we must not
+    // PERSIST anything personal — no learning into the dictionary, no clipboard history — but voice,
+    // AI, suggestions and glide are still allowed (incognito isn't a password).
+    private var noLearn = false
 
     // Cached hot-path settings (refreshed in reloadPrefs) to avoid SharedPreferences reads per keystroke.
     private var doubleSpaceOn = true
@@ -120,7 +148,6 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
 
     private var clipHistory = mutableStateOf<List<String>>(emptyList())
     private var pinnedClips = mutableStateOf<List<String>>(emptyList())
-    private var phrasesState = mutableStateOf<List<String>>(emptyList())
     private var emojiCategory = mutableIntStateOf(0)        // emoji panel category
     private var isCapsLock = mutableStateOf(false)
     private var lastShiftTapMs = 0L
@@ -151,9 +178,9 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private val clipboardManager: android.content.ClipboardManager? by lazy {
         getSystemService(android.content.Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
     }
-    // Record copied text into the clipboard-history panel (skipped in password fields).
+    // Record copied text into the clipboard-history panel (skipped in password / incognito fields).
     private val clipListener = android.content.ClipboardManager.OnPrimaryClipChangedListener {
-        if (!secureField) {
+        if (!noLearn) {
             try {
                 val text = clipboardManager?.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString()
                 if (!text.isNullOrBlank()) {
@@ -186,10 +213,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         soundEnabled.value = KeyboardPrefs.isSoundEnabled(this)
         themeId.value = KeyboardPrefs.getTheme(this)
         enabledLangs.value = KeyboardPrefs.getEnabledLanguages(this)
+        KeyboardPrefs.migratePhrasesToPinned(this)   // old quick-phrases -> pinned clips (one-time)
         clipHistory.value = KeyboardPrefs.getClipHistory(this)
         pinnedClips.value = KeyboardPrefs.getPinned(this)
         recentEmoji.value = KeyboardPrefs.getRecentEmoji(this)
-        phrasesState.value = KeyboardPrefs.getPhrases(this)
         doubleSpaceOn = KeyboardPrefs.isDoubleSpacePeriod(this)
         autoCapOn = KeyboardPrefs.isAutoCap(this)
         suggestionsOn = KeyboardPrefs.isSuggestionsEnabled(this)
@@ -313,7 +340,8 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 variation == android.text.InputType.TYPE_NUMBER_VARIATION_PASSWORD)
         val noLearning = ((info?.imeOptions ?: 0) and
             android.view.inputmethod.EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING) != 0
-        secureField = isPassword || noLearning
+        secureField = isPassword              // blocks voice/AI/suggestions/composing (passwords only)
+        noLearn = isPassword || noLearning    // blocks personal persistence (also incognito)
 
         isShift.value = false
         isCapsLock.value = false
@@ -420,8 +448,6 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 ClipboardPanel(keyHeight, keyColor, textColor, accentColor)
             } else if (mode == "rewrite") {
                 RewritePanel(keyHeight, keyColor, textColor, accentColor)
-            } else if (mode == "phrases") {
-                PhrasesPanel(keyHeight, keyColor, textColor, accentColor)
             } else {
 
             // Key content area — fixed height (maxContentRows tall) so switching between
@@ -935,7 +961,6 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     ) { SparkleGlyph(accentColor, Modifier.size(20.dp)) }
                     ToolbarVec("Emoji", { emojiCategory.intValue = if (recentEmoji.value.isEmpty()) 1 else 0; keyboardMode.value = "emoji" }) { SmileyGlyph(textColor, Modifier.size(21.dp)) }
                     ToolbarVec("Clipboard", { keyboardMode.value = "clipboard" }) { ClipboardGlyph(textColor, Modifier.size(20.dp)) }
-                    ToolbarVec("Quick phrases", { keyboardMode.value = "phrases" }) { StarGlyph(textColor, Modifier.size(19.dp)) }
                     ToolbarVec("Undo", { performKeyFeedback(); sendCtrlKey(android.view.KeyEvent.KEYCODE_Z) }) { CurvedArrowGlyph(textColor, false, Modifier.size(20.dp)) }
                     ToolbarVec("Redo", { performKeyFeedback(); sendCtrlKey(android.view.KeyEvent.KEYCODE_Z, withShift = true) }) { CurvedArrowGlyph(textColor, true, Modifier.size(20.dp)) }
                     ToolbarVec("Select all", { performKeyFeedback(); selectAll() }) { SelectAllGlyph(textColor, Modifier.size(19.dp)) }
@@ -1087,20 +1112,33 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         // Pinned items first, then recent history (excluding any that are pinned).
         val combined = pins.map { it to true } + clips.filter { it !in pins }.map { it to false }
         Column(modifier = Modifier.fillMaxWidth().height(keyHeight * (maxContentRows + 1))) {
-            // Slim "Clear" row (clears unpinned history), only when there's history
-            if (clips.isNotEmpty()) {
-                Row(
-                    modifier = Modifier.fillMaxWidth().height(30.dp).padding(horizontal = 14.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.End
-                ) {
-                    Text("Clear", color = accentColor, fontSize = 13.sp,
+            // Header: pin the current text (replaces "save quick phrase"), manage pins in settings,
+            // and clear the unpinned history.
+            Row(
+                modifier = Modifier.fillMaxWidth().height(34.dp).padding(horizontal = 14.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("＋ Pin current text", color = accentColor, fontSize = 13.sp,
+                    fontWeight = androidx.compose.ui.text.font.FontWeight.Medium,
+                    modifier = Modifier.weight(1f).clickable {
+                        val t = currentTargetText()
+                        if (!secureField && t.isNotBlank()) {
+                            KeyboardPrefs.addPinned(this@KeyoService, t)
+                            pinnedClips.value = KeyboardPrefs.getPinned(this@KeyoService)
+                            statusText.value = "📌 Pinned"
+                            handler.postDelayed({ if (statusText.value.startsWith("📌")) statusText.value = "" }, 1200)
+                        }
+                    })
+                Text("Edit ›", color = textColor.copy(alpha = 0.7f), fontSize = 13.sp,
+                    modifier = Modifier.clickable { openSettings("phrases") })
+                if (clips.isNotEmpty()) {
+                    Text("  Clear", color = accentColor, fontSize = 13.sp,
                         modifier = Modifier.clickable {
                             KeyboardPrefs.clearClips(this@KeyoService); clipHistory.value = emptyList()
                         })
                 }
-                androidx.compose.material3.HorizontalDivider(color = textColor.copy(alpha = 0.12f))
             }
+            androidx.compose.material3.HorizontalDivider(color = textColor.copy(alpha = 0.12f))
 
             Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
                 if (combined.isEmpty()) {
@@ -1132,19 +1170,8 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                     Text(clip.replace("\n", " ").take(80),
                                         color = textColor, fontSize = 14.sp, maxLines = 2)
                                 }
-                                // Save to phrases
-                                Box(
-                                    modifier = Modifier.size(38.dp)
-                                        .semantics { contentDescription = "Save to phrases" }
-                                        .clickable {
-                                            KeyboardPrefs.addPhrase(this@KeyoService, clip)
-                                            phrasesState.value = KeyboardPrefs.getPhrases(this@KeyoService)
-                                            statusText.value = "★ Saved to phrases"
-                                            handler.postDelayed({ if (statusText.value.startsWith("★")) statusText.value = "" }, 1200)
-                                        },
-                                    contentAlignment = Alignment.Center
-                                ) { Text("★", color = textColor.copy(alpha = 0.5f), fontSize = 15.sp) }
-                                // Pin toggle
+                                // Pin toggle (pinning a clip keeps it at the top — this replaces the
+                                // old "save as quick phrase" action).
                                 Box(
                                     modifier = Modifier.size(38.dp)
                                         .semantics { contentDescription = if (pinned) "Unpin" else "Pin" }
@@ -1156,63 +1183,6 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                 ) {
                                     Text("📌", fontSize = 15.sp, modifier = Modifier.alpha(if (pinned) 1f else 0.3f))
                                 }
-                            }
-                            androidx.compose.material3.HorizontalDivider(color = textColor.copy(alpha = 0.08f))
-                        }
-                    }
-                }
-            }
-            PanelBottomBar(keyColor, textColor, accentColor)
-        }
-    }
-
-    // Quick phrases panel (mode == "phrases"). Tap a saved phrase to insert it.
-    @Composable
-    fun PhrasesPanel(
-        keyHeight: androidx.compose.ui.unit.Dp,
-        keyColor: Color,
-        textColor: Color,
-        accentColor: Color
-    ) {
-        val phrases by phrasesState
-        Column(modifier = Modifier.fillMaxWidth().height(keyHeight * (maxContentRows + 1))) {
-            // Quick actions: save current text, manage in settings
-            Row(
-                modifier = Modifier.fillMaxWidth().height(34.dp).padding(horizontal = 12.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text("＋ Save current text", color = accentColor, fontSize = 13.sp,
-                    fontWeight = androidx.compose.ui.text.font.FontWeight.Medium,
-                    modifier = Modifier.weight(1f).clickable {
-                        val t = currentTargetText()
-                        if (!secureField && t.isNotBlank()) {
-                            KeyboardPrefs.addPhrase(this@KeyoService, t)
-                            phrasesState.value = KeyboardPrefs.getPhrases(this@KeyoService)
-                            statusText.value = "★ Saved to phrases"
-                            handler.postDelayed({ if (statusText.value.startsWith("★")) statusText.value = "" }, 1200)
-                        }
-                    })
-                Text("Edit ›", color = textColor.copy(alpha = 0.7f), fontSize = 13.sp,
-                    modifier = Modifier.clickable { openSettings("phrases") })
-            }
-            androidx.compose.material3.HorizontalDivider(color = textColor.copy(alpha = 0.12f))
-
-            Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
-                if (phrases.isEmpty()) {
-                    Text("Add quick phrases in Settings → Quick phrases",
-                        color = textColor.copy(alpha = 0.5f), fontSize = 13.sp,
-                        modifier = Modifier.align(Alignment.Center).padding(16.dp))
-                } else {
-                    androidx.compose.foundation.lazy.LazyColumn(modifier = Modifier.fillMaxSize()) {
-                        items(phrases.size) { i ->
-                            val p = phrases[i]
-                            Row(
-                                modifier = Modifier.fillMaxWidth()
-                                    .clickable { performKeyFeedback(); commitText(formatEmphasis(p)) }
-                                    .padding(horizontal = 14.dp, vertical = 12.dp)
-                            ) {
-                                Text(p.replace("\n", " ").take(100),
-                                    color = textColor, fontSize = 14.sp, maxLines = 2)
                             }
                             androidx.compose.material3.HorizontalDivider(color = textColor.copy(alpha = 0.08f))
                         }
@@ -2298,9 +2268,12 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         glideWord = word
         glideAlts = cands.map { cased(it) }.distinct()
         // Learn the phrase (prev -> word) so context re-ranking improves over time. Like typing, a
-        // glide doesn't add the word itself to the dictionary (bumpUnigram = false).
-        UserDictionary.learn(prev?.lowercase(), cands[0], bumpUnigram = false)
-        scheduleUserDictSave()
+        // glide doesn't add the word itself to the dictionary (bumpUnigram = false); skipped when the
+        // field forbids personalization (incognito).
+        if (!noLearn) {
+            UserDictionary.learn(prev?.lowercase(), cands[0], bumpUnigram = false)
+            scheduleUserDictSave()
+        }
         updateSuggestions()            // shows glideAlts (text now ends with "<word> ")
     }
 
@@ -2473,6 +2446,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
      *  but only add the word to the *personal* dictionary when it isn't already a built-in word — so
      *  tapping common words (e.g. "привет") doesn't clutter your saved words or waste its capacity. */
     private fun learnFromTap(prev: String?, wordLower: String) {
+        if (noLearn) return   // incognito / password: don't personalize
         val isNewWord = !SuggestionEngine.isKnown(wordLower, dictLangs(), emptyMap())
         UserDictionary.learn(prev, wordLower, bumpUnigram = isNewWord)
     }
@@ -2582,9 +2556,12 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         // "<finalWord><boundary>" in the field; the next Backspace restores [word].
         autocorrectUndo = if (corrected) AutocorrectUndo(finalWord, word) else null
         // Plain typing must NOT add the word to the dictionary — only an explicit suggestion tap
-        // (applySuggestion) does. We still record the next-word pattern for prediction.
-        UserDictionary.learn(prev?.lowercase(), learned, bumpUnigram = false)
-        scheduleUserDictSave()
+        // (applySuggestion) does. We still record the next-word pattern for prediction (unless the
+        // field forbids personalization, e.g. incognito).
+        if (!noLearn) {
+            UserDictionary.learn(prev?.lowercase(), learned, bumpUnigram = false)
+            scheduleUserDictSave()
+        }
     }
 
     private fun scheduleUserDictSave() {
@@ -2903,6 +2880,11 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             if (audioRecorder.start()) {
                 isRecording.value = true
                 statusText.value = "🎤 Recording..."
+                if (KeyboardPrefs.isLiveDictation(this)) {
+                    finalizeComposing()        // so the interim transcript owns the composing region
+                    liveBusy = false
+                    handler.postDelayed(liveDictationTick, 1600)
+                }
             } else {
                 statusText.value = "⚠ Failed to start recording"
             }
@@ -2913,9 +2895,12 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     }
 
     private fun cancelVoiceRecording() {
+        handler.removeCallbacks(liveDictationTick)
         try {
             audioRecorder.stop(File(cacheDir, "voice_input.wav"))
         } catch (_: Exception) {}
+        // Drop any live-dictation interim text from the field.
+        try { currentInputConnection?.setComposingText("", 1); currentInputConnection?.finishComposingText() } catch (_: Exception) {}
         isRecording.value = false
         statusText.value = "✕ Cancelled"
         handler.postDelayed({ if (statusText.value == "✕ Cancelled") statusText.value = "" }, 1500)
@@ -2923,6 +2908,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
 
     private fun stopVoiceRecording() {
         try {
+            handler.removeCallbacks(liveDictationTick)   // stop live-interim updates; final replaces them
             if (!audioRecorder.isActive()) return
             finalizeComposing()   // commit any composing word so the transcript appends after it
 
@@ -2957,12 +2943,15 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         }
                     } else {
                         handler.post {
+                            // Keep whatever live dictation already recognised (commit the interim).
+                            try { currentInputConnection?.finishComposingText() } catch (_: Exception) {}
                             statusText.value = error ?: "Transcription failed"
                             handler.postDelayed({ statusText.value = "" }, 3000)
                         }
                     }
                 }
             } else {
+                try { currentInputConnection?.finishComposingText() } catch (_: Exception) {}
                 isRecording.value = false
                 statusText.value = "⚠ Recording too short"
                 handler.postDelayed({ statusText.value = "" }, 2000)
