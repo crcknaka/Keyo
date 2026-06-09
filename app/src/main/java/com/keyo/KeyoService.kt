@@ -755,8 +755,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     }
                 }
 
-                // Space — shared component (tap = space, hold = dictate, swipe = cursor slider)
-                val spaceLabel = if (mode == "abc") lang.uppercase() else "space"
+                // Space — shared component (tap = space, hold = dictate, swipe = cursor slider).
+                // The label names every language sharing the active layout, so the bilingual Latin
+                // keyboard reads "EN+LV" when both are enabled (just "EN"/"RU"/"LV" otherwise).
+                val spaceLabel = if (mode == "abc") dictLangs().joinToString("+") { it.uppercase() } else "space"
                 SpaceKey(Modifier.weight(3.5f), spaceLabel, keyColor, textColor, accentColor, recordColor)
 
                 // Period — long press shows ? , ! -
@@ -2234,7 +2236,17 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             if (fw[0] !in firstFolds || fw[fw.length - 1] !in lastFolds) continue
             var ok = true
             val ideal = ArrayList<Offset>(fw.length)
-            for (c in fw) { val ctr = centerOf(c); if (ctr == null) { ok = false; break }; ideal.add(ctr) }
+            // Collapse consecutive duplicate keys: a glide crosses a repeated letter once ("hello" is
+            // swiped h-e-l-o), so match the de-duplicated key skeleton and let the dictionary pick
+            // between e.g. "hello" and a single-l word by frequency/context.
+            var lastC = ' '
+            for (c in fw) {
+                if (c == lastC) continue
+                lastC = c
+                val ctr = centerOf(c)
+                if (ctr == null) { ok = false; break }
+                ideal.add(ctr)
+            }
             if (!ok || ideal.size < 2) continue
             val idealR = resample(ideal, n)
             // Shape: average per-point offset between the two normalized-length strokes.
@@ -2252,7 +2264,9 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             }
             loc /= ideal.size
             val freq = kotlin.math.ln(1f + rank) * keyW * 0.06f   // gentle bias toward common words
-            var score = loc + 0.15f * (shape / n) + freq
+            // loc (did the path pass near each key, in order) leads; shape (overall stroke similarity)
+            // gets a bit more weight than before to better separate same-key-set words; freq breaks ties.
+            var score = loc + 0.22f * (shape / n) + freq
             val bg = followers?.get(w) ?: 0
             if (bg > 0) score -= keyW * (0.2f + 0.08f * minOf(bg, 5))   // learned-context boost
             scored.add(w to score)

@@ -380,6 +380,7 @@ class SettingsActivity : ComponentActivity() {
         var dictWords by remember { mutableStateOf(emptyList<String>()) }
         var dictQuery by remember { mutableStateOf("") }
         var newWord by remember { mutableStateOf("") }
+        var dictGroup by remember { mutableStateOf("ru") }   // which learned-words group is shown
         LaunchedEffect(Unit) {
             UserDictionary.ensureLoaded(this@SettingsActivity)
             dictWords = UserDictionary.wordsByFrequency()
@@ -429,14 +430,27 @@ class SettingsActivity : ComponentActivity() {
                     }
                     if (dictWords.isEmpty()) {
                         Spacer(Modifier.height(10.dp))
-                        Text("Words you type are learned automatically and will appear here.",
+                        Text("New words you keep (by tapping them) and words you add here appear in your dictionary. Common words aren't saved.",
                             color = textMuted, fontSize = 13.sp)
                     } else {
+                        // Split learned words by script: Cyrillic -> Russian, the rest -> English/Latvian.
+                        val ruWords = dictWords.filter { w -> w.any { it in 'а'..'я' || it == 'ё' } }
+                        val latinWords = dictWords.filter { w -> w.none { it in 'а'..'я' || it == 'ё' } }
                         Spacer(Modifier.height(12.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            GroupChip("🇷🇺 Russian", ruWords.size, dictGroup == "ru", Modifier.weight(1f)) { dictGroup = "ru" }
+                            GroupChip("EN / LV", latinWords.size, dictGroup == "latin", Modifier.weight(1f)) { dictGroup = "latin" }
+                        }
+                        Spacer(Modifier.height(10.dp))
                         PlainField(dictQuery, "Search words…", singleLine = true) { dictQuery = it }
                         Spacer(Modifier.height(8.dp))
+                        val source = if (dictGroup == "ru") ruWords else latinWords
                         val q = dictQuery.trim().lowercase()
-                        val filtered = if (q.isEmpty()) dictWords else dictWords.filter { it.contains(q) }
+                        val filtered = if (q.isEmpty()) source else source.filter { it.contains(q) }
+                        if (filtered.isEmpty()) {
+                            Text(if (source.isEmpty()) "No words in this group yet." else "No matches.",
+                                color = textMuted, fontSize = 13.sp, modifier = Modifier.padding(vertical = 6.dp))
+                        }
                         val shown = filtered.take(200)
                         shown.forEach { w ->
                             Row(
@@ -454,7 +468,7 @@ class SettingsActivity : ComponentActivity() {
                             Text("+${filtered.size - shown.size} more — narrow with search", color = textMuted, fontSize = 12.sp)
                         }
                         Spacer(Modifier.height(12.dp))
-                        Text("Clear all", color = Color(0xFFE5484D), fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
+                        Text("Clear all words", color = Color(0xFFE5484D), fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
                             modifier = Modifier.clickable { UserDictionary.clear(this@SettingsActivity); refreshDict(); dictQuery = "" })
                     }
                 }
@@ -913,5 +927,22 @@ class SettingsActivity : ComponentActivity() {
     @Composable
     private fun DeleteGlyph(onClick: () -> Unit) {
         Text("✕", color = textMuted, fontSize = 16.sp, modifier = Modifier.clickable { onClick() }.padding(start = 8.dp, end = 2.dp))
+    }
+
+    /** A segmented-style chip with a label and a count, for switching the dictionary's language group. */
+    @Composable
+    private fun GroupChip(label: String, count: Int, selected: Boolean, modifier: Modifier = Modifier, onClick: () -> Unit) {
+        Box(
+            modifier = modifier
+                .background(if (selected) accent else Color.Transparent, RoundedCornerShape(8.dp))
+                .border(1.dp, if (selected) accent else border, RoundedCornerShape(8.dp))
+                .clickable { onClick() }
+                .padding(vertical = 9.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Text("$label · $count", fontSize = 12.sp,
+                color = if (selected) Color.White else textMuted,
+                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal)
+        }
     }
 }
