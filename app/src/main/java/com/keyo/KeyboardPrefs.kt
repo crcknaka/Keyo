@@ -256,8 +256,8 @@ object KeyboardPrefs {
     fun isAutocorrectTyping(context: Context) = prefs(context).getBoolean(KEY_AUTOCORRECT_TYPING, true)
     fun setAutocorrectTyping(context: Context, v: Boolean) = prefs(context).edit().putBoolean(KEY_AUTOCORRECT_TYPING, v).apply()
 
-    /** Glide / swipe typing — slide across letters to type a word. On by default. */
-    fun isSwipeTyping(context: Context) = prefs(context).getBoolean(KEY_SWIPE_TYPING, true)
+    /** Glide / swipe typing — slide across letters to type a word. Off by default. */
+    fun isSwipeTyping(context: Context) = prefs(context).getBoolean(KEY_SWIPE_TYPING, false)
     fun setSwipeTyping(context: Context, v: Boolean) = prefs(context).edit().putBoolean(KEY_SWIPE_TYPING, v).apply()
 
     /** Live dictation — show the transcript growing in the field while you speak (more API calls).
