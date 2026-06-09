@@ -319,6 +319,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         isCapsLock.value = false
         showUndoRewrite.value = false
         composing.clear()   // fresh field: never carry a composing word across inputs
+        recentTaps.clear()
         autocorrectUndo = null
         revertedWords.clear()
         glideWord = null
@@ -439,8 +440,12 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                 val down = awaitFirstDown(requireUnconsumed = false)
                                 glideActive.value = false
                                 val start = down.position + glideOrigin
+                                // Record the touch point of a letter tap (in window coords) for the
+                                // coordinate spatial autocorrect — even when glide typing is off.
+                                val onLetter = mode == "abc" && !secureField && keyAt(start) != null
+                                if (onLetter) pendingTapPos = start
                                 // Glide only on the letter layout, when enabled, starting on a letter.
-                                if (mode != "abc" || !swipeTypingOn || secureField || keyAt(start) == null) {
+                                if (!onLetter || !swipeTypingOn) {
                                     var c = down
                                     while (c.pressed) { c = awaitPointerEvent().changes.firstOrNull() ?: break }
                                     continue
@@ -456,6 +461,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                     if (!glide) {
                                         if ((ch.position - down.position).getDistance() > threshold && crossed.size >= 2) {
                                             glide = true; glideActive.value = true
+                                            pendingTapPos = null   // a glide, not a tap — drop the captured point
                                             glideTrail.clear(); glideTrail.addAll(points)
                                         }
                                     } else glideTrail.add(ch.position)
@@ -2133,6 +2139,51 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         return keyNeighbors
     }
 
+    // ---- Coordinate spatial typing (v3) -------------------------------------------------------
+    // Each letter tap's touch point (window coords) is recorded so autocorrect can weight candidates
+    // by where the finger actually landed, not just which key it hit. `pendingTapPos` is set by the
+    // glide overlay on touch-down and consumed by the next commitChar; null when unknown (then we
+    // fall back to letter-only behaviour). The buffer self-validates by matching its chars against
+    // the word, so backspaces/accents/edits simply make it fall back rather than misalign.
+    private class Tap(val ch: Char, val point: Offset?)
+    private val recentTaps = ArrayList<Tap>()
+    private var pendingTapPos: Offset? = null
+
+    private fun recordTap(ch: Char) {
+        recentTaps.add(Tap(ch.lowercaseChar(), pendingTapPos))
+        pendingTapPos = null
+        if (recentTaps.size > 48) recentTaps.subList(0, recentTaps.size - 48).clear()
+    }
+
+    /** Touch points for [wordLower] iff the last typed letters match it exactly AND every one was
+     *  captured. Null otherwise — the signal is untrustworthy, so callers must fall back to v1. */
+    private fun tapsFor(wordLower: String): List<Offset>? {
+        val n = wordLower.length
+        if (n == 0 || recentTaps.size < n) return null
+        val out = ArrayList<Offset>(n)
+        for (i in 0 until n) {
+            val r = recentTaps[recentTaps.size - n + i]
+            val p = r.point ?: return null
+            if (SuggestionEngine.foldKey(r.ch.toString()) != SuggestionEngine.foldKey(wordLower[i].toString())) return null
+            out.add(p)
+        }
+        return out
+    }
+
+    /** Average per-letter distance (in key-widths) between [points] and [cand]'s own key centres.
+     *  Lower = the finger physically spelled [cand]. Null when a char has no key on this layout. */
+    private fun spatialCost(cand: String, points: List<Offset>): Float? {
+        if (cand.length != points.size) return null
+        val kw = avgKeyWidth()
+        var sum = 0f
+        for (i in cand.indices) {
+            val base = SuggestionEngine.foldKey(cand[i].toString()).firstOrNull() ?: cand[i]
+            val ctr = centerOf(cand[i]) ?: centerOf(base) ?: return null
+            sum += (points[i] - ctr).getDistance() / kw
+        }
+        return sum / cand.length
+    }
+
     /** Resample a polyline to exactly [n] points spaced evenly along its length (a $1-recognizer step). */
     private fun resample(pts: List<Offset>, n: Int): List<Offset> {
         if (pts.isEmpty()) return emptyList()
@@ -2257,6 +2308,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         // expose composing text). The editor doesn't spell-check composing text -> no red underline.
         if (isWordChar(char) && !secureField) {
             composing.append(char)
+            recordTap(char)   // remember where the finger landed, for coordinate spatial autocorrect
             ic?.setComposingText(composing.toString(), 1)
             maybeAutoCapitalize()
             updateSuggestions()
@@ -2403,6 +2455,14 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         }
     }
 
+    /** Learn from an explicit suggestion tap: always record the phrase (prev -> word) for context,
+     *  but only add the word to the *personal* dictionary when it isn't already a built-in word — so
+     *  tapping common words (e.g. "привет") doesn't clutter your saved words or waste its capacity. */
+    private fun learnFromTap(prev: String?, wordLower: String) {
+        val isNewWord = !SuggestionEngine.isKnown(wordLower, dictLangs(), emptyMap())
+        UserDictionary.learn(prev, wordLower, bumpUnigram = isNewWord)
+    }
+
     /** Replace the in-progress word (or insert a predicted next word) with [s] and learn it. */
     private fun applySuggestion(s: String) {
         performKeyFeedback()
@@ -2418,7 +2478,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 // signal so this glide decodes right next time.
                 val full = ic.getTextBeforeCursor(s.length + 1 + 48, 0)?.toString() ?: ""
                 val prevPart = if (full.length >= s.length + 1) full.dropLast(s.length + 1).trimEnd() else ""
-                UserDictionary.learn(trailingWord(prevPart)?.lowercase(), s.lowercase())
+                learnFromTap(trailingWord(prevPart)?.lowercase(), s.lowercase())
                 scheduleUserDictSave()
                 updateSuggestions()
                 return
@@ -2442,7 +2502,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             prev = wordBeforeTrailingSpace()
             ic.commitText("$s ", 1)
         }
-        UserDictionary.learn(prev?.lowercase(), s.lowercase())
+        learnFromTap(prev?.lowercase(), s.lowercase())
         scheduleUserDictSave()
         isShift.value = false; shiftIsAuto = false
         updateSuggestions()
@@ -2472,8 +2532,21 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 // that actually fits the sentence.
                 val prefer = if (prev != null)
                     SuggestionEngine.followerWeights(prev.lowercase(), dictLangs(), UserDictionary.bigrams()).keys else emptySet()
-                val cands = SuggestionEngine.corrections(learned, dictLangs(), UserDictionary.unigrams(), 8, maxEdits = 2, prefer = prefer)
-                val corr = SuggestionEngine.pickAutocorrect(learned, cands, neighbors())
+                val cands = SuggestionEngine.corrections(learned, dictLangs(), UserDictionary.unigrams(), 12, maxEdits = 2, prefer = prefer)
+                var corr = SuggestionEngine.pickAutocorrect(learned, cands, neighbors())
+                // (v3) Coordinate refinement: only when v1 already decided to correct AND the taps for
+                // this word were fully captured. Re-pick among the SAME candidate set the word whose
+                // keys the finger was physically closest to — but only if that's clearly confident
+                // (avg < 0.65 key-widths). Can't correct anything v1 wouldn't; just chooses better.
+                if (corr != null) {
+                    val pts = tapsFor(learned)
+                    if (pts != null) {
+                        val best = cands.filter { it.length == learned.length }
+                            .minByOrNull { spatialCost(it, pts) ?: Float.MAX_VALUE }
+                        val bCost = best?.let { spatialCost(it, pts) }
+                        if (best != null && bCost != null && bCost <= 0.65f) corr = best
+                    }
+                }
                 if (corr != null && SuggestionEngine.fold(corr) != SuggestionEngine.fold(learned)) {
                     finalWord = matchCase(word, corr)
                     learned = corr
@@ -2603,6 +2676,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         KeyboardPrefs.setCurrentLanguage(this, next)
         keyBounds.clear()      // new layout's keys re-register their positions for glide typing
         keyNeighbors = emptyMap()   // recomputed lazily for the new layout
+        recentTaps.clear()          // tap points belong to the old layout
         syncImeSubtype(next)   // best-effort: tell the OS our language (UI already switched)
         updateSuggestions()
     }
@@ -2653,7 +2727,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             val layoutChanged = layoutOf(lang) != layoutOf(currentLang.value)
             currentLang.value = lang
             KeyboardPrefs.setCurrentLanguage(this, lang)
-            if (layoutChanged) { keyBounds.clear(); keyNeighbors = emptyMap() }   // en<->lv keep the same Latin key positions
+            if (layoutChanged) { keyBounds.clear(); keyNeighbors = emptyMap(); recentTaps.clear() }   // en<->lv keep the same Latin key positions
             handler.post { updateSuggestions() }
         }
     }
