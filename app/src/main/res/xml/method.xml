@@ -5,8 +5,10 @@
          enable Russian/Latvian in system keyboard settings to see them as separate keyboards (Gboard
          style). When the active subtype changes (here or from the system picker) the editor's spell
          checker can follow the language — see onCurrentInputMethodSubtypeChanged in KeyoService. -->
+    <!-- The default subtype is labelled "Multilingual" (resource reference, so the system actually
+         shows it instead of "English (United States)") — Keyo handles EN/RU/LV in one keyboard. -->
     <subtype
-        android:label="English"
+        android:label="@string/subtype_multilingual"
         android:languageTag="en-US"
         android:imeSubtypeLocale="en_US"
         android:isAsciiCapable="true"

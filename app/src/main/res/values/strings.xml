@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Shown by the system under "Keyo" in the keyboard list / IME picker. A resource reference is
+         required for the system to display it instead of the subtype locale ("English (United States)"). -->
+    <string name="subtype_multilingual">Multilingual</string>
+</resources>

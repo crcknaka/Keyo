@@ -35,8 +35,11 @@ object KeyboardPrefs {
     const val DEFAULT_KEY_HEIGHT = 48
     const val DEFAULT_HGAP = 1
     const val DEFAULT_VGAP = 2
+    const val DEFAULT_BOTTOM_OFFSET = 16
     val KEY_HEIGHT_RANGE = 28..64
     val GAP_RANGE = 0..10
+    val BOTTOM_OFFSET_RANGE = 0..64
+    private const val KEY_BOTTOM_OFFSET = "bottom_offset"
 
     private fun prefs(context: Context): SharedPreferences {
         return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -103,11 +106,23 @@ object KeyboardPrefs {
     fun setVGap(context: Context, dp: Int) =
         prefs(context).edit().putInt(KEY_VGAP, dp.coerceIn(GAP_RANGE.first, GAP_RANGE.last)).apply()
 
+    /** Extra lift (dp) between the keyboard and the system navigation area at the bottom of the
+     *  screen — ON TOP of the automatic navigation-bar inset, so the keys always clear the
+     *  hide-keyboard / IME-switcher buttons and sit comfortably above the gesture pill. */
+    fun getBottomOffset(context: Context): Int =
+        prefs(context).getInt(KEY_BOTTOM_OFFSET, DEFAULT_BOTTOM_OFFSET)
+            .coerceIn(BOTTOM_OFFSET_RANGE.first, BOTTOM_OFFSET_RANGE.last)
+
+    fun setBottomOffset(context: Context, dp: Int) =
+        prefs(context).edit().putInt(KEY_BOTTOM_OFFSET,
+            dp.coerceIn(BOTTOM_OFFSET_RANGE.first, BOTTOM_OFFSET_RANGE.last)).apply()
+
     fun resetSize(context: Context) {
         prefs(context).edit()
             .putInt(KEY_KEY_HEIGHT, DEFAULT_KEY_HEIGHT)
             .putInt(KEY_HGAP, DEFAULT_HGAP)
             .putInt(KEY_VGAP, DEFAULT_VGAP)
+            .putInt(KEY_BOTTOM_OFFSET, DEFAULT_BOTTOM_OFFSET)
             .apply()
     }
 

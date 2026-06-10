@@ -63,6 +63,14 @@ android {
         buildConfig = true
     }
 
+    // Human-friendly APK names: Keyo.apk for release, Keyo-debug.apk for debug.
+    applicationVariants.all {
+        outputs.all {
+            (this as? com.android.build.gradle.internal.api.BaseVariantOutputImpl)?.outputFileName =
+                if (buildType.name == "release") "Keyo.apk" else "Keyo-${buildType.name}.apk"
+        }
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17

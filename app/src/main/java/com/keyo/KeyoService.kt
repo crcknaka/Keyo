@@ -117,6 +117,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private var keyHeightDp = mutableIntStateOf(KeyboardPrefs.DEFAULT_KEY_HEIGHT)
     private var keyHGapDp = mutableIntStateOf(KeyboardPrefs.DEFAULT_HGAP)
     private var keyVGapDp = mutableIntStateOf(KeyboardPrefs.DEFAULT_VGAP)
+    private var bottomOffsetDp = mutableIntStateOf(KeyboardPrefs.DEFAULT_BOTTOM_OFFSET)
     private var hapticStrength = mutableStateOf("light")    // off / light / medium / strong
     private var currentTheme = KeyboardPrefs.KeyboardTheme("catppuccin","",0xFF1E1E2E,0xFF313244,0xFFBB86FC,0xFFCDD6F4)
     private var soundEnabled = mutableStateOf(false)
@@ -226,6 +227,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         keyHeightDp.intValue = KeyboardPrefs.getKeyHeight(this)
         keyHGapDp.intValue = KeyboardPrefs.getHGap(this)
         keyVGapDp.intValue = KeyboardPrefs.getVGap(this)
+        bottomOffsetDp.intValue = KeyboardPrefs.getBottomOffset(this)
         hapticStrength.value = KeyboardPrefs.getHapticStrength(this)
         soundEnabled.value = KeyboardPrefs.isSoundEnabled(this)
         themeId.value = KeyboardPrefs.getTheme(this)
@@ -456,7 +458,14 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             modifier = Modifier
                 .fillMaxWidth()
                 .background(bgColor)
-                .padding(horizontal = 2.dp, vertical = 4.dp)
+                // targetSdk 35 enforces edge-to-edge: without this the bottom key row slides under
+                // the system navigation area (gesture pill / hide-keyboard & IME-switcher buttons).
+                // The background stays painted behind the bar; only the keys are lifted above it.
+                // On top of the automatic inset, a user-tunable bottom offset (Appearance →
+                // Keyboard size) raises the keys further clear of the system buttons.
+                .navigationBarsPadding()
+                .padding(start = 2.dp, end = 2.dp, top = 4.dp,
+                         bottom = (4 + bottomOffsetDp.intValue).dp)
         ) {
             // Dynamic top toolbar (Gboard-style). Priority: status > quick-paste chip > icons.
             TopToolbar(status, textColor, accentColor)
@@ -2357,6 +2366,11 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         var kwSum = 0f
         for (r in bounds.values) kwSum += r.width
         val keyW = (kwSum / bounds.size).coerceAtLeast(1f)
+        // Total finger-travel length: a long swipe means a long word. Candidates whose ideal
+        // key-to-key polyline is much shorter (or longer) than the actual path get penalised, so
+        // a deliberate long glide no longer loses to a short word sharing its first/last key.
+        var pathLen = 0f
+        for (i in 1 until path.size) pathLen += (path[i] - path[i - 1]).getDistance()
         val words = SuggestionEngine.wordList(langs)
         val scored = ArrayList<Pair<String, Float>>()
         var matched = 0
@@ -2397,9 +2411,17 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             }
             loc /= ideal.size
             val freq = kotlin.math.ln(1f + rank) * keyW * 0.06f   // gentle bias toward common words
+            // Path-length agreement: |actual swipe length − candidate's ideal polyline length|,
+            // normalised by the swipe length. The correct word wiggles ~20% over its ideal line
+            // (small penalty); a short word matched against a long deliberate swipe is off by
+            // 60-80% (large penalty) — this resolves the short-vs-long hesitation.
+            var idealLen = 0f
+            for (k in 1 until ideal.size) idealLen += (ideal[k] - ideal[k - 1]).getDistance()
+            val lenMismatch = keyW * 1.2f *
+                kotlin.math.abs(pathLen - idealLen) / kotlin.math.max(pathLen, 1f)
             // loc (did the path pass near each key, in order) leads; shape (overall stroke similarity)
             // gets a bit more weight than before to better separate same-key-set words; freq breaks ties.
-            var score = loc + 0.22f * (shape / n) + freq
+            var score = loc + 0.22f * (shape / n) + freq + lenMismatch
             val bg = followers?.get(w) ?: 0
             if (bg > 0) score -= keyW * (0.2f + 0.08f * minOf(bg, 5))   // learned-context boost
             scored.add(w to score)

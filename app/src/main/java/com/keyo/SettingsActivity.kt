@@ -114,7 +114,10 @@ class SettingsActivity : ComponentActivity() {
             }
         }
         Surface(modifier = Modifier.fillMaxSize(), color = bg) {
-            Crossfade(targetState = screen, label = "settings-nav") { s ->
+            // targetSdk 35 enforces edge-to-edge: keep content clear of the status/navigation bars
+            // and the on-screen keyboard (e.g. while typing the API key) — the Surface still paints
+            // the background behind the bars.
+            Crossfade(targetState = screen, label = "settings-nav", modifier = Modifier.safeDrawingPadding()) { s ->
                 when (s) {
                     "home"       -> HomeScreen(onOpen = { screen = it })
                     "setup"      -> SetupScreen { screen = "home" }
@@ -212,6 +215,13 @@ class SettingsActivity : ComponentActivity() {
                 }
             }
             Hint("Complete the three steps to start using Keyo. You can revisit this any time.")
+
+            SectionLabel("AI features — optional")
+            ApiKeyGroup()
+            Hint("A free Groq key (console.groq.com/keys) unlocks fast, accurate dictation in any " +
+                "language plus the AI assistant: rewrite, translate, fix grammar and voice commands. " +
+                "Without a key Keyo still types fine — dictation falls back to your device's " +
+                "built-in recognition and the AI tools stay off. The key never leaves this device.")
         }
     }
 
@@ -272,6 +282,7 @@ class SettingsActivity : ComponentActivity() {
         var keyH by remember { mutableStateOf(KeyboardPrefs.getKeyHeight(this@SettingsActivity)) }
         var vGap by remember { mutableStateOf(KeyboardPrefs.getVGap(this@SettingsActivity)) }
         var hGap by remember { mutableStateOf(KeyboardPrefs.getHGap(this@SettingsActivity)) }
+        var bottomOff by remember { mutableStateOf(KeyboardPrefs.getBottomOffset(this@SettingsActivity)) }
         var testText by remember { mutableStateOf("") }
 
         SubScreen("Appearance", onBack) {
@@ -300,6 +311,10 @@ class SettingsActivity : ComponentActivity() {
                 SliderRow("Horizontal spacing", hGap, "dp", KeyboardPrefs.GAP_RANGE) {
                     hGap = it; KeyboardPrefs.setHGap(this@SettingsActivity, it)
                 }
+                Sep()
+                SliderRow("Bottom offset", bottomOff, "dp", KeyboardPrefs.BOTTOM_OFFSET_RANGE) {
+                    bottomOff = it; KeyboardPrefs.setBottomOffset(this@SettingsActivity, it)
+                }
                 Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
                     PlainField(testText, "Tap here and type to preview…") { testText = it }
                     Row(
@@ -318,6 +333,7 @@ class SettingsActivity : ComponentActivity() {
                                 keyH = KeyboardPrefs.getKeyHeight(this@SettingsActivity)
                                 vGap = KeyboardPrefs.getVGap(this@SettingsActivity)
                                 hGap = KeyboardPrefs.getHGap(this@SettingsActivity)
+                                bottomOff = KeyboardPrefs.getBottomOffset(this@SettingsActivity)
                             }
                         )
                     }
