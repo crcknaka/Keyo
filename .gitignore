@@ -42,6 +42,7 @@ captures/
 # Keystore / signing material — never commit
 *.jks
 *.keystore
+keystore.properties
 
 # Local comparison screenshots / scratch images (not part of the project)
 orig.jpg

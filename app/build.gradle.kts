@@ -17,6 +17,13 @@ val groqApiKey: String = run {
     props.getProperty("GROQ_API_KEY") ?: System.getenv("GROQ_API_KEY") ?: ""
 }
 
+// Release signing material lives in keystore.properties (gitignored) next to the keystore itself.
+// Without the file the release build is simply unsigned — debug builds are unaffected.
+val keystoreProps: Properties = Properties().apply {
+    val f = rootProject.file("keystore.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+
 android {
     namespace = "com.keyo"
     compileSdk = 36
@@ -24,11 +31,31 @@ android {
     defaultConfig {
         applicationId = "com.keyo"
         minSdk = 26
-        targetSdk = 34
-        versionCode = 1
-        versionName = "1.4"
+        targetSdk = 35
+        versionCode = 2
+        versionName = "1.5"
 
         buildConfigField("String", "GROQ_API_KEY", "\"$groqApiKey\"")
+    }
+
+    signingConfigs {
+        if (!keystoreProps.isEmpty) {
+            create("release") {
+                storeFile = rootProject.file(keystoreProps.getProperty("storeFile"))
+                storePassword = keystoreProps.getProperty("storePassword")
+                keyAlias = keystoreProps.getProperty("keyAlias")
+                keyPassword = keystoreProps.getProperty("keyPassword")
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            if (!keystoreProps.isEmpty) signingConfig = signingConfigs.getByName("release")
+        }
     }
 
     buildFeatures {

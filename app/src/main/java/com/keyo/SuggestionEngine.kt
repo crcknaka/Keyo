@@ -17,24 +17,27 @@ object SuggestionEngine {
 
     private class Vocab(val words: List<String>, val set: HashSet<String>)
 
-    @Volatile private var loaded = false
-    private val byLang = HashMap<String, Vocab>()
+    // Loaded lazily PER LANGUAGE (only the user's enabled languages are paid for in RAM — the
+    // Russian dictionary + bigram model alone are several MB parsed). ConcurrentHashMap because
+    // suggestions are computed on background dispatchers while another language may still be loading.
+    private val byLang = java.util.concurrent.ConcurrentHashMap<String, Vocab>()
     // Cache of merged dictionaries keyed by the sorted language set (e.g. "en+lv"), so a
     // multilingual keyboard (English + Latvian share one Latin layout) builds the union once.
     private val mergedByLangs = HashMap<String, Vocab>()
     // Bundled bigram model per language: prev-word -> followers, most-frequent first (from a corpus,
     // assets/dict/bigram_<lang>.txt). Gives next-word prediction / context from day one, before the
     // user's own [UserDictionary] bigrams have learned anything.
-    private val bundledBigrams = HashMap<String, Map<String, List<String>>>()
+    private val bundledBigrams = java.util.concurrent.ConcurrentHashMap<String, Map<String, List<String>>>()
 
-    fun isReady(): Boolean = loaded
+    fun isReady(): Boolean = byLang.isNotEmpty()
 
-    /** Loads all bundled dictionaries from assets. Call from a background thread; idempotent. */
-    fun ensureLoaded(context: Context) {
-        if (loaded) return
-        synchronized(this) {
-            if (loaded) return
-            for (lang in listOf("en", "ru", "lv")) {
+    /** Loads the bundled dictionaries + bigram models for [langs] from assets (all languages when
+     *  omitted). Call from a background thread; idempotent and cheap once loaded. */
+    fun ensureLoaded(context: Context, langs: List<String> = listOf("en", "ru", "lv")) {
+        for (lang in langs.distinct()) {
+            if (byLang.containsKey(lang)) continue
+            synchronized(this) {
+                if (byLang.containsKey(lang)) return@synchronized
                 val words = ArrayList<String>(16000)
                 try {
                     context.assets.open("dict/$lang.txt").bufferedReader().useLines { seq ->
@@ -47,7 +50,6 @@ object SuggestionEngine {
                 // Membership is checked on the folded form so ё/е count as the same letter.
                 val folded = HashSet<String>(words.size * 2)
                 words.forEach { folded.add(fold(it)) }
-                byLang[lang] = Vocab(words, folded)
                 // Bundled bigram model (prev \t f1 f2 … ), if present for this language.
                 val bg = HashMap<String, List<String>>()
                 try {
@@ -60,8 +62,8 @@ object SuggestionEngine {
                     }
                 } catch (_: Exception) { /* missing model -> no bundled context for this language */ }
                 bundledBigrams[lang] = bg
+                byLang[lang] = Vocab(words, folded)   // publish last: isReady/vocab see a complete pair
             }
-            loaded = true
         }
     }
 
@@ -77,12 +79,18 @@ object SuggestionEngine {
         // from several threads — build/publish under a lock.
         synchronized(mergedByLangs) {
             mergedByLangs[key]?.let { return it }
-            val parts = langs.toSortedSet().mapNotNull { byLang[it] }.filter { it.words.isNotEmpty() }
+            val wanted = langs.toSortedSet()
+            val parts = wanted.mapNotNull { byLang[it] }.filter { it.words.isNotEmpty() }
             if (parts.size <= 1) return parts.firstOrNull() ?: byLang["en"]
             val words = mergeRanked(parts.map { it.words })
             val folded = HashSet<String>(words.size * 2)
             words.forEach { folded.add(fold(it)) }
-            return Vocab(words, folded).also { mergedByLangs[key] = it }
+            val merged = Vocab(words, folded)
+            // Only cache a COMPLETE merge — with lazy per-language loading a language may still be
+            // loading, and caching a partial union would freeze it out permanently.
+            if (parts.size == wanted.count { byLang.containsKey(it) } && parts.size == wanted.size)
+                mergedByLangs[key] = merged
+            return merged
         }
     }
 
@@ -333,6 +341,37 @@ object SuggestionEngine {
         val ft = if (tapped == a) fa else fb
         val fo = if (tapped == a) fb else fa
         return if (fo > ft * 1.3f) (if (tapped == a) b else a) else tapped
+    }
+
+    /** Re-rank completions by sentence context (stable): completions that the bundled/learned
+     *  bigrams expect after the previous word come first, then — for Russian — a light
+     *  number-agreement nudge: after a plural determiner/adjective ("какие", "эти", "новые", …)
+     *  plural-looking forms (-и/-ы) outrank singular ones, so "какие иде…" completes to "идеи",
+     *  not "идея". Order-only — it never invents or drops candidates. */
+    internal fun rankCompletions(comps: List<String>, prevLower: String?, prefer: Set<String>): List<String> {
+        if (comps.size < 2) return comps
+        val p = prevLower ?: ""
+        val plural = p.length >= 2 && (
+            p.endsWith("ие") || p.endsWith("ые") || p == "все" || p == "эти" || p == "те" ||
+            p == "мои" || p == "твои" || p == "наши" || p == "ваши" || p == "свои")
+        return comps.sortedWith(
+            compareByDescending<String> { it in prefer }
+                .thenByDescending { plural && (it.endsWith("и") || it.endsWith("ы")) }
+        )
+    }
+
+    /** True when [b] is a single ADJACENT-KEY substitution or a single transposition of [a] — the
+     *  only slips confident enough to let context override a word that is itself valid. */
+    internal fun isConfidentSlip(a: String, b: String, neighbors: Map<Char, Set<Char>>): Boolean {
+        val fa = fold(a); val fb = fold(b)
+        if (fa == fb || fa.length != fb.length) return false
+        val diffs = fa.indices.filter { fa[it] != fb[it] }
+        return when (diffs.size) {
+            1 -> fb[diffs[0]] in (neighbors[fa[diffs[0]]] ?: emptySet())
+            2 -> diffs[1] == diffs[0] + 1 &&
+                 fa[diffs[0]] == fb[diffs[1]] && fa[diffs[1]] == fb[diffs[0]]
+            else -> false
+        }
     }
 
     /** True when [b] differs from [a] only by 1–2 substitutions, each onto a *physically adjacent*

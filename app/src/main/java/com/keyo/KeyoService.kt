@@ -65,6 +65,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
 
     private val audioRecorder = AudioRecorder()
     private val handler = Handler(Looper.getMainLooper())
+    // System-dictation fallback: used when there is no Groq key or no network, so voice typing
+    // keeps working offline (on-device recognition with downloaded language packs).
+    private val offlineDictation by lazy { OfflineDictation(this) }
+    private var offlineSession = false
     // Live dictation: while recording, periodically transcribe the audio-so-far and show it as a
     // growing composing region (the final commitText on release replaces it). One transcription in
     // flight at a time (liveBusy). Off unless KeyboardPrefs.isLiveDictation.
@@ -153,6 +157,11 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     // sentence punctuation pulls back onto the word. Cleared as soon as you type past it / move away.
     private var glideWord: String? = null
     private var glideAlts: List<String> = emptyList()
+    // Live glide preview: the current best guess shown above the keys while the finger is still
+    // swiping (Gboard-style). Throttled: one background decode in flight, every ~6 new points.
+    private val glidePreview = mutableStateOf<String?>(null)
+    private var glidePreviewBusy = false
+    private var glidePreviewAt = 0
 
     private var clipHistory = mutableStateOf<List<String>>(emptyList())
     private var pinnedClips = mutableStateOf<List<String>>(emptyList())
@@ -220,7 +229,15 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         hapticStrength.value = KeyboardPrefs.getHapticStrength(this)
         soundEnabled.value = KeyboardPrefs.isSoundEnabled(this)
         themeId.value = KeyboardPrefs.getTheme(this)
+        val langsBefore = enabledLangs.value
         enabledLangs.value = KeyboardPrefs.getEnabledLanguages(this)
+        if (enabledLangs.value != langsBefore) {
+            // A language was just enabled in Settings — load its dictionary in the background.
+            val langs = enabledLangs.value + currentLang.value
+            serviceScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                SuggestionEngine.ensureLoaded(this@KeyoService, langs)
+            }
+        }
         KeyboardPrefs.migratePhrasesToPinned(this)   // old quick-phrases -> pinned clips (one-time)
         clipHistory.value = KeyboardPrefs.getClipHistory(this)
         pinnedClips.value = KeyboardPrefs.getPinned(this)
@@ -248,10 +265,12 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         reloadPrefs()
         KeyboardPrefs.registerChangeListener(this, prefListener)
         clipboardManager?.addPrimaryClipChangedListener(clipListener)
-        // Load the suggestion dictionaries + the user's learned vocabulary off the main thread.
+        // Load the user's learned vocabulary + ONLY the enabled languages' dictionaries off the
+        // main thread (lazy per-language: an unused language's multi-MB word list + bigram model
+        // never gets parsed into RAM). Newly enabled languages load via reloadPrefs.
         serviceScope.launch(kotlinx.coroutines.Dispatchers.IO) {
             UserDictionary.ensureLoaded(this@KeyoService)
-            SuggestionEngine.ensureLoaded(this@KeyoService)
+            SuggestionEngine.ensureLoaded(this@KeyoService, enabledLangs.value + currentLang.value)
         }
     }
 
@@ -373,7 +392,14 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         glideWord = null
         setSuggestions(emptyList(), null)
         confirmDeferred?.complete(false); confirmDeferred = null; pendingConfirm.value = null
-        keyboardMode.value = "abc"   // always open as the normal keyboard, ready to type
+        // Open in the layout the field asks for (Gboard behaviour): number/date fields get the
+        // numpad, phone fields the symbol page (has + * # ( ) -), everything else the letters.
+        keyboardMode.value = when (cls) {
+            android.text.InputType.TYPE_CLASS_NUMBER,
+            android.text.InputType.TYPE_CLASS_DATETIME -> "numpad"
+            android.text.InputType.TYPE_CLASS_PHONE -> "123"
+            else -> "abc"
+        }
         syncImeSubtype(currentLang.value)   // best-effort: keep the OS subtype on our language
         maybeAutoCapitalize()
     }
@@ -400,6 +426,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         clipboardManager?.removePrimaryClipChangedListener(clipListener)
         // Cancel pending delayed work and all launched coroutines so nothing fires after teardown.
         handler.removeCallbacksAndMessages(null)
+        offlineDictation.cancel()
         UserDictionary.save(this)
         confirmDeferred?.complete(false); confirmDeferred = null
         serviceJob.cancel()
@@ -517,10 +544,15 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                             pendingTapPos = null   // a glide, not a tap — drop the captured point
                                             glideTrail.clear(); glideTrail.addAll(points)
                                         }
-                                    } else glideTrail.add(ch.position)
+                                    } else {
+                                        glideTrail.add(ch.position)
+                                        glidePreviewTick(points)
+                                    }
                                 }
                                 if (glide) commitGlide(points)
                                 glideTrail.clear()
+                                glidePreview.value = null
+                                glidePreviewAt = 0
                             }
                         }
                     }
@@ -683,6 +715,17 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         p, color = accentColor.copy(alpha = 0.5f),
                         style = Stroke(width = 12f, cap = StrokeCap.Round, join = StrokeJoin.Round)
                     )
+                }
+            }
+            // Live glide preview — the current best guess floats above the keys while swiping.
+            if (glideActive.value) glidePreview.value?.let { guess ->
+                Box(
+                    modifier = Modifier.align(Alignment.TopCenter).padding(top = 6.dp)
+                        .background(accentColor, RoundedCornerShape(10.dp))
+                        .padding(horizontal = 12.dp, vertical = 5.dp)
+                ) {
+                    Text(guess, color = Color.Black, fontSize = 16.sp,
+                        fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold)
                 }
             }
             } // end glide Box
@@ -2243,18 +2286,29 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
 
     /** Average per-letter distance (in key-widths) between [points] and [cand]'s own key centres.
      *  Lower = the finger physically spelled [cand]. Null when a char has no key on this layout. */
-    private fun spatialCost(cand: String, points: List<Offset>, bounds: Map<Char, Rect>): Float? {
-        if (cand.length != points.size || bounds.isEmpty()) return null
+    /** Physical plausibility of [cand] as a SUBSTITUTION slip of [typed]: the WORST distance (in
+     *  key-widths) between the finger's tap and [cand]'s key, over only the positions where they
+     *  differ. Small = the finger really hovered near the other key at every differing spot.
+     *  Judged on the worst position, never the average — an average dilutes over the matching
+     *  letters and would favour a wrong substitution over a true transposition (device-verified:
+     *  "teh" was "corrected" to "ten" instead of "the"). Null when not a same-length substitution
+     *  pattern or any tap/key is missing. */
+    private fun spatialSlipCost(typed: String, cand: String, points: List<Offset>, bounds: Map<Char, Rect>): Float? {
+        if (cand.length != typed.length || typed.length != points.size || bounds.isEmpty()) return null
+        val ft = SuggestionEngine.foldKey(typed)
+        val fc = SuggestionEngine.foldKey(cand)
+        if (ft.length != fc.length) return null
         var kwSum = 0f
         for (r in bounds.values) kwSum += r.width
         val kw = (kwSum / bounds.size).coerceAtLeast(1f)
-        var sum = 0f
-        for (i in cand.indices) {
-            val base = SuggestionEngine.foldKey(cand[i].toString()).firstOrNull() ?: cand[i]
-            val ctr = bounds[cand[i]]?.center ?: bounds[base]?.center ?: return null
-            sum += (points[i] - ctr).getDistance() / kw
+        var worst = -1f
+        for (i in fc.indices) {
+            if (ft[i] == fc[i]) continue
+            val ctr = bounds[cand[i]]?.center ?: bounds[fc[i]]?.center ?: return null
+            val d = (points[i] - ctr).getDistance() / kw
+            if (d > worst) worst = d
         }
-        return sum / cand.length
+        return if (worst < 0f) null else worst
     }
 
     /** Resample a polyline to exactly [n] points spaced evenly along its length (a $1-recognizer step). */
@@ -2353,6 +2407,26 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         }
         if (scored.isEmpty()) return emptyList()
         return scored.sortedBy { it.second }.map { it.first }.take(3)
+    }
+
+    /** Throttled live decode while the finger is still swiping: at most one decode in flight, and
+     *  only after enough new points accumulated. Feeds the floating preview chip above the keys. */
+    private fun glidePreviewTick(points: List<Offset>) {
+        if (glidePreviewBusy || points.size - glidePreviewAt < 6) return
+        glidePreviewBusy = true
+        glidePreviewAt = points.size
+        val path = points.map { it + glideOrigin }   // copies the live list (still on main thread)
+        val bounds = HashMap(keyBounds)
+        val langs = dictLangs()
+        serviceScope.launch(kotlinx.coroutines.Dispatchers.Default) {
+            val best = try {
+                decodeGlide(path, null, bounds, langs).firstOrNull()
+            } catch (_: Throwable) { null }
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                glidePreviewBusy = false
+                if (glideActive.value && best != null) glidePreview.value = best
+            }
+        }
     }
 
     /** Finish a glide: insert the decoded word + an auto-space (Gboard-style) and offer the alternates
@@ -2570,12 +2644,24 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         }
         val word = currentWordBeforeCursor()
         if (word.isEmpty()) {
-            // Next-word prediction right after "<word> ". Cheap (bigram map lookups) — stays sync.
             val prev = wordBeforeTrailingSpace()
-            if (prev != null) {
-                val nexts = SuggestionEngine.nextWords(prev.lowercase(), langs, UserDictionary.bigrams(), 3)
-                setSuggestions(nexts, nexts.firstOrNull())
-            } else setSuggestions(emptyList(), null)
+            val nexts = if (prev != null)
+                SuggestionEngine.nextWords(prev.lowercase(), langs, UserDictionary.bigrams(), 3)
+            else emptyList()
+            // Right after an autocorrect: surface the original word as a one-tap revert (Gboard
+            // underlines the corrected word; a strip chip is deterministic in every editor).
+            val undo = autocorrectUndo
+            if (undo != null) {
+                val n = undo.corrected.length + 1
+                val before = currentInputConnection?.getTextBeforeCursor(n, 0)?.toString()
+                if (before != null && before.length == n && before.startsWith(undo.corrected)) {
+                    setSuggestions(listOf("↩ ${undo.original}") + nexts.take(2), null)
+                    return
+                }
+            }
+            // Next-word prediction right after "<word> ". Cheap (bigram map lookups) — stays sync.
+            if (nexts.isNotEmpty()) setSuggestions(nexts, nexts.firstOrNull())
+            else setSuggestions(emptyList(), null)
             return
         }
         // Snapshot everything the background pass needs: the learned maps are mutated on the main
@@ -2587,9 +2673,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         else emptySet()
         val pts = tapsFor(word.lowercase())
         val bounds = if (pts != null) HashMap(keyBounds) else null
+        val prevLower = prevW?.lowercase()
         serviceScope.launch(kotlinx.coroutines.Dispatchers.Default) {
             val result = try {
-                computeSuggestions(word, langs, uni, prefer, pts, bounds)
+                computeSuggestions(word, langs, uni, prefer, prevLower, pts, bounds)
             } catch (e: Throwable) {
                 android.util.Log.e("Keyo", "computeSuggestions failed", e)
                 emptyList<String>() to null
@@ -2611,12 +2698,17 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         langs: List<String>,
         uni: Map<String, Int>,
         prefer: Set<String>,
+        prevLower: String?,
         pts: List<Offset>?,
         bounds: Map<Char, Rect>?
     ): Pair<List<String>, String?> {
         val lower = word.lowercase()
         val known = SuggestionEngine.isKnown(lower, langs, uni)
-        val comp = SuggestionEngine.complete(lower, langs, uni, 3)   // prefix completions
+        // Fetch a few extra completions, then let sentence context pick the top ones: bigram
+        // followers of the previous word first, plus the Russian number-agreement nudge
+        // ("какие иде…" -> "идеи", not the globally-more-frequent "идея").
+        val comp = SuggestionEngine.rankCompletions(
+            SuggestionEngine.complete(lower, langs, uni, 12), prevLower, prefer)
         // Strip layout mirrors Gboard: leftmost is exactly what you typed (tap to keep / add to dict).
         val list = LinkedHashSet<String>()
         list.add(word)
@@ -2624,19 +2716,37 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         if (comp.isNotEmpty()) {
             // Valid prefix -> mid-typing: offer completions; default to the top one unless the word
             // is already a complete known word (then leave what you typed as the default).
+            // A typo can also be a valid prefix of a rarer word ("teh" -> "Tehran"): when a
+            // correction is much more frequent than the best completion, the typo is the likelier
+            // intent — Gboard defaults to "the" there, not "Tehran".
+            var corrPrimary: String? = null
+            if (!known) {
+                val corr = SuggestionEngine.corrections(lower, langs, uni, 2, prefer = prefer)
+                if (corr.isNotEmpty()) {
+                    val vocabList = SuggestionEngine.wordList(langs)
+                    val corrRank = vocabList.indexOf(corr[0]).let { if (it < 0) 0 else it }
+                    val compRank = vocabList.indexOf(comp[0]).let { if (it < 0) 0 else it }
+                    if (corrRank < compRank * 4) corrPrimary = corr[0]
+                }
+            }
+            if (corrPrimary != null) {
+                primary = matchCase(word, corrPrimary)
+                list.add(primary)
+            }
             comp.forEach { list.add(matchCase(word, it)) }
-            primary = if (known) word else matchCase(word, comp[0])
+            if (primary == null) primary = if (known) word else matchCase(word, comp[0])
         } else if (!known) {
             // No completions and not a known word -> likely a typo. Offer corrections like Gboard:
             // [typed | best correction (bold) | a longer form of it]. Space applies the best one.
             // Context: prefer a fix that fits the previous word (bundled + learned bigrams).
             var corr = SuggestionEngine.corrections(lower, langs, uni, 2, prefer = prefer)
-            // Spatial re-rank: when this word's touch points were fully captured, order the fixes
-            // by how close the finger physically was to each candidate's keys (a small index
-            // penalty keeps frequency meaningful when distances tie).
+            // Spatial re-rank, promote-only: fixes whose differing keys the finger physically
+            // grazed (slip cost ≤ 0.75 key-widths) float to the front in cost order; everything
+            // else (incl. transpositions, where taps are far by construction) keeps rank order.
             if (corr.size > 1 && pts != null && bounds != null) {
                 corr = corr.mapIndexed { i, c ->
-                    c to ((spatialCost(c, pts, bounds) ?: 9f) + i * 0.08f)
+                    val slip = spatialSlipCost(lower, c, pts, bounds)
+                    c to (if (slip != null && slip <= 0.75f) slip else 1f + i * 0.08f)
                 }.sortedBy { it.second }.map { it.first }
             }
             if (corr.isNotEmpty()) {
@@ -2659,9 +2769,31 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         UserDictionary.learn(prev, wordLower, bumpUnigram = isNewWord)
     }
 
+    /** Tap on the "↩ original" strip chip: swap the autocorrected word back, KEEPING the boundary
+     *  char (unlike Backspace-revert, which deletes it — here the user isn't deleting anything).
+     *  Keeping the typed word is a strong signal, so it is learned like an explicit tap. */
+    private fun revertAutocorrectKeepBoundary() {
+        val undo = autocorrectUndo ?: return
+        autocorrectUndo = null
+        val ic = currentInputConnection ?: return
+        val n = undo.corrected.length + 1
+        val before = ic.getTextBeforeCursor(n, 0)?.toString() ?: return
+        if (before.length == n && before.startsWith(undo.corrected)) {
+            revertedWords.add(SuggestionEngine.fold(undo.original.lowercase()))
+            ic.deleteSurroundingText(n, 0)
+            ic.commitText(undo.original + before.last(), 1)
+            if (!noLearn) {
+                learnFromTap(null, undo.original.lowercase())
+                scheduleUserDictSave()
+            }
+        }
+        updateSuggestions()
+    }
+
     /** Replace the in-progress word (or insert a predicted next word) with [s] and learn it. */
     private fun applySuggestion(s: String) {
         performKeyFeedback()
+        if (s.startsWith("↩ ")) { revertAutocorrectKeepBoundary(); return }
         val ic = currentInputConnection ?: return
         // Tapping a glide alternate: swap the just-glided word for it, keeping the auto-space.
         val gw = glideWord
@@ -2751,10 +2883,29 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 if (corr != null) {
                     val pts = tapsFor(learned)
                     if (pts != null) {
+                        // Substitution slips only, judged on the worst differing position: a
+                        // candidate overrides the rank-best fix ONLY when the finger physically
+                        // landed near its key at EVERY position where they differ.
                         val best = cands.filter { it.length == learned.length }
-                            .minByOrNull { spatialCost(it, pts, keyBounds) ?: Float.MAX_VALUE }
-                        val bCost = best?.let { spatialCost(it, pts, keyBounds) }
-                        if (best != null && bCost != null && bCost <= 0.65f) corr = best
+                            .mapNotNull { c -> spatialSlipCost(learned, c, pts, keyBounds)?.let { c to it } }
+                            .minByOrNull { it.second }
+                        if (best != null && best.second <= 0.65f) corr = best.first
+                    }
+                }
+                // Context correction of VALID words (Gboard's "magic"): a slip can form a real
+                // word ("знаю сто" for "знаю что"), which the unknown-word path never touches.
+                // Extremely conservative: only when the previous word's context STRONGLY expects
+                // another word (top bundled follower / well-learned pair), the typed word is not
+                // itself an expected follower, and the fix is a single adjacent-key substitution
+                // or transposition. Backspace-revert applies as usual.
+                if (corr == null && prev != null &&
+                    SuggestionEngine.isKnown(learned, dictLangs(), UserDictionary.unigrams())) {
+                    val fw = SuggestionEngine.followerWeights(prev.lowercase(), dictLangs(), UserDictionary.bigrams())
+                    if (fw.isNotEmpty() && (fw[learned] ?: 0) == 0) {
+                        corr = fw.entries.asSequence()
+                            .filter { it.value >= 7 }
+                            .map { it.key }
+                            .firstOrNull { SuggestionEngine.isConfidentSlip(learned, it, neighbors()) }
                     }
                 }
                 if (corr != null && SuggestionEngine.fold(corr) != SuggestionEngine.fold(learned)) {
@@ -3103,6 +3254,15 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         }
     }
 
+    private fun networkAvailable(): Boolean = try {
+        val cm = getSystemService(android.content.Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
+        cm?.activeNetwork != null
+    } catch (_: Throwable) { true }
+
+    private fun langTagOf(lang: String) = when (lang) {
+        "ru" -> "ru-RU"; "lv" -> "lv-LV"; else -> "en-US"
+    }
+
     private fun startVoiceRecording() {
         try {
             if (secureField) {
@@ -3113,6 +3273,37 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
                 != PackageManager.PERMISSION_GRANTED) {
                 statusText.value = "⚠ Mic permission needed — open app settings"
+                return
+            }
+
+            // No Groq key / no network -> fall back to the device's own speech recognition, so
+            // dictation still works. Interim text streams into the composing region.
+            if ((GroqApi.apiKey.isBlank() || !networkAvailable()) && offlineDictation.isAvailable()) {
+                finalizeComposing()
+                offlineSession = true
+                isRecording.value = true
+                statusText.value = "🎤 Recording (on-device)…"
+                offlineDictation.start(
+                    langTagOf(currentLang.value),
+                    preferOffline = !networkAvailable(),
+                    onPartial = { t ->
+                        try { currentInputConnection?.setComposingText(t, 1) } catch (_: Exception) {}
+                    },
+                    onFinal = { t ->
+                        handler.post {
+                            offlineSession = false
+                            isRecording.value = false
+                            try {
+                                if (!t.isNullOrBlank()) currentInputConnection?.setComposingText(t, 1)
+                                currentInputConnection?.finishComposingText()
+                            } catch (_: Exception) {}
+                            if (t.isNullOrBlank()) {
+                                statusText.value = "Didn't catch that"
+                                handler.postDelayed({ if (statusText.value == "Didn't catch that") statusText.value = "" }, 2000)
+                            } else statusText.value = ""
+                        }
+                    }
+                )
                 return
             }
 
@@ -3134,6 +3325,18 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     }
 
     private fun cancelVoiceRecording() {
+        if (offlineSession) {
+            offlineSession = false
+            offlineDictation.cancel()
+            try {
+                currentInputConnection?.setComposingText("", 1)
+                currentInputConnection?.finishComposingText()
+            } catch (_: Exception) {}
+            isRecording.value = false
+            statusText.value = "✕ Cancelled"
+            handler.postDelayed({ if (statusText.value == "✕ Cancelled") statusText.value = "" }, 1500)
+            return
+        }
         handler.removeCallbacks(liveDictationTick)
         try {
             audioRecorder.stop(File(cacheDir, "voice_input.wav"))
@@ -3147,6 +3350,12 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
 
     private fun stopVoiceRecording() {
         try {
+            if (offlineSession) {
+                // Finish the system-recognizer session; the final text arrives via its onFinal.
+                statusText.value = "⏳ Transcribing..."
+                offlineDictation.stop()
+                return
+            }
             handler.removeCallbacks(liveDictationTick)   // stop live-interim updates; final replaces them
             if (!audioRecorder.isActive()) return
             finalizeComposing()   // commit any composing word so the transcript appends after it
