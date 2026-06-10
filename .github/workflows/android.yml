@@ -41,6 +41,8 @@ jobs:
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:
-          name: app-debug
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: Keyo-debug
+          # The build names its outputs Keyo[-debug].apk (see app/build.gradle.kts outputFileName);
+          # a wildcard keeps this step working if the naming ever changes again.
+          path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
