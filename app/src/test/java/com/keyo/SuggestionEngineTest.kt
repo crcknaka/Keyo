@@ -23,6 +23,64 @@ class SuggestionEngineTest {
     @Test fun editDistance_overCap_returnsMaxPlusOne() =
         assertTrue(SuggestionEngine.editDistanceAtMost("abc", "xyz", 1) > 1)
 
+    // --- Damerau: adjacent transposition counts as ONE edit (the most common fast-typing typo) ---
+
+    @Test fun editDistance_transposition_isOne() {
+        assertEquals(1, SuggestionEngine.editDistanceAtMost("teh", "the", 2))
+        assertEquals(1, SuggestionEngine.editDistanceAtMost("пнада", "панда", 2))
+        assertEquals(1, SuggestionEngine.editDistanceAtMost("ab", "ba", 2))
+    }
+
+    @Test fun editDistance_twoSeparateTranspositions_isTwo() =
+        assertEquals(2, SuggestionEngine.editDistanceAtMost("badc", "abcd", 2))
+
+    @Test fun corrections_findTransposedWordEvenForShortWords() {
+        // 3-letter words get maxDist=1; "the" is now reachable from "teh" thanks to Damerau.
+        val vocabList = listOf("the", "tea")
+        val out = SuggestionEngine.correctionsFrom("teh", vocabList, vocabList.toSet(), emptyMap(), 2)
+        assertEquals("the", out.first())
+    }
+
+    @Test fun pickAutocorrect_appliesTransposition() =
+        assertEquals("the", SuggestionEngine.pickAutocorrect("teh", listOf("the"), emptyMap()))
+
+    // --- prefixStrength (probabilistic key targeting: language model side) ---
+
+    @Test fun prefixStrength_zeroForUnknownPrefix() =
+        assertEquals(0f, SuggestionEngine.prefixStrengthFrom("zz", listOf("hello", "world"), emptyMap()), 0.0001f)
+
+    @Test fun prefixStrength_higherForMoreFrequentWords() {
+        val words = listOf("aaa", "bbb")   // frequency-ordered: "aaa" is the more common word
+        val sA = SuggestionEngine.prefixStrengthFrom("aa", words, emptyMap())
+        val sB = SuggestionEngine.prefixStrengthFrom("bb", words, emptyMap())
+        assertTrue(sA > sB && sB > 0f)
+    }
+
+    @Test fun prefixStrength_learnedWordsCountStrongly() =
+        assertEquals(0.9f, SuggestionEngine.prefixStrengthFrom("zz", listOf("hello"), mapOf("zzap" to 3)), 0.0001f)
+
+    // --- chooseKey (probabilistic key targeting: decision rule) ---
+
+    @Test fun chooseKey_keepsTappedWhenDeadCentre() {
+        // Tap near the centre of 'a': never second-guessed, even if 's' looks better to the LM.
+        val out = SuggestionEngine.chooseKey('a', listOf('a' to 0.1f, 's' to 0.9f)) { 1f }
+        assertEquals('a', out)
+    }
+
+    @Test fun chooseKey_overridesBoundaryTapWhenLanguagePrefersNeighbour() {
+        // Boundary tap (0.45 vs 0.55 key-widths): 's' continues the word, 'a' doesn't.
+        val out = SuggestionEngine.chooseKey('a', listOf('a' to 0.45f, 's' to 0.55f)) { c ->
+            if (c == 's') 1f else 0f
+        }
+        assertEquals('s', out)
+    }
+
+    @Test fun chooseKey_keepsTappedOnBoundaryWhenScoresAreClose() {
+        // Equal language strength -> geometry (and the 1.3x margin) keeps what was tapped.
+        val out = SuggestionEngine.chooseKey('a', listOf('a' to 0.45f, 's' to 0.55f)) { 0.5f }
+        assertEquals('a', out)
+    }
+
     // --- completeFrom ---
 
     private val vocab = listOf("there", "they", "them", "then", "the", "world", "would", "work")

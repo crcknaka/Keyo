@@ -20,8 +20,11 @@ object UserDictionary {
     private const val MAX_BIGRAM_KEYS = 2500
     private const val MAX_FOLLOWERS = 12
 
-    private val unigram = HashMap<String, Int>()
-    private val bigram = HashMap<String, HashMap<String, Int>>()
+    // @Volatile vars (not vals): ensureLoaded builds fresh maps on the IO thread and publishes them
+    // atomically, so main-thread readers see either the old map or the complete new one — never a
+    // HashMap mid-population. All mutation goes through synchronized methods.
+    @Volatile private var unigram = HashMap<String, Int>()
+    @Volatile private var bigram = HashMap<String, HashMap<String, Int>>()
 
     @Volatile private var loaded = false
     @Volatile var dirty = false
@@ -31,23 +34,34 @@ object UserDictionary {
         if (loaded) return
         synchronized(this) {
             if (loaded) return
+            val u = HashMap<String, Int>()
+            val b = HashMap<String, HashMap<String, Int>>()
             try {
                 val raw = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_DATA, null)
                 if (raw != null) {
                     val root = JSONObject(raw)
-                    root.optJSONObject("u")?.let { u ->
-                        for (k in u.keys()) unigram[k] = u.getInt(k)
+                    root.optJSONObject("u")?.let { uj ->
+                        for (k in uj.keys()) u[k] = uj.getInt(k)
                     }
-                    root.optJSONObject("b")?.let { b ->
-                        for (prev in b.keys()) {
-                            val inner = b.getJSONObject(prev)
+                    root.optJSONObject("b")?.let { bj ->
+                        for (prev in bj.keys()) {
+                            val inner = bj.getJSONObject(prev)
                             val map = HashMap<String, Int>()
                             for (next in inner.keys()) map[next] = inner.getInt(next)
-                            bigram[prev] = map
+                            b[prev] = map
                         }
                     }
                 }
             } catch (_: Exception) { /* corrupt store -> start fresh */ }
+            // Merge anything learned while the load was still running (the first keystrokes can
+            // race the IO load), then publish.
+            for ((k, v) in unigram) u[k] = maxOf(u[k] ?: 0, v)
+            for ((p, f) in bigram) {
+                val t = b.getOrPut(p) { HashMap() }
+                for ((k, v) in f) t[k] = (t[k] ?: 0) + v
+            }
+            unigram = u
+            bigram = b
             loaded = true
         }
     }
@@ -64,7 +78,7 @@ object UserDictionary {
         unigram.entries.sortedByDescending { it.value }.map { it.key }
 
     /** Manually add a word so it shows up in suggestions. Returns false if it isn't a valid word. */
-    fun addWord(word: String): Boolean {
+    fun addWord(word: String): Boolean = synchronized(this) {
         val w = word.trim().lowercase()
         if (w.length < 2 || w.length > 32) return false
         if (w.any { !it.isLetter() && it != '\'' && it != '-' }) return false
@@ -74,7 +88,7 @@ object UserDictionary {
     }
 
     /** Remove a word and any bigrams that reference it. */
-    fun removeWord(word: String) {
+    fun removeWord(word: String): Unit = synchronized(this) {
         val w = word.lowercase()
         if (unigram.remove(w) != null) dirty = true
         if (bigram.remove(w) != null) dirty = true
@@ -89,7 +103,7 @@ object UserDictionary {
      * only enter the dictionary on an explicit suggestion tap — see KeyoService.finishWord. The
      * next-word (bigram) pattern is always recorded, since that's prediction, not the dictionary.
      */
-    fun learn(prev: String?, word: String, bumpUnigram: Boolean = true) {
+    fun learn(prev: String?, word: String, bumpUnigram: Boolean = true): Unit = synchronized(this) {
         if (word.length < 2 || word.length > 32) return
         if (bumpUnigram) {
             unigram[word] = (unigram[word] ?: 0) + 1
@@ -106,7 +120,7 @@ object UserDictionary {
     }
 
     /** Persist if there are unsaved changes. Cheap to call repeatedly. */
-    fun save(context: Context) {
+    fun save(context: Context): Unit = synchronized(this) {
         if (!dirty) return
         try {
             val root = JSONObject()
@@ -123,7 +137,7 @@ object UserDictionary {
         } catch (_: Exception) { /* ignore persistence errors */ }
     }
 
-    fun clear(context: Context) {
+    fun clear(context: Context): Unit = synchronized(this) {
         unigram.clear(); bigram.clear(); dirty = false
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(KEY_DATA).apply()
     }

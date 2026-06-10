@@ -73,13 +73,17 @@ object SuggestionEngine {
     private fun vocab(langs: List<String>): Vocab? {
         if (langs.size <= 1) return vocab(langs.firstOrNull() ?: return byLang["en"])
         val key = langs.toSortedSet().joinToString("+")
-        mergedByLangs[key]?.let { return it }
-        val parts = langs.toSortedSet().mapNotNull { byLang[it] }.filter { it.words.isNotEmpty() }
-        if (parts.size <= 1) return parts.firstOrNull() ?: byLang["en"]
-        val words = mergeRanked(parts.map { it.words })
-        val folded = HashSet<String>(words.size * 2)
-        words.forEach { folded.add(fold(it)) }
-        return Vocab(words, folded).also { mergedByLangs[key] = it }
+        // Suggestions are computed off the main thread now, so the merged-vocab cache can be hit
+        // from several threads — build/publish under a lock.
+        synchronized(mergedByLangs) {
+            mergedByLangs[key]?.let { return it }
+            val parts = langs.toSortedSet().mapNotNull { byLang[it] }.filter { it.words.isNotEmpty() }
+            if (parts.size <= 1) return parts.firstOrNull() ?: byLang["en"]
+            val words = mergeRanked(parts.map { it.words })
+            val folded = HashSet<String>(words.size * 2)
+            words.forEach { folded.add(fold(it)) }
+            return Vocab(words, folded).also { mergedByLangs[key] = it }
+        }
     }
 
     /** Completions that extend [prefixLower] (all lowercase), personalised words first. */
@@ -283,6 +287,54 @@ object SuggestionEngine {
         return scored.sortedWith(compareBy({ it.second }, { it.third })).map { it.first }.take(limit)
     }
 
+    /** Strength of [prefixLower] as the start of a word in [langs]: 0 when no dictionary word
+     *  starts with it, otherwise higher for more frequent words; the user's own learned words count
+     *  strongly. Cheap enough to call on a keystroke — the bundled list is frequency-ordered, so
+     *  the first hit is the best rank and the scan stops there. Drives probabilistic key targeting. */
+    fun prefixStrength(prefixLower: String, langs: List<String>, learnedUni: Map<String, Int>): Float {
+        val v = vocab(langs) ?: return 0f
+        return prefixStrengthFrom(prefixLower, v.words, learnedUni)
+    }
+
+    internal fun prefixStrengthFrom(
+        prefixLower: String,
+        words: List<String>,
+        learnedUni: Map<String, Int>,
+        scanLimit: Int = 8000
+    ): Float {
+        if (prefixLower.isEmpty()) return 0f
+        val fp = fold(prefixLower)
+        var s = 0f
+        for (w in learnedUni.keys) if (fold(w).startsWith(fp)) { s = 0.9f; break }
+        val n = minOf(scanLimit, words.size)
+        for (rank in 0 until n) {
+            if (fold(words[rank]).startsWith(fp))
+                return maxOf(s, 1f / (1f + kotlin.math.ln(1f + rank)))
+        }
+        return s
+    }
+
+    /** Gboard-style dynamic key targets: decide which key a tap near a key boundary actually meant.
+     *  [cands] = the two nearest keys with their distances from the tap point in key-widths
+     *  (nearest first); [strength] scores how well a key continues the word being typed (e.g.
+     *  [prefixStrength] of prefix+key). Keeps [tapped] unless the alternative wins clearly on the
+     *  combined spatial × language score — dead-centre taps are never second-guessed. */
+    internal fun chooseKey(tapped: Char, cands: List<Pair<Char, Float>>, strength: (Char) -> Float): Char {
+        if (cands.size < 2) return tapped
+        val (a, da) = cands[0]
+        val (b, db) = cands[1]
+        if (tapped != a && tapped != b) return tapped
+        if (db - da > 0.55f) return tapped          // comfortably inside the nearest key — unambiguous
+        // Spatial confidence falls off with distance from the key centre; the 0.15 floor keeps
+        // geometry meaningful even when neither letter continues a known word.
+        fun f(c: Char, d: Float) = kotlin.math.exp(-d * d * 1.8f) * (0.15f + strength(c))
+        val fa = f(a, da)
+        val fb = f(b, db)
+        val ft = if (tapped == a) fa else fb
+        val fo = if (tapped == a) fb else fa
+        return if (fo > ft * 1.3f) (if (tapped == a) b else a) else tapped
+    }
+
     /** True when [b] differs from [a] only by 1–2 substitutions, each onto a *physically adjacent*
      *  key (per [neighbors]). I.e. [b] is a plausible fat-finger mistype of [a]. Same length only —
      *  insertions/deletions are handled by ordinary edit-distance correction, not the spatial path. */
@@ -320,10 +372,14 @@ object SuggestionEngine {
         return m.entries.sortedByDescending { it.value }.take(limit).map { it.key }
     }
 
-    /** Levenshtein distance between [a] and [b], capped: returns [max]+1 as soon as it is exceeded. */
+    /** Damerau-Levenshtein (optimal string alignment) distance between [a] and [b], capped: returns
+     *  [max]+1 as soon as it is exceeded. A transposition of adjacent letters ("teh"→"the") counts
+     *  as ONE edit — it's the most common fast-typing mistake, so plain Levenshtein (which scores it
+     *  as two substitutions) would push such fixes out of autocorrect range. */
     internal fun editDistanceAtMost(a: String, b: String, max: Int): Int {
         val n = a.length; val m = b.length
         if (kotlin.math.abs(n - m) > max) return max + 1
+        var prevPrev = IntArray(m + 1)
         var prev = IntArray(m + 1) { it }
         var curr = IntArray(m + 1)
         for (i in 1..n) {
@@ -331,15 +387,18 @@ object SuggestionEngine {
             var rowMin = curr[0]
             for (j in 1..m) {
                 val cost = if (a[i - 1] == b[j - 1]) 0 else 1
-                curr[j] = minOf(
+                var v = minOf(
                     prev[j] + 1,        // deletion
                     curr[j - 1] + 1,    // insertion
                     prev[j - 1] + cost  // substitution
                 )
-                if (curr[j] < rowMin) rowMin = curr[j]
+                if (i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1])
+                    v = minOf(v, prevPrev[j - 2] + 1)   // transposition of adjacent letters
+                curr[j] = v
+                if (v < rowMin) rowMin = v
             }
             if (rowMin > max) return max + 1
-            val tmp = prev; prev = curr; curr = tmp
+            val tmp = prevPrev; prevPrev = prev; prev = curr; curr = tmp
         }
         return prev[m]
     }
