@@ -35,7 +35,7 @@ object KeyboardPrefs {
     const val DEFAULT_KEY_HEIGHT = 48
     const val DEFAULT_HGAP = 1
     const val DEFAULT_VGAP = 2
-    const val DEFAULT_BOTTOM_OFFSET = 16
+    const val DEFAULT_BOTTOM_OFFSET = 32
     val KEY_HEIGHT_RANGE = 28..64
     val GAP_RANGE = 0..10
     val BOTTOM_OFFSET_RANGE = 0..64
@@ -248,12 +248,30 @@ object KeyboardPrefs {
         prefs(context).edit().remove(KEY_PHRASES).apply()
     }
 
-    // Recently-used emoji
-    fun getRecentEmoji(context: Context) = getList(context, KEY_RECENT_EMOJI)
+    // Recently-used emoji, ordered by how OFTEN each is used (recency breaks ties) — favourites
+    // gravitate to the front of the Recents tab instead of being pushed out by one-off picks.
+    private const val KEY_EMOJI_COUNTS = "emoji_counts"
+
+    private fun emojiCounts(context: Context): org.json.JSONObject =
+        try { org.json.JSONObject(prefs(context).getString(KEY_EMOJI_COUNTS, "{}") ?: "{}") }
+        catch (_: Exception) { org.json.JSONObject() }
+
+    fun getRecentEmoji(context: Context): List<String> {
+        val recency = getList(context, KEY_RECENT_EMOJI)   // most-recent first
+        if (recency.size < 2) return recency
+        val counts = emojiCounts(context)
+        return recency.sortedByDescending { counts.optInt(it, 0) }   // stable: ties keep recency
+    }
+
     fun addRecentEmoji(context: Context, e: String) {
-        val cur = getRecentEmoji(context).toMutableList()
+        val cur = getList(context, KEY_RECENT_EMOJI).toMutableList()
         cur.remove(e); cur.add(0, e)
-        while (cur.size > 32) cur.removeAt(cur.size - 1)
+        val counts = emojiCounts(context)
+        counts.put(e, counts.optInt(e, 0) + 1)
+        while (cur.size > 40) counts.remove(cur.removeAt(cur.size - 1))
+        prefs(context).edit()
+            .putString(KEY_EMOJI_COUNTS, counts.toString())
+            .apply()
         putList(context, KEY_RECENT_EMOJI, cur)
     }
 

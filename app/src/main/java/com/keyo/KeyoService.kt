@@ -690,22 +690,30 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     }
                 }
                 "numpad" -> {
-                    // Calculator-style numpad
-                    val numpadRows = listOf(
-                        listOf("7","8","9","÷"),
-                        listOf("4","5","6","×"),
-                        listOf("1","2","3","-"),
-                        listOf("0",".",",","+")
+                    // Phone-style pad (Gboard-like): big plain digits 1-2-3 on top, a helper
+                    // column on the right (backspace + the symbols number fields actually need).
+                    // Space / Enter / ABC live on the shared bottom row as usual.
+                    val digitFont = (KeyboardPrefs.fontSizeSp(keyHeightDp.intValue, keyVGapDp.intValue) * 1.3f).sp
+                    val padRows = listOf(
+                        listOf("1", "2", "3"),
+                        listOf("4", "5", "6"),
+                        listOf("7", "8", "9"),
+                        listOf("*", "0", "#")
                     )
-                    numpadRows.forEach { row ->
+                    padRows.forEachIndexed { i, row ->
                         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
                             row.forEach { s ->
-                                KeyButton(s, keyColor, textColor, Modifier.weight(1f)) { commitText(s) }
+                                val isDigit = s[0].isDigit()
+                                KeyButton(
+                                    s, keyColor, textColor, Modifier.weight(1f),
+                                    fontSize = if (isDigit) digitFont else KeyboardPrefs.fontSizeSp(keyHeightDp.intValue, keyVGapDp.intValue).sp
+                                ) { commitText(s) }
                             }
-                            if (row == numpadRows.last()) {
-                                // = and backspace on last row
-                                KeyButton("=", keyColor, textColor, Modifier.weight(1f)) { commitText("=") }
-                                BackspaceKey(keyColor, textColor, Modifier.weight(1f))
+                            when (i) {
+                                0 -> BackspaceKey(keyColor, textColor, Modifier.weight(1f))
+                                1 -> KeyButton("-", keyColor, textColor, Modifier.weight(1f)) { commitText("-") }
+                                2 -> KeyButton("+", keyColor, textColor, Modifier.weight(1f)) { commitText("+") }
+                                3 -> KeyButton(".", keyColor, textColor, Modifier.weight(1f)) { commitChar('.') }
                             }
                         }
                     }
@@ -1074,30 +1082,49 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         ) { glyph() }
     }
 
-    // A circular bezel/dial knob with tick marks that rotate as you scrub the cursor.
+    // The cursor slider's dial: a knurled wheel with a soft halo and gradient face that spins as
+    // you scrub, with an I-beam text cursor in the hub so it reads as "cursor control" at a glance.
     @Composable
     private fun BezelKnob(rotationDeg: Float, ring: Color, hub: Color, modifier: Modifier) {
         Canvas(modifier = modifier) {
             val r = size.minDimension / 2f
             val c = androidx.compose.ui.geometry.Offset(size.width / 2f, size.height / 2f)
-            // base disc + subtle inner face
-            drawCircle(color = ring, radius = r, center = c)
-            drawCircle(color = hub.copy(alpha = 0.18f), radius = r * 0.78f, center = c)
-            // rotating ticks around the bezel
-            val ticks = 12
+            // soft halo + gradient disc (light falling from the top-left)
+            drawCircle(color = ring.copy(alpha = 0.28f), radius = r, center = c)
+            drawCircle(
+                brush = androidx.compose.ui.graphics.Brush.radialGradient(
+                    colors = listOf(lerp(ring, Color.White, 0.30f), ring),
+                    center = c + androidx.compose.ui.geometry.Offset(-r * 0.25f, -r * 0.30f),
+                    radius = r * 1.6f
+                ),
+                radius = r * 0.90f, center = c
+            )
+            // knurled edge: rounded ticks (alternating length) that rotate with the drag
+            val ticks = 16
             for (i in 0 until ticks) {
-                val ang = Math.toRadians((i * (360.0 / ticks) + rotationDeg))
+                val ang = Math.toRadians(i * (360.0 / ticks) + rotationDeg)
                 val ca = kotlin.math.cos(ang).toFloat()
                 val sa = kotlin.math.sin(ang).toFloat()
+                val inner = if (i % 2 == 0) 0.62f else 0.72f
                 drawLine(
-                    color = hub,
-                    start = androidx.compose.ui.geometry.Offset(c.x + ca * r * 0.60f, c.y + sa * r * 0.60f),
-                    end = androidx.compose.ui.geometry.Offset(c.x + ca * r * 0.90f, c.y + sa * r * 0.90f),
-                    strokeWidth = r * 0.13f
+                    color = hub.copy(alpha = if (i % 2 == 0) 0.85f else 0.40f),
+                    start = androidx.compose.ui.geometry.Offset(c.x + ca * r * inner, c.y + sa * r * inner),
+                    end = androidx.compose.ui.geometry.Offset(c.x + ca * r * 0.85f, c.y + sa * r * 0.85f),
+                    strokeWidth = r * 0.10f,
+                    cap = StrokeCap.Round
                 )
             }
-            // center hub
-            drawCircle(color = hub, radius = r * 0.30f, center = c)
+            // hub face + I-beam text cursor
+            drawCircle(color = hub.copy(alpha = 0.14f), radius = r * 0.50f, center = c)
+            val ib = r * 0.28f      // half-height of the I-beam stem
+            val serif = r * 0.15f   // half-width of its serifs
+            val w = r * 0.11f
+            drawLine(hub, androidx.compose.ui.geometry.Offset(c.x, c.y - ib),
+                androidx.compose.ui.geometry.Offset(c.x, c.y + ib), w, StrokeCap.Round)
+            drawLine(hub, androidx.compose.ui.geometry.Offset(c.x - serif, c.y - ib),
+                androidx.compose.ui.geometry.Offset(c.x + serif, c.y - ib), w, StrokeCap.Round)
+            drawLine(hub, androidx.compose.ui.geometry.Offset(c.x - serif, c.y + ib),
+                androidx.compose.ui.geometry.Offset(c.x + serif, c.y + ib), w, StrokeCap.Round)
         }
     }
 
@@ -1131,21 +1158,50 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                             color = if (selected) accentColor else textColor.copy(alpha = 0.6f))
                     }
                 }
-                // Suggest from current text
+                // AI emoji search: suggests emoji matching the text just written. Drawn as a tinted
+                // round button so it reads as tappable, and always reacts — with a hint when
+                // there's nothing to match yet, or an error note when the lookup fails.
                 Box(
                     modifier = Modifier.weight(1f).fillMaxHeight()
                         .semantics { contentDescription = "Suggest emoji for my text" }
                         .clickable {
+                            performKeyFeedback()
                             val t = currentTargetText()
-                            if (!secureField && t.isNotBlank()) {
-                                suggesting = true
-                                GroqApi.suggestEmojis(t) { res, _ ->
-                                    handler.post { suggesting = false; suggestions = splitEmojis(res ?: "") }
+                            when {
+                                secureField -> {}
+                                t.isBlank() -> {
+                                    statusText.value = "✨ Type a message first — I'll match emoji to it"
+                                    handler.postDelayed({ if (statusText.value.startsWith("✨ Type")) statusText.value = "" }, 2200)
+                                }
+                                else -> {
+                                    suggesting = true
+                                    GroqApi.suggestEmojis(t) { res, _ ->
+                                        handler.post {
+                                            suggesting = false
+                                            suggestions = splitEmojis(res ?: "")
+                                            if (suggestions.isEmpty()) {
+                                                statusText.value = "✨ Couldn't fetch suggestions"
+                                                handler.postDelayed({ if (statusText.value.startsWith("✨ Could")) statusText.value = "" }, 2000)
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         },
                     contentAlignment = Alignment.Center
-                ) { EnterGlyph("search", if (suggestions.isNotEmpty()) accentColor else textColor.copy(alpha = 0.6f), Modifier.size(18.dp)) }
+                ) {
+                    Box(
+                        modifier = Modifier.size(28.dp).background(
+                            if (suggestions.isNotEmpty()) accentColor else accentColor.copy(alpha = 0.16f),
+                            androidx.compose.foundation.shape.CircleShape
+                        ),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        EnterGlyph("search",
+                            if (suggestions.isNotEmpty()) Color.Black else accentColor,
+                            Modifier.size(16.dp))
+                    }
+                }
             }
             androidx.compose.material3.HorizontalDivider(color = textColor.copy(alpha = 0.12f))
 
@@ -1336,6 +1392,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                         cursorVisual = true
                                         longPressJob.cancel()
                                         lastStepX = totalDragX
+                                        cursorSelAnchor = null   // fresh swipe -> fresh selection anchor
                                     }
                                     if (cursorMode) {
                                         dragXVisual = totalDragX
@@ -1397,15 +1454,39 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 ) {
                     val halfTravelPx = with(density) { (maxWidth / 2 - 16.dp).toPx() }
                     val knobOffset = with(density) { dragXVisual.coerceIn(-halfTravelPx, halfTravelPx).toDp() }
-                    Box(
-                        modifier = Modifier.fillMaxWidth().height(4.dp)
-                            .background(textColor.copy(alpha = 0.22f), RoundedCornerShape(2.dp))
-                    )
+                    // Rail: a gradient track that fades out at the ends, with direction chevrons
+                    // that light up toward the side being dragged.
+                    Canvas(Modifier.fillMaxWidth().height(20.dp)) {
+                        val cy = size.height / 2f
+                        val th = 4.dp.toPx()
+                        drawRoundRect(
+                            brush = androidx.compose.ui.graphics.Brush.horizontalGradient(
+                                0f to textColor.copy(alpha = 0f),
+                                0.15f to textColor.copy(alpha = 0.22f),
+                                0.85f to textColor.copy(alpha = 0.22f),
+                                1f to textColor.copy(alpha = 0f)
+                            ),
+                            topLeft = androidx.compose.ui.geometry.Offset(0f, cy - th / 2f),
+                            size = androidx.compose.ui.geometry.Size(size.width, th),
+                            cornerRadius = androidx.compose.ui.geometry.CornerRadius(th / 2f)
+                        )
+                        val s = 5.dp.toPx()
+                        fun chevron(xc: Float, dir: Float, alpha: Float) {
+                            val p = Path()
+                            p.moveTo(xc + dir * s * 0.6f, cy - s)
+                            p.lineTo(xc - dir * s * 0.6f, cy)
+                            p.lineTo(xc + dir * s * 0.6f, cy + s)
+                            drawPath(p, color = textColor.copy(alpha = alpha),
+                                style = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round))
+                        }
+                        chevron(6.dp.toPx(), 1f, if (dragXVisual < -12f) 0.95f else 0.35f)
+                        chevron(size.width - 6.dp.toPx(), -1f, if (dragXVisual > 12f) 0.95f else 0.35f)
+                    }
                     BezelKnob(
                         rotationDeg = dragXVisual * 0.9f,
                         ring = accentColor,
                         hub = textColor,
-                        modifier = Modifier.offset(x = knobOffset).size(30.dp)
+                        modifier = Modifier.offset(x = knobOffset).size(34.dp)
                     )
                 }
             } else {
@@ -3149,14 +3230,47 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         currentInputConnection?.performContextMenuAction(android.R.id.selectAll)
     }
 
-    // Move the text cursor one character left/right (space-bar swipe).
+    // The anchor of a space-bar selection swipe (where the selection started growing from),
+    // reset when a new cursor swipe begins so each swipe selects like a fresh shift+arrow run.
+    private var cursorSelAnchor: Int? = null
+
+    /** Move the text cursor one position left/right (space-bar swipe). Operates directly on the
+     *  editor's selection instead of sending DPAD key events: at the field's edge DPAD makes apps
+     *  move the FOCUS to neighbouring UI elements (buttons, links, other fields) — the swipe must
+     *  never leave the text. Clamped to the text bounds; falls back to key events only when the
+     *  editor can't expose its text. */
     private fun moveCursor(left: Boolean, select: Boolean = false) {
         finalizeComposing()   // moving the caret commits the word being typed
         val ic = currentInputConnection ?: return
-        val code = if (left) android.view.KeyEvent.KEYCODE_DPAD_LEFT else android.view.KeyEvent.KEYCODE_DPAD_RIGHT
-        val meta = if (select) android.view.KeyEvent.META_SHIFT_ON or android.view.KeyEvent.META_SHIFT_LEFT_ON else 0
-        ic.sendKeyEvent(android.view.KeyEvent(0, 0, android.view.KeyEvent.ACTION_DOWN, code, 0, meta))
-        ic.sendKeyEvent(android.view.KeyEvent(0, 0, android.view.KeyEvent.ACTION_UP, code, 0, meta))
+        val et = try {
+            ic.getExtractedText(android.view.inputmethod.ExtractedTextRequest(), 0)
+        } catch (_: Exception) { null }
+        val text = et?.text
+        if (text == null || et.selectionStart < 0 || et.selectionEnd < 0) {
+            // Rare: the editor won't report its text — old key-event path (clamping impossible).
+            val code = if (left) android.view.KeyEvent.KEYCODE_DPAD_LEFT else android.view.KeyEvent.KEYCODE_DPAD_RIGHT
+            val meta = if (select) android.view.KeyEvent.META_SHIFT_ON or android.view.KeyEvent.META_SHIFT_LEFT_ON else 0
+            ic.sendKeyEvent(android.view.KeyEvent(0, 0, android.view.KeyEvent.ACTION_DOWN, code, 0, meta))
+            ic.sendKeyEvent(android.view.KeyEvent(0, 0, android.view.KeyEvent.ACTION_UP, code, 0, meta))
+            return
+        }
+        val lo = et.startOffset
+        val hi = et.startOffset + text.length
+        val selA = et.startOffset + et.selectionStart
+        val selB = et.startOffset + et.selectionEnd
+        if (!select) {
+            cursorSelAnchor = null
+            // A collapsed caret steps by one; an active selection first collapses to its edge.
+            val pos = if (selA != selB) (if (left) selA else selB)
+                      else (selA + if (left) -1 else 1).coerceIn(lo, hi)
+            ic.setSelection(pos, pos)
+        } else {
+            val anchor = cursorSelAnchor ?: (if (selA != selB) (if (left) selB else selA) else selA)
+                .also { cursorSelAnchor = it }
+            val moving = if (anchor == selA) selB else selA
+            val m = (moving + if (left) -1 else 1).coerceIn(lo, hi)
+            ic.setSelection(minOf(anchor, m), maxOf(anchor, m))
+        }
     }
 
     // Shift tap handling: single = one-shot shift, double-tap = caps lock.
