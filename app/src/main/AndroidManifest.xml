@@ -30,6 +30,16 @@
                 android:resource="@xml/method" />
         </service>
 
+        <!-- Warms the Compose runtime in the fresh process right after each APK update, so the
+             first keyboard show after an update doesn't pay first-composition costs inside the
+             show-IME window transaction (slow layout there can leave a backgrounded app with a
+             stuck "IME already visible" state and a keyboard that never appears). -->
+        <receiver android:name=".PackageReplacedReceiver" android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
         <activity
             android:name=".SettingsActivity"
             android:label="Keyo"

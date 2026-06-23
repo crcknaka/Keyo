@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <!-- Debug-only field playground for reproducing IME issues; not in release builds. -->
+        <activity
+            android:name=".FieldTestActivity"
+            android:exported="true"
+            android:windowSoftInputMode="stateVisible|adjustResize" />
+    </application>
+</manifest>

@@ -158,6 +158,18 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     // sentence punctuation pulls back onto the word. Cleared as soon as you type past it / move away.
     private var glideWord: String? = null
     private var glideAlts: List<String> = emptyList()
+    // Set when we auto-insert a trailing space (after a suggestion tap). The next sentence
+    // punctuation pulls that space back so it attaches to the word ("word " + "." -> "word.").
+    private var pendingAutoSpace = false
+    // Our own suggestion commit produces ONE selection update which we must NOT treat as the user
+    // moving the caret; this one-shot flag absorbs it. Any later caret move invalidates pendingAutoSpace
+    // so punctuation can't pull/eat a space at an unrelated cursor position.
+    private var autoSpaceSkipNextSel = false
+    // The space bar commits on finger-UP (so hold=dictate / swipe=cursor can override). When typing
+    // fast the NEXT letter's key-DOWN can arrive before that UP, which used to glue the letter onto the
+    // previous word ("чау как" -> "чаук ак"). So a space tap is marked "pending" on key-down and the
+    // next character flushes it first, keeping the real key order.
+    private var pendingSpaceTap = false
     // Live glide preview: the current best guess shown above the keys while the finger is still
     // swiping (Gboard-style). Throttled: one background decode in flight, every ~6 new points.
     private val glidePreview = mutableStateOf<String?>(null)
@@ -233,6 +245,12 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         themeId.value = KeyboardPrefs.getTheme(this)
         val langsBefore = enabledLangs.value
         enabledLangs.value = KeyboardPrefs.getEnabledLanguages(this)
+        // If the user disabled the currently-active language in Settings, switch to a still-enabled
+        // one immediately so the layout doesn't keep showing a disabled language until field restart.
+        if (enabledLangs.value.isNotEmpty() && currentLang.value !in enabledLangs.value) {
+            currentLang.value = enabledLangs.value.first()
+            KeyboardPrefs.setCurrentLanguage(this, currentLang.value)
+        }
         if (enabledLangs.value != langsBefore) {
             // A language was just enabled in Settings — load its dictionary in the background.
             val langs = enabledLangs.value + currentLang.value
@@ -273,6 +291,51 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         serviceScope.launch(kotlinx.coroutines.Dispatchers.IO) {
             UserDictionary.ensureLoaded(this@KeyoService)
             SuggestionEngine.ensureLoaded(this@KeyoService, enabledLangs.value + currentLang.value)
+        }
+        // The first Compose composition of the whole keyboard takes hundreds of ms and normally
+        // happens INSIDE the first show-IME transaction, blocking this process's main thread while
+        // WindowManager waits for the IME window to lay out. On slower devices the system's show
+        // retries can all time out, and the client app is left believing the IME is visible — after
+        // that every further show request (even a tap on the field) is dropped as redundant and the
+        // keyboard never appears in that app until it restarts (seen with WhatsApp's auto-focused
+        // two-step-verification PIN prompt). The service is created when the IME is bound (process
+        // start / package update), well before any show request, so paying the composition cost here
+        // keeps the actual show transaction fast.
+        handler.post { prewarmKeyboardUi() }
+    }
+
+    /** Compose the keyboard once in a detached throwaway view (loads + JITs Compose and all our
+     *  layout code), then pre-build the real input view so the first show only attaches it. */
+    private fun prewarmKeyboardUi() {
+        if (isShowInputRequested) {
+            // The service was cold-started by a show request that is already being processed —
+            // the real composition is about to run, so a warm-up pass would only delay it.
+            return
+        }
+        val t0 = android.os.SystemClock.elapsedRealtime()
+        try {
+            val recomposer = androidx.compose.runtime.Recomposer(serviceScope.coroutineContext)
+            val warm = ComposeView(this).apply {
+                setParentCompositionContext(recomposer)
+                setContent { KeyboardLayout() }
+            }
+            warm.measure(
+                View.MeasureSpec.makeMeasureSpec(resources.displayMetrics.widthPixels, View.MeasureSpec.EXACTLY),
+                View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+            )
+            warm.disposeComposition()
+            recomposer.close()
+            android.util.Log.i("Keyo", "compose prewarm done in ${android.os.SystemClock.elapsedRealtime() - t0}ms")
+        } catch (e: Throwable) {
+            android.util.Log.w("Keyo", "compose prewarm skipped", e)
+        }
+        // Hand the framework a ready-made input view: showWindow() skips onCreateInputView and the
+        // (now warm) composition runs immediately on attach. After a config change the framework
+        // drops this view and calls onCreateInputView again, which rebuilds it the usual way.
+        try {
+            setInputView(onCreateInputView())
+        } catch (e: Throwable) {
+            android.util.Log.w("Keyo", "input view pre-create skipped", e)
         }
     }
 
@@ -385,6 +448,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
 
         isShift.value = false
         isCapsLock.value = false
+        shiftIsAuto = false
         showUndoRewrite.value = false
         composing.clear()   // fresh field: never carry a composing word across inputs
         recentTaps.clear()
@@ -392,6 +456,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         autocorrectUndo = null
         revertedWords.clear()
         glideWord = null
+        glideAlts = emptyList()
+        pendingAutoSpace = false
+        autoSpaceSkipNextSel = false
+        pendingSpaceTap = false
         setSuggestions(emptyList(), null)
         confirmDeferred?.complete(false); confirmDeferred = null; pendingConfirm.value = null
         // Open in the layout the field asks for (Gboard behaviour): number/date fields get the
@@ -404,6 +472,24 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         }
         syncImeSubtype(currentLang.value)   // best-effort: keep the OS subtype on our language
         maybeAutoCapitalize()
+    }
+
+    override fun onFinishInputView(finishingInput: Boolean) {
+        super.onFinishInputView(finishingInput)
+        // The field is going away: finalize any composing word in place (so it isn't silently dropped
+        // or carried over) and clear transient editing state. onStartInputView re-initializes
+        // everything when input resumes.
+        if (composing.isNotEmpty()) {
+            try { currentInputConnection?.finishComposingText() } catch (_: Exception) {}
+            composing.clear()
+        }
+        autocorrectUndo = null
+        glideWord = null
+        glideAlts = emptyList()
+        pendingTapPos = null
+        pendingAutoSpace = false
+        autoSpaceSkipNextSel = false
+        pendingSpaceTap = false
     }
 
     override fun onEvaluateFullscreenMode(): Boolean {
@@ -1261,7 +1347,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     fontWeight = androidx.compose.ui.text.font.FontWeight.Medium,
                     modifier = Modifier.weight(1f).clickable {
                         val t = currentTargetText()
-                        if (!secureField && t.isNotBlank()) {
+                        if (!secureField && !noLearn && t.isNotBlank()) {
                             KeyboardPrefs.addPinned(this@KeyoService, t)
                             pinnedClips.value = KeyboardPrefs.getPinned(this@KeyoService)
                             statusText.value = "📌 Pinned"
@@ -1356,6 +1442,11 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 .height(keyHeightDp.intValue.dp)
                 .semantics { contentDescription = "Space. Long-press to dictate, swipe to move the cursor" }
                 .pointerInput(Unit) {
+                    // A deliberate horizontal drag starts the cursor slider. The threshold is in dp
+                    // and generous: the old ~24px (≈9dp) was so small that a fast typing tap that
+                    // drifted sideways got misread as a swipe and the space was dropped (words merged
+                    // when typing quickly). A real cursor swipe easily clears this; a tap won't.
+                    val cursorThresholdPx = 26.dp.toPx()
                     awaitEachGesture {
                         val down = awaitFirstDown()
                         @Suppress("VARIABLE_WITH_REDUNDANT_INITIALIZER")
@@ -1367,11 +1458,13 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         micCancelled = false
                         micDragX = 0f
                         spacePressed = true
+                        pendingSpaceTap = true   // a space tap is forming; the next char may flush it
 
                         val longPressJob = serviceScope.launch {
                             kotlinx.coroutines.delay(400)
                             if (!cursorMode) {
                                 longPressed = true
+                                pendingSpaceTap = false   // it's a hold (dictate), not a space tap
                                 startVoiceRecording()
                                 performKeyFeedback()
                             }
@@ -1387,9 +1480,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                     micDragX = totalDragX
                                     if (micDragX < -cancelThreshold) micCancelled = true
                                 } else {
-                                    if (!cursorMode && kotlin.math.abs(totalDragX) > 24f) {
+                                    if (!cursorMode && kotlin.math.abs(totalDragX) > cursorThresholdPx) {
                                         cursorMode = true
                                         cursorVisual = true
+                                        pendingSpaceTap = false   // it's a swipe (cursor), not a space tap
                                         longPressJob.cancel()
                                         lastStepX = totalDragX
                                         cursorSelAnchor = null   // fresh swipe -> fresh selection anchor
@@ -1414,7 +1508,9 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         if (longPressed) {
                             if (micCancelled) cancelVoiceRecording() else stopVoiceRecording()
                             micDragX = 0f
-                        } else if (!cursorMode) {
+                        } else if (!cursorMode && pendingSpaceTap) {
+                            // Normal tap, and no fast next-letter already flushed it: commit the space.
+                            pendingSpaceTap = false
                             performKeyFeedback()
                             commitChar(' ')
                         }
@@ -2152,6 +2248,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                     composing.setLength((composing.length - label.length).coerceAtLeast(0))
                                     composing.append(chosenAlt)
                                     currentInputConnection?.setComposingText(composing.toString(), 1)
+                                    updateSuggestions()   // onUpdateSelection skips self-edits now, so refresh here
                                 }
                                 else -> {                                   // base char already committed: patch it in place
                                     currentInputConnection?.deleteSurroundingText(label.length, 0)
@@ -2267,6 +2364,84 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
 
     /** Characters that belong to a word and so stay in the composing region. */
     private fun isWordChar(c: Char): Boolean = c.isLetter() || c == '\'' || c == '-'
+
+    // English contractions typed without the apostrophe -> canonical form (correct caps for the "I"
+    // ones). Forms that are themselves valid words (its, were, well, lets, id, ill, shed, …) are
+    // deliberately left out so a correct word is never "fixed".
+    private val enContractions = mapOf(
+        "im" to "I'm", "ive" to "I've",
+        "dont" to "don't", "cant" to "can't", "wont" to "won't",
+        "isnt" to "isn't", "arent" to "aren't", "wasnt" to "wasn't", "werent" to "weren't",
+        "havent" to "haven't", "hasnt" to "hasn't", "hadnt" to "hadn't",
+        "doesnt" to "doesn't", "didnt" to "didn't",
+        "couldnt" to "couldn't", "wouldnt" to "wouldn't", "shouldnt" to "shouldn't",
+        "mustnt" to "mustn't", "neednt" to "needn't", "aint" to "ain't",
+        "youre" to "you're", "youve" to "you've", "youll" to "you'll", "youd" to "you'd",
+        "hes" to "he's", "shes" to "she's", "hed" to "he'd",
+        "theyre" to "they're", "theyve" to "they've", "theyll" to "they'll", "theyd" to "they'd",
+        "weve" to "we've",
+        "thats" to "that's", "theres" to "there's", "whats" to "what's", "whos" to "who's",
+        "whod" to "who'd", "wheres" to "where's", "whens" to "when's", "hows" to "how's",
+        "couldve" to "could've", "shouldve" to "should've", "wouldve" to "would've",
+        "mustve" to "must've", "mightve" to "might've",
+        "yall" to "y'all", "oclock" to "o'clock"
+    )
+
+    // Emoticons -> emoji, swapped inline as soon as the closing character is typed (only when preceded
+    // by a space or the start of text, so URLs like "http://" are never touched). Longest match wins.
+    private val emoticons = listOf(
+        ":')" to "😢", ":-)" to "😊", ":-(" to "🙁", ":-D" to "😃", ":-P" to "😛",
+        ";-)" to "😉", "</3" to "💔",
+        ":)" to "😊", ":(" to "🙁", ":D" to "😃", ":P" to "😛",
+        ";)" to "😉", ":O" to "😮", ":|" to "😐", ":/" to "😕",
+        ":*" to "😘", "<3" to "❤️", "xD" to "😆", "XD" to "😆", "=)" to "😊"
+    ).sortedByDescending { it.first.length }
+    private val emoticonEndChars = emoticons.map { it.first.last() }.toSet()
+
+    // Word -> emoji offered in the suggestion strip while typing (tap swaps the word for the emoji).
+    private val emojiKeywords = mapOf(
+        "love" to "❤️", "heart" to "❤️", "like" to "👍", "ok" to "👌", "okay" to "👌",
+        "yes" to "✅", "no" to "❌", "fire" to "🔥", "lit" to "🔥", "happy" to "😊", "smile" to "😊",
+        "sad" to "😢", "cry" to "😭", "lol" to "😂", "haha" to "😂", "laugh" to "😂", "funny" to "😂",
+        "cool" to "😎", "wow" to "😮", "omg" to "😱", "angry" to "😠", "mad" to "😠",
+        "kiss" to "😘", "wink" to "😉", "party" to "🎉", "birthday" to "🎂", "cake" to "🎂",
+        "gift" to "🎁", "star" to "⭐", "sun" to "☀️", "snow" to "❄️", "coffee" to "☕",
+        "beer" to "🍺", "wine" to "🍷", "pizza" to "🍕", "food" to "🍔", "music" to "🎵",
+        "money" to "💰", "phone" to "📱", "home" to "🏠", "car" to "🚗", "dog" to "🐶", "cat" to "🐱",
+        "thanks" to "🙏", "please" to "🙏", "sleep" to "😴", "tired" to "😴", "sick" to "🤒",
+        "think" to "🤔", "eyes" to "👀", "hi" to "👋", "hello" to "👋", "bye" to "👋", "hug" to "🤗",
+        "strong" to "💪", "clap" to "👏", "perfect" to "💯", "rocket" to "🚀", "flower" to "🌸", "rose" to "🌹",
+        "любовь" to "❤️", "сердце" to "❤️", "люблю" to "❤️", "огонь" to "🔥", "круто" to "😎",
+        "смех" to "😂", "ахах" to "😂", "хаха" to "😂", "смешно" to "😂", "грустно" to "😢",
+        "плачу" to "😭", "счастье" to "😊", "улыбка" to "😊", "злой" to "😠", "поцелуй" to "😘",
+        "праздник" to "🎉", "торт" to "🎂", "подарок" to "🎁", "звезда" to "⭐", "солнце" to "☀️",
+        "кофе" to "☕", "пиво" to "🍺", "вино" to "🍷", "пицца" to "🍕", "еда" to "🍔",
+        "музыка" to "🎵", "деньги" to "💰", "телефон" to "📱", "дом" to "🏠", "машина" to "🚗",
+        "собака" to "🐶", "кошка" to "🐱", "кот" to "🐱", "спасибо" to "🙏", "привет" to "👋",
+        "пока" to "👋", "сила" to "💪", "цветок" to "🌸", "роза" to "🌹", "думаю" to "🤔",
+        "сон" to "😴", "устал" to "😴", "вау" to "😮", "да" to "✅", "нет" to "❌"
+    )
+
+    /** If the text right before the cursor ends with an emoticon (preceded by a space or start of
+     *  text), swap it for the matching emoji. Returns true if it replaced. */
+    private fun maybeReplaceEmoticon(): Boolean {
+        if (secureField || fieldNoSuggestions) return false
+        val ic = currentInputConnection ?: return false
+        val before = ic.getTextBeforeCursor(4, 0)?.toString() ?: return false
+        for ((emo, glyph) in emoticons) {
+            if (before.endsWith(emo)) {
+                val pre = before.dropLast(emo.length)
+                if (pre.isEmpty() || pre.last() == ' ' || pre.last() == '\n') {
+                    composing.clear()
+                    ic.finishComposingText()
+                    ic.deleteSurroundingText(emo.length, 0)
+                    ic.commitText(glyph, 1)
+                    return true
+                }
+            }
+        }
+        return false
+    }
 
     /** Commit the active composing word (if any) so the following edit starts on clean text. */
     private fun finalizeComposing() {
@@ -2589,7 +2764,16 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     // not here, so every key vibrates exactly once.
     private fun commitChar(char: Char) {
         val ic = currentInputConnection
+        // Flush a still-pending space tap (its key-up hasn't arrived yet) BEFORE this character, so a
+        // fast next-letter keypress lands after the space instead of gluing onto the previous word.
+        if (pendingSpaceTap) {
+            pendingSpaceTap = false
+            finishWord()
+            ic?.commitText(" ", 1)
+        }
         autocorrectUndo = null   // typing past a just-corrected word accepts the correction
+        val hadAutoSpace = pendingAutoSpace
+        pendingAutoSpace = false
         // Glide smart-space: typing on dismisses the glide alternates; sentence punctuation pulls
         // back onto the word ("word ." -> "word.") by removing the auto-space; a single manual
         // space right after the glide is swallowed (the space is already there) so the auto-space
@@ -2606,38 +2790,47 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 ic.deleteSurroundingText(1, 0)
             }
         }
+        // Smart spacing after a suggestion's auto-inserted trailing space (Gboard-style), mirroring
+        // the glide smart-space above: a redundant manual space is swallowed (it's already there, so
+        // it can't trigger an accidental double-space period), and sentence punctuation pulls the
+        // space back so it hugs the word ("word " + "." -> "word.").
+        if (hadAutoSpace && ic?.getTextBeforeCursor(1, 0)?.toString() == " ") {
+            if (char == ' ') { maybeAutoCapitalize(); updateSuggestions(); return }
+            if (char in ".,!?;:") ic.deleteSurroundingText(1, 0)
+        }
         // Word characters build up the composing region (except in secure / no-suggestion fields,
         // where we never expose composing text). The editor doesn't spell-check composing text ->
         // no red underline.
         if (isWordChar(char) && !secureField && !fieldNoSuggestions) {
+            // Editing inside an existing word (a word char follows the caret): insert plainly at the
+            // caret with NO composing region. Keeps the cursor exactly where it is and avoids running
+            // autocorrect/suggestions on a half-word fragment. (Any active composing word was already
+            // finalized by onUpdateSelection when the caret moved into the word.)
+            val tail = ic?.getTextAfterCursor(1, 0)?.toString() ?: ""
+            if (tail.isNotEmpty() && isWordChar(tail[0])) {
+                finalizeComposing()
+                ic?.commitText(char.toString(), 1)
+                pendingTapPos = null
+                maybeAutoCapitalize()
+                updateSuggestions()
+                return
+            }
             // Probabilistic key targeting: a tap near a key boundary picks the letter that better
             // continues the current word (needs the touch point captured by the glide overlay).
             var ch = char
             pendingTapPos?.let { p ->
                 if (char.isLetter() && keyboardMode.value == "abc") ch = disambiguateTap(char, p)
             }
-            // Typing that continues an already-committed word (e.g. right after Backspace deleted
-            // into it, or the cursor was placed at its end) re-adopts the whole word into the
-            // composing region, so suggestions and autocorrect see the full word — not just the
-            // freshly typed tail. Gboard behaves the same.
-            if (composing.isEmpty() && ic?.getSelectedText(0).isNullOrEmpty()) {
-                val head = currentWordBeforeCursor()
-                if (head.isNotEmpty() && head.length <= 24) {
-                    ic?.beginBatchEdit()
-                    ic?.deleteSurroundingText(head.length, 0)
-                    composing.append(head)
-                    composing.append(ch)
-                    ic?.setComposingText(composing.toString(), 1)
-                    ic?.endBatchEdit()
-                    recordTap(ch)
-                    maybeAutoCapitalize()
-                    updateSuggestions()
-                    return
-                }
-            }
+            // NOTE: we deliberately do NOT "re-adopt" an already-committed word back into the
+            // composing region here. That used to delete the word with deleteSurroundingText and
+            // re-add it — which, racing a just-committed space during fast typing, ate the space
+            // ("чау как" -> "чаукак"). Continuing a word just appends a new composing run; finishWord
+            // still autocorrects the whole word on the next boundary via currentWordBeforeCursor.
             composing.append(ch)
             recordTap(ch)   // remember where the finger landed, for coordinate spatial autocorrect
             ic?.setComposingText(composing.toString(), 1)
+            // Emoticons ending in a letter (e.g. :D :P xD) complete here.
+            if (ch in emoticonEndChars && maybeReplaceEmoticon()) { maybeAutoCapitalize(); updateSuggestions(); return }
             maybeAutoCapitalize()
             updateSuggestions()
             return
@@ -2679,6 +2872,15 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             if (c.isLetter() || c == '\'' || c == '-') sb.append(c) else break
         }
         return sb.reverse().toString()
+    }
+
+    /** The run of word characters immediately after the cursor (the tail of a word being edited
+     *  from its middle). Empty when the caret sits at the end of a word / on whitespace. */
+    private fun wordAfterCursor(): String {
+        val after = currentInputConnection?.getTextAfterCursor(48, 0)?.toString() ?: return ""
+        val sb = StringBuilder()
+        for (c in after) { if (isWordChar(c)) sb.append(c) else break }
+        return sb.toString()
     }
 
     /** The word preceding [currentWord] (text before the cursor still ends with currentWord). */
@@ -2777,6 +2979,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         val pts = tapsFor(word.lowercase())
         val bounds = if (pts != null) HashMap(keyBounds) else null
         val prevLower = prevW?.lowercase()
+        val emoji = emojiKeywords[word.lowercase()]   // offer a matching emoji as an extra strip chip
         serviceScope.launch(kotlinx.coroutines.Dispatchers.Default) {
             val result = try {
                 computeSuggestions(word, langs, uni, prefer, prevLower, pts, bounds)
@@ -2785,7 +2988,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 emptyList<String>() to null
             }
             kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
-                if (gen == suggGen) setSuggestions(result.first, result.second)
+                if (gen == suggGen) {
+                    val list = if (emoji != null && emoji !in result.first) result.first + emoji else result.first
+                    setSuggestions(list, result.second)
+                }
             }
         }
         } catch (e: Throwable) {
@@ -2898,6 +3104,9 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         performKeyFeedback()
         if (s.startsWith("↩ ")) { revertAutocorrectKeepBoundary(); return }
         val ic = currentInputConnection ?: return
+        // Emoji suggestion (e.g. typed "love" -> tapped ❤️): replace the word with the emoji, but
+        // don't learn the glyph as a personal word. Detected by a high first code point (emoji/symbol).
+        val isEmoji = s.isNotEmpty() && s[0].code > 0x2000
         // Tapping a glide alternate: swap the just-glided word for it, keeping the auto-space.
         val gw = glideWord
         if (gw != null) {
@@ -2925,6 +3134,8 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             composing.clear()
         }
         val prev: String?
+        // Batch the edits so the editor reports a SINGLE selection update (the skip-flag absorbs it).
+        ic.beginBatchEdit()
         if (composing.isNotEmpty()) {
             // The active word lives in the composing region: swap it for the suggestion + finalize.
             prev = wordBefore(word)
@@ -2932,16 +3143,26 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             ic.finishComposingText()
             composing.clear()
             ic.commitText(" ", 1)
+            pendingAutoSpace = true
         } else if (word.isNotEmpty()) {
             prev = wordBefore(word)
-            ic.deleteSurroundingText(word.length, 0)
-            ic.commitText("$s ", 1)
+            // Replace the WHOLE word, including any tail after the caret (suggestion tapped while
+            // editing mid-word) — never split it. Trailing space only at a real word end.
+            val tail = wordAfterCursor()
+            ic.deleteSurroundingText(word.length, tail.length)
+            if (tail.isEmpty()) { ic.commitText("$s ", 1); pendingAutoSpace = true }
+            else ic.commitText(s, 1)
         } else {
             prev = wordBeforeTrailingSpace()
             ic.commitText("$s ", 1)
+            pendingAutoSpace = true
         }
-        learnFromTap(prev?.lowercase(), s.lowercase())
-        scheduleUserDictSave()
+        ic.endBatchEdit()
+        if (pendingAutoSpace) autoSpaceSkipNextSel = true
+        if (!isEmoji) {
+            learnFromTap(prev?.lowercase(), s.lowercase())
+            scheduleUserDictSave()
+        }
         isShift.value = false; shiftIsAuto = false
         updateSuggestions()
     }
@@ -2950,9 +3171,13 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private fun finishWord() {
         if (secureField || fieldNoSuggestions) { finalizeComposing(); return }
         val ic = currentInputConnection
-        // Defensive: if the composing buffer covers only the tail of the visible word (it shouldn't,
-        // now that typing re-adopts the word — but editors can surprise), finalize it and treat the
-        // whole word as committed text so autocorrect sees the full word, not the tail.
+        // A boundary typed in the MIDDLE of a word (a word char follows the caret) splits it — don't
+        // autocorrect/learn the left fragment as if it were a finished word.
+        val afterCaret = ic?.getTextAfterCursor(1, 0)?.toString() ?: ""
+        if (afterCaret.isNotEmpty() && isWordChar(afterCaret[0])) { finalizeComposing(); return }
+        // Defensive: if the composing buffer covers only part of the visible word (it normally won't,
+        // but editors can surprise), finalize it and treat the whole word as committed text so
+        // autocorrect sees the full word, not just the buffered part.
         if (composing.isNotEmpty() && composing.toString() != currentWordBeforeCursor()) {
             ic?.finishComposingText()
             composing.clear()
@@ -2963,12 +3188,22 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         val prev = wordBefore(word)
         var learned = word.lowercase()
         var finalWord = word
+        // English niceties applied FIRST (so autocorrect can't mangle "dont" -> "done"): a standalone
+        // "i"/"i'..." -> "I...", and apostrophe-less contractions (dont -> don't, im -> I'm, youre ->
+        // you're, ...). Only when English is active, independent of the autocorrect toggle, and NOT
+        // Backspace-revertable. Forms that are valid words on their own are kept out of enContractions.
+        var enFixed = false
+        if ("en" in dictLangs() && !revertedWords.contains(SuggestionEngine.fold(learned))) {
+            val c = enContractions[finalWord.lowercase()]
+            if (c != null) { finalWord = matchCase(finalWord, c); enFixed = true }
+            else if (finalWord == "i" || finalWord.startsWith("i'")) { finalWord = "I" + finalWord.substring(1); enFixed = true }
+        }
         // Gboard-style autocorrect: swap an unknown typed word for the closest dictionary word.
         // correct() returns null for words already known (bundled or learned) and ranks by frequency,
         // so valid short words like "как"/"что" are never touched — only unknown typos (e.g. "кае").
         // We only auto-apply single-edit fixes — without word context, 2-edit guesses miss too often
         // (and stay available as tap suggestions). Words the user reverted this session are left alone.
-        if (autocorrectTypingOn && SuggestionEngine.isReady() && word.length >= 3 &&
+        if (!enFixed && autocorrectTypingOn && SuggestionEngine.isReady() && word.length >= 3 &&
             !revertedWords.contains(SuggestionEngine.fold(learned))) {
             try {
                 // Spatial-aware: among ranked corrections, apply the top single-edit fix (as before),
@@ -3030,6 +3265,8 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         }
         // Arm Backspace-to-revert: the caller commits the boundary char right after this, leaving
         // "<finalWord><boundary>" in the field; the next Backspace restores [word].
+        // Any change (autocorrect, i->I, contraction) is one-tap revertable: the strip shows
+        // "↩ <original>" and the first Backspace restores it (and won't be re-fixed this session).
         autocorrectUndo = if (corrected) AutocorrectUndo(finalWord, word) else null
         // Plain typing must NOT add the word to the dictionary — only an explicit suggestion tap
         // (applySuggestion) does. We still record the next-word pattern for prediction (unless the
@@ -3050,10 +3287,38 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         candidatesStart: Int, candidatesEnd: Int
     ) {
         super.onUpdateSelection(oldSelStart, oldSelEnd, newSelStart, newSelEnd, candidatesStart, candidatesEnd)
-        // If the composing region ended outside our control (the user tapped elsewhere, or the app
-        // edited the field), drop the buffer so the next keystroke doesn't reopen a stale region at
-        // the wrong spot. candidatesStart == -1 means there is no active composing span.
-        if (composing.isNotEmpty() && candidatesStart == -1 && candidatesEnd == -1) composing.clear()
+        if (composing.isNotEmpty()) {
+            // Our own setComposingText(...,1) always leaves the caret collapsed exactly at the end of
+            // the composing span, so that state means "this update came from our own keystroke".
+            val caretAtComposingEnd = newSelStart == newSelEnd && newSelEnd == candidatesEnd
+            when {
+                // candidatesStart==-1 means no active composing span — normally an external drop (user
+                // tapped elsewhere / app edited). But during FAST typing it's often a STALE, out-of-order
+                // callback from a prior commit (e.g. the boundary space, which has no composing region)
+                // that arrives AFTER we already started a new composing word. Clearing the buffer then
+                // would let the next setComposingText overwrite the new word's first letter
+                // ("чау как" -> "чау ак"). So only drop the buffer if the word is really gone from the
+                // field; if it's still right before the cursor, the -1 is stale — keep the buffer.
+                candidatesStart == -1 ->
+                    if (!currentWordBeforeCursor().endsWith(composing.toString())) composing.clear()
+                // Self-generated update from typing/backspace: commitChar/deleteSmart already refreshed
+                // the strip + auto-shift, so skip the redundant (and costly) recompute.
+                caretAtComposingEnd -> return
+                // The caret moved INTO or away from the composing word (a mid-word tap, or a
+                // selection was made). Finalize the word in place so the next keystroke edits real
+                // text at the true caret instead of snapping back to the end of the composing region.
+                else -> {
+                    try { currentInputConnection?.finishComposingText() } catch (_: Exception) {}
+                    composing.clear()
+                }
+            }
+        }
+        // Invalidate a pending suggestion auto-space once the caret really moves (skip the single
+        // self-update from our own suggestion commit) — stops punctuation eating an unrelated space.
+        if (pendingAutoSpace) {
+            if (autoSpaceSkipNextSel) autoSpaceSkipNextSel = false
+            else pendingAutoSpace = false
+        }
         maybeAutoCapitalize()   // keep Shift in sync when the cursor moves (arm at sentence starts, disarm mid-text)
         updateSuggestions()
     }
@@ -3108,6 +3373,8 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private fun commitText(text: String) {
         finalizeComposing()   // symbols / digits / paste / emoji end the current word first
         currentInputConnection?.commitText(text, 1)
+        // Emoticons ending in a symbol/digit (e.g. :) :( ;) :/ <3) complete here.
+        if (text.isNotEmpty() && text.last() in emoticonEndChars) maybeReplaceEmoticon()
     }
 
     // Unified key feedback. Every key (letters, backspace, mode, shift, space) routes through
@@ -3130,8 +3397,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             } catch (_: Exception) {}
         }
         if (soundEnabled.value) {
-            val am = getSystemService(android.content.Context.AUDIO_SERVICE) as android.media.AudioManager
-            am.playSoundEffect(android.media.AudioManager.FX_KEYPRESS_STANDARD, -1f)
+            try {
+                val am = getSystemService(android.content.Context.AUDIO_SERVICE) as? android.media.AudioManager
+                am?.playSoundEffect(android.media.AudioManager.FX_KEYPRESS_STANDARD, -1f)
+            } catch (_: Exception) {}
         }
     }
 
@@ -3241,6 +3510,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
      *  editor can't expose its text. */
     private fun moveCursor(left: Boolean, select: Boolean = false) {
         finalizeComposing()   // moving the caret commits the word being typed
+        pendingAutoSpace = false   // navigating away ends the suggestion auto-space association
         val ic = currentInputConnection ?: return
         val et = try {
             ic.getExtractedText(android.view.inputmethod.ExtractedTextRequest(), 0)
@@ -3329,6 +3599,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
 
     private fun deleteSmart(byWord: Boolean) {
         performKeyFeedback()
+        pendingAutoSpace = false
         val ic = currentInputConnection ?: return
 
         // Backspace right after a glide deletes the whole inserted word + its auto-space in one tap.
@@ -3370,9 +3641,13 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 ic.finishComposingText()
             } else {
                 composing.setLength(composing.length - 1)
-                if (composing.isEmpty()) ic.finishComposingText()
+                // finishComposingText() alone only *finalizes* the span — it never deletes text, so
+                // the last glyph would be orphaned (you'd need a 2nd Backspace). Clear the visual
+                // composing text first, then finalize.
+                if (composing.isEmpty()) { ic.setComposingText("", 1); ic.finishComposingText() }
                 else ic.setComposingText(composing.toString(), 1)
             }
+            maybeAutoCapitalize()   // deleting to empty at a sentence start should re-arm auto-shift
             updateSuggestions()
             return
         }
