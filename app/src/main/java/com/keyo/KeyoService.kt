@@ -199,6 +199,9 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private var primarySuggestion = mutableStateOf<String?>(null)
     private var toolbarPinned = mutableStateOf(false)
     private val saveUserDict = Runnable { UserDictionary.save(this) }
+    // Suggestions are debounced: the heavy dictionary work runs ~one frame after the last keystroke,
+    // not on every keypress. Coalesces the commitChar + onUpdateSelection double-call and fast bursts.
+    private val updateSuggestionsRunnable = Runnable { runUpdateSuggestions() }
 
     // Track D — confirmation prompt for consequential AI actions (call / SMS). When set, a bar with
     // Confirm / Cancel appears; the assistant's tool loop suspends on `confirmDeferred` until tapped.
@@ -460,6 +463,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         pendingAutoSpace = false
         autoSpaceSkipNextSel = false
         pendingSpaceTap = false
+        handler.removeCallbacks(updateSuggestionsRunnable)   // drop any debounced compute from the old field
         setSuggestions(emptyList(), null)
         confirmDeferred?.complete(false); confirmDeferred = null; pendingConfirm.value = null
         // Open in the layout the field asks for (Gboard behaviour): number/date fields get the
@@ -2805,8 +2809,9 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             // Editing inside an existing word (a word char follows the caret): insert plainly at the
             // caret with NO composing region. Keeps the cursor exactly where it is and avoids running
             // autocorrect/suggestions on a half-word fragment. (Any active composing word was already
-            // finalized by onUpdateSelection when the caret moved into the word.)
-            val tail = ic?.getTextAfterCursor(1, 0)?.toString() ?: ""
+            // finalized by onUpdateSelection when the caret moved into the word.) Skip the IPC read
+            // while a word is composing — the caret is at its end then, so we're never mid-word.
+            val tail = if (composing.isEmpty()) (ic?.getTextAfterCursor(1, 0)?.toString() ?: "") else ""
             if (tail.isNotEmpty() && isWordChar(tail[0])) {
                 finalizeComposing()
                 ic?.commitText(char.toString(), 1)
@@ -2926,10 +2931,17 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     // background pass only publishes if it is still the latest — stale results are dropped.
     private var suggGen = 0L
 
+    /** Debounced entry point: schedule the suggestion recompute ~one frame later so a burst of fast
+     *  keystrokes collapses into a single pass (characters still appear instantly via setComposingText). */
+    private fun updateSuggestions() {
+        handler.removeCallbacks(updateSuggestionsRunnable)
+        handler.postDelayed(updateSuggestionsRunnable, 22)
+    }
+
     /** Recompute the suggestion strip from the text around the cursor. The InputConnection reads
      *  happen here on the main thread; the dictionary scans (the expensive part — full-vocab prefix
      *  scan + edit-distance pass) run on a background dispatcher so fast typing never janks the UI. */
-    private fun updateSuggestions() {
+    private fun runUpdateSuggestions() {
         if (secureField || fieldNoSuggestions || !suggestionsOn || !SuggestionEngine.isReady()) {
             setSuggestions(emptyList(), null); return
         }
@@ -3383,24 +3395,30 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private fun performKeyFeedback() {
         val level = hapticStrength.value
         val durationMs = KeyboardPrefs.hapticDurationMs(level)
-        if (durationMs > 0L) {
-            try {
-                vibrator?.let { v ->
-                    if (v.hasVibrator()) {
-                        val amplitude = if (v.hasAmplitudeControl())
-                            KeyboardPrefs.hapticAmplitude(level).coerceIn(1, 255)
-                        else
-                            android.os.VibrationEffect.DEFAULT_AMPLITUDE
-                        v.vibrate(android.os.VibrationEffect.createOneShot(durationMs, amplitude))
+        val sound = soundEnabled.value
+        if (durationMs <= 0L && !sound) return
+        // Vibrator / AudioManager are binder calls that can briefly block; run them OFF the main thread
+        // so they never delay the keystroke's commit or its visual feedback.
+        serviceScope.launch(kotlinx.coroutines.Dispatchers.Default) {
+            if (durationMs > 0L) {
+                try {
+                    vibrator?.let { v ->
+                        if (v.hasVibrator()) {
+                            val amplitude = if (v.hasAmplitudeControl())
+                                KeyboardPrefs.hapticAmplitude(level).coerceIn(1, 255)
+                            else
+                                android.os.VibrationEffect.DEFAULT_AMPLITUDE
+                            v.vibrate(android.os.VibrationEffect.createOneShot(durationMs, amplitude))
+                        }
                     }
-                }
-            } catch (_: Exception) {}
-        }
-        if (soundEnabled.value) {
-            try {
-                val am = getSystemService(android.content.Context.AUDIO_SERVICE) as? android.media.AudioManager
-                am?.playSoundEffect(android.media.AudioManager.FX_KEYPRESS_STANDARD, -1f)
-            } catch (_: Exception) {}
+                } catch (_: Exception) {}
+            }
+            if (sound) {
+                try {
+                    val am = getSystemService(android.content.Context.AUDIO_SERVICE) as? android.media.AudioManager
+                    am?.playSoundEffect(android.media.AudioManager.FX_KEYPRESS_STANDARD, -1f)
+                } catch (_: Exception) {}
+            }
         }
     }
 
