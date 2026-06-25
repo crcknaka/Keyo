@@ -28,6 +28,10 @@ object SuggestionEngine {
     // assets/dict/bigram_<lang>.txt). Gives next-word prediction / context from day one, before the
     // user's own [UserDictionary] bigrams have learned anything.
     private val bundledBigrams = java.util.concurrent.ConcurrentHashMap<String, Map<String, List<String>>>()
+    // foldKey skeleton -> most frequent dictionary word that carries diacritics for that skeleton
+    // (e.g. "cau" -> "čau", "ludzu" -> "lūdzu"). Backs Latvian-style diacritic restoration; built
+    // lazily per language. Finds the word no matter how rare it is — NOT limited to top candidates.
+    private val diacriticByLang = java.util.concurrent.ConcurrentHashMap<String, Map<String, String>>()
 
     fun isReady(): Boolean = byLang.isNotEmpty()
 
@@ -195,6 +199,32 @@ object SuggestionEngine {
         val sb = StringBuilder(f.length)
         for (c in f) sb.append(accentBase[c] ?: c)
         return sb.toString()
+    }
+
+    /** Latvian-style diacritic restoration: the most frequent dictionary word whose base-letter
+     *  skeleton equals [typedLower] but with diacritics added ("cau" → "čau", "ludzu" → "lūdzu"),
+     *  or null if there is none (or [typedLower] already has them). Independent of frequency rank, so
+     *  even a rare word like "čau" is found where the normal correction candidate list would miss it. */
+    fun diacriticRestore(typedLower: String, langs: List<String>): String? {
+        if (typedLower.isEmpty()) return null
+        val key = foldKey(typedLower)
+        for (l in langs) {
+            val w = diacriticIndex(l)[key]
+            if (w != null && w != typedLower) return w
+        }
+        return null
+    }
+
+    private fun diacriticIndex(lang: String): Map<String, String> {
+        diacriticByLang[lang]?.let { return it }
+        val v = byLang[lang] ?: return emptyMap()   // not loaded yet — don't cache an empty index
+        val m = HashMap<String, String>(v.words.size)
+        for (w in v.words) {                 // words are frequency-sorted → first wins (most frequent)
+            val k = foldKey(w)
+            if (k != w) m.putIfAbsent(k, w)  // only words that actually carry diacritics
+        }
+        diacriticByLang[lang] = m
+        return m
     }
 
     // ---------------------------------------------------------------------------------------------

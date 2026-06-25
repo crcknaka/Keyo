@@ -2174,6 +2174,13 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         // Near the right screen edge the alt popup extends LEFT from the key (with the row reversed)
         // so the window edge never clamps it — clamping would break the finger-to-item mapping.
         val popupFromRight = keyCenterX > screenWidthPx / 2f
+        // Read the latest label/alts/onClick from inside the long-lived gesture WITHOUT restarting it.
+        // (Keying pointerInput on `label` used to cancel an in-flight long-press the moment Shift was
+        // consumed — label "C"→"c" — so accent popups never opened while Shift was on.)
+        val curOnClick by androidx.compose.runtime.rememberUpdatedState(onClick)
+        val curLabel by androidx.compose.runtime.rememberUpdatedState(label)
+        val curAlts by androidx.compose.runtime.rememberUpdatedState(alts)
+        val curHasAlts by androidx.compose.runtime.rememberUpdatedState(hasAlts)
 
         // The pointer handler sits ABOVE the gap padding, so the whole grid cell is tappable: taps
         // landing in the visual gap between keys go to this key instead of dying (no dead zones).
@@ -2182,11 +2189,18 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 .height(height)
                 .onGloballyPositioned { keyCenterX = it.positionInWindow().x + it.size.width / 2f }
                 .semantics { contentDescription = keyDescription(label) }
-                .pointerInput(label) {
+                .pointerInput(Unit) {
                     val stepPx = 40.dp.toPx()   // one popup item is 40dp wide; selection step matches
                     awaitEachGesture {
                         val down = awaitFirstDown()
                         val fromRight = keyCenterX > screenWidthPx / 2f
+                        // Capture the key's CURRENT case/alts at press time — BEFORE onClick may
+                        // consume Shift (which flips the label to lowercase). This makes a Shift+
+                        // long-press insert the UPPERCASE accent (Č), and the gesture survives the
+                        // recomposition because pointerInput is keyed on Unit, not the label.
+                        val pressLabel = curLabel
+                        val pressAlts = curAlts
+                        val pressHasAlts = curHasAlts
                         pressed = true
                         showAlts = false
                         var longPressed = false
@@ -2195,19 +2209,20 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         // Commit on key-DOWN so the character appears instantly (no waiting
                         // for finger-up). This removes the perceived typing latency. A
                         // long-press later replaces this character with the chosen accent.
-                        onClick()
+                        curOnClick()
                         performKeyFeedback()
 
                         // Long press timer
                         val longPressJob = serviceScope.launch {
                             kotlinx.coroutines.delay(400)
-                            if (pressed && hasAlts && !glideActive.value) {   // not while gliding
+                            val a = pressAlts
+                            if (pressed && pressHasAlts && a != null && a.isNotEmpty() && !glideActive.value) {
                                 longPressed = true
                                 showAlts = true
                                 // Default to the primary alternate (Gboard-style): releasing
                                 // without moving the finger inserts it.
-                                selectedAlt = alts!!.first()
-                                selectedAltIdx = if (fromRight) alts.size - 1 else 0
+                                selectedAlt = a.first()
+                                selectedAltIdx = if (fromRight) a.size - 1 else 0
                                 performKeyFeedback()
                             }
                         }
@@ -2223,13 +2238,14 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                 // If alts are showing, detect which one the finger is on. The row is
                                 // anchored so the primary item starts above the key; near the right
                                 // edge it is reversed and extends left instead.
-                                if (showAlts && alts != null) {
+                                val a = pressAlts
+                                if (showAlts && a != null) {
                                     val dx = change.position.x - down.position.x
-                                    val n = alts.size
+                                    val n = a.size
                                     val vis = if (!fromRight) (dx / stepPx).roundToInt().coerceIn(0, n - 1)
                                               else ((dx / stepPx) + (n - 1)).roundToInt().coerceIn(0, n - 1)
                                     selectedAltIdx = vis
-                                    selectedAlt = if (!fromRight) alts[vis] else alts[n - 1 - vis]
+                                    selectedAlt = if (!fromRight) a[vis] else a[n - 1 - vis]
                                 }
                                 change.consume()
                             }
@@ -2248,11 +2264,11 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                             when {
                                 chosenAlt == "⚙" -> {                      // gear on the period opens settings
                                     finalizeComposing()
-                                    currentInputConnection?.deleteSurroundingText(label.length, 0)
+                                    currentInputConnection?.deleteSurroundingText(pressLabel.length, 0)
                                     openSettings()
                                 }
                                 composing.isNotEmpty() -> {                // swap the base letter inside the composing word
-                                    composing.setLength((composing.length - label.length).coerceAtLeast(0))
+                                    composing.setLength((composing.length - pressLabel.length).coerceAtLeast(0))
                                     composing.append(chosenAlt)
                                     currentInputConnection?.setComposingText(composing.toString(), 1)
                                     updateSuggestions()   // onUpdateSelection skips self-edits now, so refresh here
@@ -3248,6 +3264,15 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         if (best != null && best.second <= 0.65f) corr = best.first
                     }
                 }
+                // Diacritic restoration (Latvian etc.): typing the base letters where a diacritic
+                // belongs ("cau" → "čau", "ludzu" → "lūdzu") should ADD the diacritics, not pick a
+                // frequent unrelated same-distance word ("jau"). Uses a skeleton index so it finds the
+                // word even when it's rare (corpus-based dicts rank "čau" very low). Only for UNKNOWN
+                // words, so a correct base-letter word ("sava") is never forced into a diacritic form.
+                if (!SuggestionEngine.isKnown(learned, dictLangs(), UserDictionary.unigrams())) {
+                    val diacriticFix = SuggestionEngine.diacriticRestore(learned, dictLangs())
+                    if (diacriticFix != null) corr = diacriticFix
+                }
                 // Context correction of VALID words (Gboard's "magic"): a slip can form a real
                 // word ("знаю сто" for "знаю что"), which the unknown-word path never touches.
                 // Extremely conservative: only when the previous word's context STRONGLY expects
@@ -3431,29 +3456,29 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     /** The on-screen layout for [lang]: Russian is Cyrillic; English and Latvian share Latin/QWERTY. */
     private fun layoutOf(lang: String) = if (lang == "ru") "ru" else "latin"
 
-    /** Enabled dictionary languages that share the current keyboard's layout. With both English and
-     *  Latvian enabled they map to the one Latin keyboard, so suggestions, autocorrect and glide all
-     *  draw from both word lists at once — no toggling between two identical QWERTY layouts. */
-    private fun dictLangs(): List<String> {
-        val layout = layoutOf(currentLang.value)
-        return enabledLangs.value.filter { layoutOf(it) == layout }.ifEmpty { listOf(currentLang.value) }
-    }
+    /** The dictionary for the language being typed RIGHT NOW. Each enabled language is its own
+     *  keyboard with its own word list — English and Latvian are NOT merged anymore (switch between
+     *  them with the globe key / space-swipe), so suggestions/autocorrect stay clean per language
+     *  (e.g. Latvian "cau" → "čau" without English words like "car" outranking it). */
+    private fun dictLangs(): List<String> = listOf(currentLang.value)
 
-    // Cycle the keyboard across the user's enabled layouts (globe key / space-bar swipe). English and
-    // Latvian collapse into a single Latin stop, so the globe flips Latin <-> Cyrillic, not en/lv/ru.
+    // Cycle the keyboard across EACH enabled language (globe key / space-bar swipe): EN → LV → RU →
+    // EN. English and Latvian are now separate keyboards (own dictionary each), so the globe steps
+    // through them individually instead of treating en+lv as one Latin stop.
     private fun cycleLanguage() {
-        val stops = LinkedHashMap<String, String>()   // layout -> first enabled lang for it
-        for (l in enabledLangs.value) stops.putIfAbsent(layoutOf(l), l)
-        val cycle = stops.values.toList()
-        if (cycle.size <= 1) return   // only one layout enabled (e.g. en+lv) — nothing to switch to
-        finalizeComposing()   // commit the current word before switching layout
-        val idx = cycle.indexOfFirst { layoutOf(it) == layoutOf(currentLang.value) }.coerceAtLeast(0)
+        val cycle = enabledLangs.value
+        if (cycle.size <= 1) return   // only one language enabled — nothing to switch to
+        finalizeComposing()   // commit the current word before switching
+        val idx = cycle.indexOf(currentLang.value).coerceAtLeast(0)
         val next = cycle[(idx + 1) % cycle.size]
+        val layoutChanged = layoutOf(next) != layoutOf(currentLang.value)
         currentLang.value = next
         KeyboardPrefs.setCurrentLanguage(this, next)
-        keyBounds.clear()      // new layout's keys re-register their positions for glide typing
-        keyNeighbors = emptyMap()   // recomputed lazily for the new layout
-        recentTaps.clear()          // tap points belong to the old layout
+        if (layoutChanged) {
+            keyBounds.clear()      // a different layout's keys re-register their positions for glide
+            keyNeighbors = emptyMap()   // recomputed lazily for the new layout
+        }
+        recentTaps.clear()          // tap points belong to the previous language
         syncImeSubtype(next)   // best-effort: tell the OS our language (UI already switched)
         updateSuggestions()
     }

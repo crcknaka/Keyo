@@ -356,7 +356,7 @@ class SettingsActivity : ComponentActivity() {
                     }
                 }
             }
-            Hint("English and Latvian share one Latin keyboard — enable both for a bilingual layout whose suggestions, autocorrect and glide draw from both, with no language switching. Latvian diacritics (ā č ē ī š ž…) are on long-press. The 🌐 key (or a space-bar swipe) flips between Latin and Russian.")
+            Hint("Each language is a separate keyboard with its own dictionary, so suggestions and autocorrect stay clean per language (e.g. Latvian \"cau\" → \"čau\"). Switch between enabled languages with the 🌐 key or a space-bar swipe. English and Latvian share the same QWERTY layout; Latvian diacritics (ā č ē ī š ž…) are on long-press.")
         }
     }
 
@@ -406,7 +406,7 @@ class SettingsActivity : ComponentActivity() {
         var dictWords by remember { mutableStateOf(emptyList<String>()) }
         var dictQuery by remember { mutableStateOf("") }
         var newWord by remember { mutableStateOf("") }
-        var dictGroup by remember { mutableStateOf("ru") }   // which learned-words group is shown
+        var dictGroup by remember { mutableStateOf("en") }   // which learned-words group is shown
         LaunchedEffect(Unit) {
             UserDictionary.ensureLoaded(this@SettingsActivity)
             dictWords = UserDictionary.wordsByFrequency()
@@ -459,18 +459,24 @@ class SettingsActivity : ComponentActivity() {
                         Text("New words you keep (by tapping them) and words you add here appear in your dictionary. Common words aren't saved.",
                             color = textMuted, fontSize = 13.sp)
                     } else {
-                        // Split learned words by script: Cyrillic -> Russian, the rest -> English/Latvian.
+                        // Split learned words: Cyrillic → Russian; Latin WITH Latvian diacritics →
+                        // Latvian; the rest of Latin → English. Words have no language tag, so a
+                        // plain-Latin Latvian word (no diacritics) falls under English — by letters
+                        // alone it can't be told apart from English.
+                        val lvMarks = "āčēģīķļņšūž"
                         val ruWords = dictWords.filter { w -> w.any { it in 'а'..'я' || it == 'ё' } }
-                        val latinWords = dictWords.filter { w -> w.none { it in 'а'..'я' || it == 'ё' } }
+                        val lvWords = dictWords.filter { w -> w.none { it in 'а'..'я' || it == 'ё' } && w.any { it in lvMarks } }
+                        val enWords = dictWords.filter { w -> w.none { it in 'а'..'я' || it == 'ё' } && w.none { it in lvMarks } }
                         Spacer(Modifier.height(12.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            GroupChip("🇷🇺 Russian", ruWords.size, dictGroup == "ru", Modifier.weight(1f)) { dictGroup = "ru" }
-                            GroupChip("EN / LV", latinWords.size, dictGroup == "latin", Modifier.weight(1f)) { dictGroup = "latin" }
+                            GroupChip("🇬🇧 EN", enWords.size, dictGroup == "en", Modifier.weight(1f)) { dictGroup = "en" }
+                            GroupChip("🇱🇻 LV", lvWords.size, dictGroup == "lv", Modifier.weight(1f)) { dictGroup = "lv" }
+                            GroupChip("🇷🇺 RU", ruWords.size, dictGroup == "ru", Modifier.weight(1f)) { dictGroup = "ru" }
                         }
                         Spacer(Modifier.height(10.dp))
                         PlainField(dictQuery, "Search words…", singleLine = true) { dictQuery = it }
                         Spacer(Modifier.height(8.dp))
-                        val source = if (dictGroup == "ru") ruWords else latinWords
+                        val source = when (dictGroup) { "ru" -> ruWords; "lv" -> lvWords; else -> enWords }
                         val q = dictQuery.trim().lowercase()
                         val filtered = if (q.isEmpty()) source else source.filter { it.contains(q) }
                         if (filtered.isEmpty()) {
