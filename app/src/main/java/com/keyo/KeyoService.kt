@@ -529,7 +529,6 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     @Composable
     fun KeyboardLayout() {
         val lang by currentLang
-        val status by statusText
         val shift by isShift
         val mode by keyboardMode
         val numberRow by showNumberRow
@@ -558,7 +557,8 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                          bottom = (4 + bottomOffsetDp.intValue).dp)
         ) {
             // Dynamic top toolbar (Gboard-style). Priority: status > quick-paste chip > icons.
-            TopToolbar(status, textColor, accentColor)
+            // It reads statusText itself, so status changes never recompose the key grid below.
+            TopToolbar(textColor, accentColor)
 
             // Confirmation bar for consequential AI actions (call / SMS).
             val confirmText by pendingConfirm
@@ -1011,7 +1011,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
 
     // Dynamic top toolbar (Gboard-style): status text, a quick-paste chip, or action icons.
     @Composable
-    fun TopToolbar(status: String, textColor: Color, accentColor: Color) {
+    fun TopToolbar(textColor: Color, accentColor: Color) {
+        // Read statusText HERE (not in KeyboardLayout) so a status change (voice/AI/hints) recomposes
+        // only this toolbar, never the key grid.
+        val status by statusText
         val chip by showClipChip
         val clip by lastClip
         val undo by showUndoRewrite
@@ -2530,9 +2533,12 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         val cands = near.map { it.key to (it.value.center - point).getDistance() / kw }
         val prefix = composing.toString().lowercase()
         val langs = dictLangs()
-        val uni = UserDictionary.unigrams()
+        // Runs on the critical path (before the letter appears). Use ONLY the frequency-sorted bundled
+        // vocab — its prefix scan early-exits at the first match. We skip the personal-dict scan, which
+        // folds + startsWith on every entry per call (no early exit when nothing matches) and added
+        // latency to fast edge-taps; bundled vocab + finger position still drive the choice.
         val chosen = SuggestionEngine.chooseKey(lower, cands) { c ->
-            SuggestionEngine.prefixStrength(prefix + c, langs, uni)
+            SuggestionEngine.prefixStrength(prefix + c, langs, emptyMap())
         }
         if (chosen == lower) return tapped
         return if (tapped.isUpperCase()) chosen.uppercaseChar() else chosen
@@ -3796,7 +3802,28 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
 
                 GroqApi.transcribe(audioFile) { text, error ->
                     if (text != null) {
-                        if (KeyboardPrefs.isAutocorrectEnabled(this@KeyoService)) {
+                        val cleanup = KeyboardPrefs.isAutocorrectEnabled(this@KeyoService)
+                        val instant = KeyboardPrefs.isInstantDictation(this@KeyoService)
+                        if (cleanup && instant) {
+                            // Instant dictation: show the raw transcription right away in the composing
+                            // region (text appears after ONE round-trip), then swap in the cleaned
+                            // version when it arrives — setComposingText replaces it cleanly.
+                            handler.post {
+                                try {
+                                    currentInputConnection?.setComposingText(text, 1)
+                                    statusText.value = "🧹 Cleaning up…"
+                                } catch (_: Exception) {}
+                            }
+                            GroqApi.cleanupText(text) { cleaned, _ ->
+                                handler.post {
+                                    try {
+                                        if (cleaned != null && cleaned != text) currentInputConnection?.setComposingText(cleaned, 1)
+                                        currentInputConnection?.finishComposingText()
+                                    } catch (_: Exception) {}
+                                    statusText.value = ""
+                                }
+                            }
+                        } else if (cleanup) {
                             handler.post { statusText.value = "🧹 Cleaning up..." }
                             GroqApi.cleanupText(text) { cleaned, _ ->
                                 handler.post {

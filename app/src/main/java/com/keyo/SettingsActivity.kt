@@ -366,6 +366,7 @@ class SettingsActivity : ComponentActivity() {
         var selectedAiModel by remember { mutableStateOf(KeyboardPrefs.getAiModel(this@SettingsActivity)) }
         var autocorrect by remember { mutableStateOf(KeyboardPrefs.isAutocorrectEnabled(this@SettingsActivity)) }
         var liveDictation by remember { mutableStateOf(KeyboardPrefs.isLiveDictation(this@SettingsActivity)) }
+        var instantDictation by remember { mutableStateOf(KeyboardPrefs.isInstantDictation(this@SettingsActivity)) }
 
         SubScreen("Voice & AI", onBack) {
             SectionLabel("Models")
@@ -382,6 +383,10 @@ class SettingsActivity : ComponentActivity() {
                 Sep()
                 ToggleRow("Dictation cleanup", "Tidies up dictation: punctuation, fillers, casing", autocorrect) {
                     autocorrect = it; KeyboardPrefs.setAutocorrectEnabled(this@SettingsActivity, it)
+                }
+                Sep()
+                ToggleRow("Instant dictation", "With cleanup on: insert the text right away, then tidy it a moment later — instead of waiting for both steps", instantDictation) {
+                    instantDictation = it; KeyboardPrefs.setInstantDictation(this@SettingsActivity, it)
                 }
             }
             Hint("Voice and AI use the Groq API. They're disabled in password fields.")

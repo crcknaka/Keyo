@@ -30,6 +30,7 @@ object KeyboardPrefs {
     private const val KEY_AUTOCORRECT_TYPING = "autocorrect_typing"
     private const val KEY_SWIPE_TYPING = "swipe_typing"
     private const val KEY_LIVE_DICTATION = "live_dictation"
+    private const val KEY_INSTANT_DICTATION = "instant_dictation"
 
     // Defaults / ranges for the visual size editor.
     const val DEFAULT_KEY_HEIGHT = 48
@@ -297,6 +298,11 @@ object KeyboardPrefs {
      *  Off by default; the standard path transcribes once on release. */
     fun isLiveDictation(context: Context) = prefs(context).getBoolean(KEY_LIVE_DICTATION, false)
     fun setLiveDictation(context: Context, v: Boolean) = prefs(context).edit().putBoolean(KEY_LIVE_DICTATION, v).apply()
+
+    /** When dictation cleanup is on: insert the raw transcription immediately and swap in the cleaned
+     *  version a moment later (one round-trip to first text instead of two). On by default. */
+    fun isInstantDictation(context: Context) = prefs(context).getBoolean(KEY_INSTANT_DICTATION, true)
+    fun setInstantDictation(context: Context, v: Boolean) = prefs(context).edit().putBoolean(KEY_INSTANT_DICTATION, v).apply()
 
     private fun saveClips(context: Context, list: List<String>) {
         val arr = JSONArray()
