@@ -356,7 +356,7 @@ class SettingsActivity : ComponentActivity() {
                     }
                 }
             }
-            Hint("Each language is a separate keyboard with its own dictionary, so suggestions and autocorrect stay clean per language (e.g. Latvian \"cau\" → \"čau\"). Switch between enabled languages with the 🌐 key or a space-bar swipe. English and Latvian share the same QWERTY layout; Latvian diacritics (ā č ē ī š ž…) are on long-press.")
+            Hint("Each language is a separate keyboard with its own dictionary, so suggestions and autocorrect stay clean per language (e.g. Latvian \"cau\" → \"čau\"). Switch between enabled languages with the 🌐 key. English and Latvian share the same QWERTY layout; Latvian diacritics (ā č ē ī š ž…) are on long-press.")
         }
     }
 
@@ -450,8 +450,16 @@ class SettingsActivity : ComponentActivity() {
                     PlainField(newWord, "Add a word…", singleLine = true) { newWord = it }
                     Spacer(Modifier.height(8.dp))
                     PrimaryButton("Add word") {
+                        val added = newWord.trim().lowercase()
                         if (UserDictionary.addWord(newWord)) {
                             UserDictionary.save(this@SettingsActivity); newWord = ""; refreshDict()
+                            // Jump to the group the word files under, so the add is visibly confirmed
+                            // (adding "čau" while the EN chip is selected would otherwise look lost).
+                            dictGroup = when {
+                                added.any { it in 'а'..'я' || it == 'ё' } -> "ru"
+                                added.any { it in "āčēģīķļņšūž" } -> "lv"
+                                else -> "en"
+                            }
                         }
                     }
                     if (dictWords.isEmpty()) {

@@ -170,6 +170,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     // previous word ("чау как" -> "чаук ак"). So a space tap is marked "pending" on key-down and the
     // next character flushes it first, keeping the real key order.
     private var pendingSpaceTap = false
+    // When the last of OUR OWN edits happened. onUpdateSelection uses this to tell a stale
+    // out-of-order callback (arrives milliseconds after our keystroke) from a genuine external
+    // finalize of the composing region while the keyboard is idle.
+    private var lastSelfEditMs = 0L
     // Live glide preview: the current best guess shown above the keys while the finger is still
     // swiping (Gboard-style). Throttled: one background decode in flight, every ~6 new points.
     private val glidePreview = mutableStateOf<String?>(null)
@@ -250,13 +254,22 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         enabledLangs.value = KeyboardPrefs.getEnabledLanguages(this)
         // If the user disabled the currently-active language in Settings, switch to a still-enabled
         // one immediately so the layout doesn't keep showing a disabled language until field restart.
+        // Mirror cycleLanguage's cleanup: stale Cyrillic keyBounds/keyNeighbors after a ru↔latin
+        // change would silently degrade glide + spatial autocorrect.
         if (enabledLangs.value.isNotEmpty() && currentLang.value !in enabledLangs.value) {
+            val old = currentLang.value
             currentLang.value = enabledLangs.value.first()
             KeyboardPrefs.setCurrentLanguage(this, currentLang.value)
+            if (layoutOf(currentLang.value) != layoutOf(old)) {
+                keyBounds.clear()
+                keyNeighbors = emptyMap()
+            }
+            recentTaps.clear()
         }
         if (enabledLangs.value != langsBefore) {
-            // A language was just enabled in Settings — load its dictionary in the background.
-            val langs = enabledLangs.value + currentLang.value
+            // A language was just enabled in Settings — load its dictionary in the background
+            // (current language first, same reason as in onCreate).
+            val langs = listOf(currentLang.value) + enabledLangs.value
             serviceScope.launch(kotlinx.coroutines.Dispatchers.IO) {
                 SuggestionEngine.ensureLoaded(this@KeyoService, langs)
             }
@@ -293,7 +306,12 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         // never gets parsed into RAM). Newly enabled languages load via reloadPrefs.
         serviceScope.launch(kotlinx.coroutines.Dispatchers.IO) {
             UserDictionary.ensureLoaded(this@KeyoService)
-            SuggestionEngine.ensureLoaded(this@KeyoService, enabledLangs.value + currentLang.value)
+            // Current language FIRST: ensureLoaded parses in list order, and until the active
+            // language's dict lands, suggestions/autocorrect are gated off (isLangLoaded) — so the
+            // shorter this window, the sooner the keyboard is smart in the language being typed.
+            // (currentLang.value may still be the default here; the pref is the truth.)
+            SuggestionEngine.ensureLoaded(this@KeyoService,
+                listOf(KeyboardPrefs.getCurrentLanguage(this@KeyoService)) + enabledLangs.value)
         }
         // The first Compose composition of the whole keyboard takes hundreds of ms and normally
         // happens INSIDE the first show-IME transaction, blocking this process's main thread while
@@ -959,9 +977,9 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 }
 
                 // Space — shared component (tap = space, hold = dictate, swipe = cursor slider).
-                // The label names every language sharing the active layout, so the bilingual Latin
-                // keyboard reads "EN+LV" when both are enabled (just "EN"/"RU"/"LV" otherwise).
-                val spaceLabel = if (mode == "abc") dictLangs().joinToString("+") { it.uppercase() } else "space"
+                // The label names the CURRENT language ("EN"/"LV"/"RU") — each language is its own
+                // keyboard with its own dictionary now.
+                val spaceLabel = if (mode == "abc") lang.uppercase() else "space"
                 SpaceKey(Modifier.weight(3.5f), spaceLabel, keyColor, textColor, accentColor, recordColor)
 
                 // Period — long press shows ? , ! -
@@ -2018,39 +2036,28 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private fun modeKeyFont(): androidx.compose.ui.unit.TextUnit =
         (KeyboardPrefs.fontSizeSp(keyHeightDp.intValue, keyVGapDp.intValue) * 0.72f).sp
 
-    // ---- Rich formatting (bold / italic) ----
+    // ---- AI-output emphasis ----
     private fun currentPkg(): String = currentInputEditorInfo?.packageName ?: ""
-
-    // Map A-Z a-z 0-9 to Unicode mathematical bold/italic so they render styled in ANY app
-    // (Latin only — Cyrillic has no Unicode bold equivalents).
-    private fun toUnicodeStyled(s: String, italic: Boolean): String {
-        val sb = StringBuilder()
-        for (ch in s) {
-            val cp = when {
-                ch in 'A'..'Z' -> (if (italic) 0x1D434 else 0x1D400) + (ch - 'A')
-                ch in 'a'..'z' -> if (italic && ch == 'h') 0x210E
-                                  else (if (italic) 0x1D44E else 0x1D41A) + (ch - 'a')
-                !italic && ch in '0'..'9' -> 0x1D7CE + (ch - '0')
-                else -> ch.code
-            }
-            sb.appendCodePoint(cp)
-        }
-        return sb.toString()
-    }
 
     private fun isWhatsApp() = currentPkg().let { it == "com.whatsapp" || it == "com.whatsapp.w4b" }
 
     private fun applyBold(text: String): String =
-        if (isWhatsApp()) "*$text*" else toUnicodeStyled(text, italic = false)
+        if (isWhatsApp()) "*$text*" else text     // WhatsApp renders *text* natively as bold
 
     private fun applyItalic(text: String): String =
-        if (isWhatsApp()) "_${text}_" else toUnicodeStyled(text, italic = true)
+        if (isWhatsApp()) "_${text}_" else text   // WhatsApp renders _text_ natively as italic
 
-    // Convert the AI's ⟦b⟧/⟦i⟧ markers into real per-app formatting.
+    // The AI's ⟦b⟧/⟦i⟧ emphasis markers: WhatsApp gets its native * / _ markup; everywhere else the
+    // markers are simply stripped and the text stays PLAIN. (We used to map emphasis to Unicode
+    // "mathematical bold/italic" glyphs — that looked like the keyboard changed the font, broke
+    // search/copy/screen-readers, and users hated it. Never again.) Stray markdown **…** from the
+    // model is stripped for the same reason.
     private fun formatEmphasis(text: String): String {
         var t = Regex("⟦b⟧(.*?)⟦/b⟧", RegexOption.DOT_MATCHES_ALL).replace(text) { applyBold(it.groupValues[1]) }
         t = Regex("⟦i⟧(.*?)⟦/i⟧", RegexOption.DOT_MATCHES_ALL).replace(t) { applyItalic(it.groupValues[1]) }
-        return t.replace("⟦b⟧", "").replace("⟦/b⟧", "").replace("⟦i⟧", "").replace("⟦/i⟧", "")
+        t = t.replace("⟦b⟧", "").replace("⟦/b⟧", "").replace("⟦i⟧", "").replace("⟦/i⟧", "")
+        if (!isWhatsApp()) t = Regex("\\*\\*(.+?)\\*\\*", RegexOption.DOT_MATCHES_ALL).replace(t) { it.groupValues[1] }
+        return t
     }
 
     // Selected text, or the text just before the cursor (for AI features).
@@ -2161,6 +2168,12 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     ) {
         var pressed by remember { mutableStateOf(false) }
         var showAlts by remember { mutableStateOf(false) }
+        // The popup renders THIS list — snapshotted when the long-press fires, so what you see is
+        // exactly what the selection math uses. Rendering the live `alts` instead would desync from
+        // the gesture whenever the key recomposes mid-press (Shift consumed on key-down flips
+        // "C"→"c", whose alt list can differ in content and LENGTH — e.g. "s" has ß but "S" doesn't).
+        var shownAlts by remember { mutableStateOf<List<String>?>(null) }
+        var shownFromRight by remember { mutableStateOf(false) }
         var selectedAltIdx by remember { mutableIntStateOf(-1) }   // visual index in the popup row
         var keyCenterX by remember { mutableFloatStateOf(0f) }
         // Long-press digit when the number row is hidden; it becomes the primary alternate.
@@ -2171,9 +2184,6 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         val screenWidthPx = with(androidx.compose.ui.platform.LocalDensity.current) {
             androidx.compose.ui.platform.LocalConfiguration.current.screenWidthDp.dp.toPx()
         }
-        // Near the right screen edge the alt popup extends LEFT from the key (with the row reversed)
-        // so the window edge never clamps it — clamping would break the finger-to-item mapping.
-        val popupFromRight = keyCenterX > screenWidthPx / 2f
         // Read the latest label/alts/onClick from inside the long-lived gesture WITHOUT restarting it.
         // (Keying pointerInput on `label` used to cancel an in-flight long-press the moment Shift was
         // consumed — label "C"→"c" — so accent popups never opened while Shift was on.)
@@ -2219,6 +2229,8 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                             if (pressed && pressHasAlts && a != null && a.isNotEmpty() && !glideActive.value) {
                                 longPressed = true
                                 showAlts = true
+                                shownAlts = a              // popup shows the same list the gesture uses
+                                shownFromRight = fromRight
                                 // Default to the primary alternate (Gboard-style): releasing
                                 // without moving the finger inserts it.
                                 selectedAlt = a.first()
@@ -2254,6 +2266,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         longPressJob.cancel()
                         pressed = false
                         showAlts = false
+                        shownAlts = null
                         selectedAltIdx = -1
 
                         // The base character was already committed on key-down. On long-press,
@@ -2268,13 +2281,18 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                     openSettings()
                                 }
                                 composing.isNotEmpty() -> {                // swap the base letter inside the composing word
-                                    composing.setLength((composing.length - pressLabel.length).coerceAtLeast(0))
-                                    composing.append(chosenAlt)
-                                    currentInputConnection?.setComposingText(composing.toString(), 1)
-                                    updateSuggestions()   // onUpdateSelection skips self-edits now, so refresh here
+                                    // Rollover guard: only splice if the buffer actually ends with THIS
+                                    // key's character — a second finger may have typed another letter
+                                    // after ours (then replacing the tail would corrupt the wrong char).
+                                    if (composing.toString().endsWith(pressLabel, ignoreCase = true)) {
+                                        composing.setLength((composing.length - pressLabel.length).coerceAtLeast(0))
+                                        composing.append(chosenAlt)
+                                        currentInputConnection?.setComposingText(composing.toString(), 1)
+                                        updateSuggestions()   // onUpdateSelection skips self-edits now, so refresh here
+                                    }
                                 }
                                 else -> {                                   // base char already committed: patch it in place
-                                    currentInputConnection?.deleteSurroundingText(label.length, 0)
+                                    currentInputConnection?.deleteSurroundingText(pressLabel.length, 0)
                                     commitText(chosenAlt)
                                 }
                             }
@@ -2332,14 +2350,17 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             // Alt characters popup — uses Popup to escape parent clipping. The row is anchored so
             // the PRIMARY alternate sits directly above the key (reversed and extending left near
             // the right screen edge), matching the finger-travel selection math in the gesture.
-            if (showAlts && alts != null) {
-                val display = if (popupFromRight) alts.asReversed() else alts
-                val anchorShift = ((alts.size * 40 + 8) / 2 - 24).dp
+            // Renders the press-time snapshot (shownAlts/shownFromRight) so it can never desync from
+            // what the finger actually selects, even if the key recomposes mid-press.
+            val popupAlts = shownAlts
+            if (showAlts && popupAlts != null) {
+                val display = if (shownFromRight) popupAlts.asReversed() else popupAlts
+                val anchorShift = ((popupAlts.size * 40 + 8) / 2 - 24).dp
                 androidx.compose.ui.window.Popup(
                     alignment = Alignment.TopCenter,
                     offset = with(androidx.compose.ui.platform.LocalDensity.current) {
                         androidx.compose.ui.unit.IntOffset(
-                            (if (popupFromRight) -anchorShift else anchorShift).roundToPx(),
+                            (if (shownFromRight) -anchorShift else anchorShift).roundToPx(),
                             (-56).dp.roundToPx()
                         )
                     }
@@ -2786,17 +2807,36 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         }
     }
 
+    /** Flush a space tap whose finger-up hasn't arrived yet (fast-typing overlap), applying the SAME
+     *  smart-space rules a normal space tap would — swallow a redundant space after a glide/suggestion
+     *  auto-space, honour double-space→period — so the flush can't produce "word  x" or lose the
+     *  period a fast double-space deserved. */
+    private fun flushPendingSpace() {
+        if (!pendingSpaceTap) return
+        pendingSpaceTap = false
+        val ic = currentInputConnection ?: return
+        // Auto-space already present (glide / suggestion tap): the flushed space is redundant.
+        if ((glideWord != null || pendingAutoSpace) && ic.getTextBeforeCursor(1, 0)?.toString() == " ") return
+        if (doubleSpaceOn) {
+            val before = ic.getTextBeforeCursor(2, 0)?.toString() ?: ""
+            if (before.length == 2 && before[1] == ' ' && before[0].isLetterOrDigit()) {
+                ic.deleteSurroundingText(1, 0)
+                ic.commitText(". ", 1)
+                return
+            }
+        }
+        finishWord()
+        ic.commitText(" ", 1)
+    }
+
     // Note: haptic feedback is triggered by the caller (KeyButton tap / custom keys),
     // not here, so every key vibrates exactly once.
     private fun commitChar(char: Char) {
         val ic = currentInputConnection
-        // Flush a still-pending space tap (its key-up hasn't arrived yet) BEFORE this character, so a
-        // fast next-letter keypress lands after the space instead of gluing onto the previous word.
-        if (pendingSpaceTap) {
-            pendingSpaceTap = false
-            finishWord()
-            ic?.commitText(" ", 1)
-        }
+        lastSelfEditMs = System.currentTimeMillis()
+        // Flush a still-pending space tap BEFORE this character, so a fast next-key press lands
+        // after the space instead of gluing onto the previous word.
+        flushPendingSpace()
         autocorrectUndo = null   // typing past a just-corrected word accepts the correction
         val hadAutoSpace = pendingAutoSpace
         pendingAutoSpace = false
@@ -2964,7 +3004,11 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
      *  happen here on the main thread; the dictionary scans (the expensive part — full-vocab prefix
      *  scan + edit-distance pass) run on a background dispatcher so fast typing never janks the UI. */
     private fun runUpdateSuggestions() {
-        if (secureField || fieldNoSuggestions || !suggestionsOn || !SuggestionEngine.isReady()) {
+        // isLangLoaded: while the CURRENT language's dictionary is still parsing (cold start),
+        // vocab() would fall back to English — better to show nothing for that moment than
+        // English suggestions on a Latvian/Russian keyboard.
+        if (secureField || fieldNoSuggestions || !suggestionsOn || !SuggestionEngine.isReady() ||
+            !SuggestionEngine.isLangLoaded(currentLang.value)) {
             setSuggestions(emptyList(), null); return
         }
         // Never let a suggestion computation crash the IME — onUpdateSelection runs this and an
@@ -3224,8 +3268,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         var finalWord = word
         // English niceties applied FIRST (so autocorrect can't mangle "dont" -> "done"): a standalone
         // "i"/"i'..." -> "I...", and apostrophe-less contractions (dont -> don't, im -> I'm, youre ->
-        // you're, ...). Only when English is active, independent of the autocorrect toggle, and NOT
-        // Backspace-revertable. Forms that are valid words on their own are kept out of enContractions.
+        // you're, ...). Only when English is the active keyboard, independent of the autocorrect
+        // toggle. NOTE: the expanded dictionary contains some of these raw forms ("im", "dont") as
+        // frequent tokens — the contraction fix deliberately overrides isKnown for them; a revert
+        // (Backspace / ↩ chip) whitelists the raw form for the session via revertedWords.
         var enFixed = false
         if ("en" in dictLangs() && !revertedWords.contains(SuggestionEngine.fold(learned))) {
             val c = enContractions[finalWord.lowercase()]
@@ -3238,6 +3284,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         // We only auto-apply single-edit fixes — without word context, 2-edit guesses miss too often
         // (and stay available as tap suggestions). Words the user reverted this session are left alone.
         if (!enFixed && autocorrectTypingOn && SuggestionEngine.isReady() && word.length >= 3 &&
+            SuggestionEngine.isLangLoaded(currentLang.value) &&   // never autocorrect against the English fallback vocab
             !revertedWords.contains(SuggestionEngine.fold(learned))) {
             try {
                 // Spatial-aware: among ranked corrections, apply the top single-edit fix (as before),
@@ -3340,10 +3387,15 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 // callback from a prior commit (e.g. the boundary space, which has no composing region)
                 // that arrives AFTER we already started a new composing word. Clearing the buffer then
                 // would let the next setComposingText overwrite the new word's first letter
-                // ("чау как" -> "чау ак"). So only drop the buffer if the word is really gone from the
-                // field; if it's still right before the cursor, the -1 is stale — keep the buffer.
-                candidatesStart == -1 ->
-                    if (!currentWordBeforeCursor().endsWith(composing.toString())) composing.clear()
+                // ("чау как" -> "чау ак"). Keep the buffer ONLY when this looks like that race: our own
+                // keystroke happened moments ago AND the word is still right before the cursor. A -1
+                // arriving while the keyboard is idle is a genuine external finalize (e.g. the app's
+                // own TextWatcher) — keeping the buffer then would duplicate the word on the next key.
+                candidatesStart == -1 -> {
+                    val staleRace = System.currentTimeMillis() - lastSelfEditMs < 500 &&
+                        currentWordBeforeCursor().endsWith(composing.toString())
+                    if (!staleRace) composing.clear()
+                }
                 // Self-generated update from typing/backspace: commitChar/deleteSmart already refreshed
                 // the strip + auto-shift, so skip the redundant (and costly) recompute.
                 caretAtComposingEnd -> return
@@ -3414,6 +3466,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     }
 
     private fun commitText(text: String) {
+        flushPendingSpace()   // a fast digit/symbol/emoji tap must not overtake a pending space tap
         finalizeComposing()   // symbols / digits / paste / emoji end the current word first
         currentInputConnection?.commitText(text, 1)
         // Emoticons ending in a symbol/digit (e.g. :) :( ;) :/ <3) complete here.
@@ -3462,15 +3515,15 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
      *  (e.g. Latvian "cau" → "čau" without English words like "car" outranking it). */
     private fun dictLangs(): List<String> = listOf(currentLang.value)
 
-    // Cycle the keyboard across EACH enabled language (globe key / space-bar swipe): EN → LV → RU →
-    // EN. English and Latvian are now separate keyboards (own dictionary each), so the globe steps
-    // through them individually instead of treating en+lv as one Latin stop.
+    // Cycle the keyboard across EACH enabled language (globe key): EN → LV → RU → EN. English and
+    // Latvian are separate keyboards (own dictionary each), so the globe steps through them
+    // individually instead of treating en+lv as one Latin stop.
     private fun cycleLanguage() {
         val cycle = enabledLangs.value
         if (cycle.size <= 1) return   // only one language enabled — nothing to switch to
         finalizeComposing()   // commit the current word before switching
-        val idx = cycle.indexOf(currentLang.value).coerceAtLeast(0)
-        val next = cycle[(idx + 1) % cycle.size]
+        val idx = cycle.indexOf(currentLang.value)
+        val next = if (idx < 0) cycle[0] else cycle[(idx + 1) % cycle.size]
         val layoutChanged = layoutOf(next) != layoutOf(currentLang.value)
         currentLang.value = next
         KeyboardPrefs.setCurrentLanguage(this, next)
@@ -3479,6 +3532,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             keyNeighbors = emptyMap()   // recomputed lazily for the new layout
         }
         recentTaps.clear()          // tap points belong to the previous language
+        revertedWords.clear()       // reverts are per-language decisions (e.g. "cau" EN vs LV)
         syncImeSubtype(next)   // best-effort: tell the OS our language (UI already switched)
         updateSuggestions()
     }
@@ -3529,7 +3583,13 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             val layoutChanged = layoutOf(lang) != layoutOf(currentLang.value)
             currentLang.value = lang
             KeyboardPrefs.setCurrentLanguage(this, lang)
-            if (layoutChanged) { keyBounds.clear(); keyNeighbors = emptyMap(); recentTaps.clear() }   // en<->lv keep the same Latin key positions
+            if (layoutChanged) { keyBounds.clear(); keyNeighbors = emptyMap() }   // en<->lv keep the same Latin key positions
+            recentTaps.clear()   // tap points belong to the previous language
+            // The OS can hand us a language that isn't in enabledLangs — its dictionary was never
+            // loaded and everything would silently fall back to English until the next field start.
+            serviceScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                SuggestionEngine.ensureLoaded(this@KeyoService, listOf(lang))
+            }
             handler.post { updateSuggestions() }
         }
     }
@@ -3648,6 +3708,8 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
 
     private fun deleteSmart(byWord: Boolean) {
         performKeyFeedback()
+        lastSelfEditMs = System.currentTimeMillis()
+        flushPendingSpace()   // keep real key order: a space tapped before this backspace lands first
         pendingAutoSpace = false
         val ic = currentInputConnection ?: return
 
@@ -3830,20 +3892,31 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         val cleanup = KeyboardPrefs.isAutocorrectEnabled(this@KeyoService)
                         val instant = KeyboardPrefs.isInstantDictation(this@KeyoService)
                         if (cleanup && instant) {
-                            // Instant dictation: show the raw transcription right away in the composing
-                            // region (text appears after ONE round-trip), then swap in the cleaned
-                            // version when it arrives — setComposingText replaces it cleanly.
+                            // Instant dictation: COMMIT the raw transcription right away (text appears
+                            // after one round-trip). NOT a composing span — a composing span would be
+                            // silently replaced by the user's next keystroke/backspace, destroying the
+                            // whole dictation. When the cleaned version arrives, swap it in ONLY if the
+                            // raw text is still untouched right before the cursor; any edit the user
+                            // made meanwhile (or a switch to another field) wins and the cleanup result
+                            // is dropped.
                             handler.post {
                                 try {
-                                    currentInputConnection?.setComposingText(text, 1)
+                                    currentInputConnection?.commitText(text, 1)
                                     statusText.value = "🧹 Cleaning up…"
                                 } catch (_: Exception) {}
                             }
                             GroqApi.cleanupText(text) { cleaned, _ ->
                                 handler.post {
                                     try {
-                                        if (cleaned != null && cleaned != text) currentInputConnection?.setComposingText(cleaned, 1)
-                                        currentInputConnection?.finishComposingText()
+                                        if (cleaned != null && cleaned != text) {
+                                            val c = currentInputConnection
+                                            if (c?.getTextBeforeCursor(text.length, 0)?.toString() == text) {
+                                                c.beginBatchEdit()
+                                                c.deleteSurroundingText(text.length, 0)
+                                                c.commitText(cleaned, 1)
+                                                c.endBatchEdit()
+                                            }
+                                        }
                                     } catch (_: Exception) {}
                                     statusText.value = ""
                                 }

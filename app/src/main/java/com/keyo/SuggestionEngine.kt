@@ -35,6 +35,11 @@ object SuggestionEngine {
 
     fun isReady(): Boolean = byLang.isNotEmpty()
 
+    /** True once [lang]'s own dictionary is parsed. While false, vocab(lang) silently falls back to
+     *  English — callers gating on this avoid English suggestions/autocorrect on e.g. a Latvian
+     *  keyboard during the first moments after a cold start. */
+    fun isLangLoaded(lang: String): Boolean = byLang.containsKey(lang)
+
     /** Loads the bundled dictionaries + bigram models for [langs] from assets (all languages when
      *  omitted). Call from a background thread; idempotent and cheap once loaded. */
     fun ensureLoaded(context: Context, langs: List<String> = listOf("en", "ru", "lv")) {
@@ -67,6 +72,8 @@ object SuggestionEngine {
                 } catch (_: Exception) { /* missing model -> no bundled context for this language */ }
                 bundledBigrams[lang] = bg
                 byLang[lang] = Vocab(words, folded)   // publish last: isReady/vocab see a complete pair
+                diacriticIndex(lang)   // pre-build here on the IO thread — the first word boundary
+                                       // shouldn't pay a full-dict fold scan on the main thread
             }
         }
     }

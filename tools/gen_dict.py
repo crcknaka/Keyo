@@ -66,10 +66,17 @@ if base:
     with open(base, encoding='utf-8') as f:
         for line in f:
             w = line.strip()
-            if w and w not in seen:
-                seen.add(w)
-                out.append(w)
-                kept_old += 1
+            # Apply the SAME junk filters to inherited words — old dictionaries carried
+            # single-letter noise ("l", "s", …) that --base would otherwise reimport forever.
+            if not w or w in seen or not pat.match(w):
+                continue
+            if len(w) == 1 and w not in single_ok:
+                continue
+            if len(w) > 24 or triple.search(w):
+                continue
+            seen.add(w)
+            out.append(w)
+            kept_old += 1
 
 with open(outfile, 'w', encoding='utf-8') as f:
     f.write('\n'.join(out) + '\n')

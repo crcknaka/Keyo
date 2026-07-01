@@ -49207,34 +49207,25 @@ sasodīts
 atā
 nīl
 nolādēts
-s
 džek
-o
 pagaidiet
 aizveries
 hallo
 jēziņ
 hārvij
-i
 nomierinies
-u
 apsolu
 nīls
-a
 izdarīji
 paklausies
 redzēji
-j
-t
 kāp
 džon
 draudziņ
 paga
 celies
-b
 mister
 doktor
-m
 oh
 paklau
 jaunkundz
@@ -49267,7 +49258,6 @@ stjū
 parāvis
 alan
 brāl
-l
 arlabunakti
 sem
 dabūšu
@@ -49298,7 +49288,6 @@ stāt
 jaunkundze
 mārtij
 tēvoci
-d
 pazūdi
 pateici
 kruķi
@@ -49327,7 +49316,6 @@ neskaties
 aleksa
 kuces
 apsoli
-c
 bērk
 džim
 džordž
@@ -49448,7 +49436,6 @@ kevin
 poters
 mīļumiņ
 džonij
-r
 atvedi
 džef
 izglābi
@@ -49529,7 +49516,6 @@ liecies
 džonss
 foulers
 nākšu
-n
 tedij
 griez
 meloji
@@ -49713,7 +49699,6 @@ paej
 tēmē
 pītera
 mama
-x
 maikl
 ešlija
 noa
@@ -49730,13 +49715,11 @@ gulties
 paņemsim
 drīksti
 nepateici
-k
 vils
 gļēvulis
 gendalf
 uzmani
 henks
-e
 blū
 laumiņu
 loru
@@ -50047,7 +50030,6 @@ kaleb
 ķeries
 pazūdam
 meloja
-h
 steidzies
 nelaid
 burvestības
@@ -50064,7 +50046,6 @@ resnais
 izpalīdzēt
 mako
 jāparunā
-g
 atzvanīšu
 rītvakar
 šauju
@@ -50094,7 +50075,6 @@ sadošu
 darījāt
 neatgriezīšos
 palaidi
-v
 māmiņ
 muļķe
 nokavēju
@@ -50139,7 +50119,6 @@ mērij
 tonijs
 senna
 pārinieks
-z
 medī
 izklaidējies
 nosauci
@@ -50973,7 +50952,6 @@ pavēlēm
 sajucis
 izsekoju
 pārdevi
-p
 virve
 apsēsts
 teds
