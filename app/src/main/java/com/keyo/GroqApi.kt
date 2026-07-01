@@ -122,7 +122,8 @@ object GroqApi {
         val sys = "You are a precise text-editing tool. Apply the user's instruction to their text and " +
             "output ONLY the resulting text — no explanations, no quotes, no preamble. " +
             "Keep the original language unless the instruction says to translate. " +
-            "NEVER output HTML or markdown tags; for emphasis use markers ⟦b⟧bold⟦/b⟧ and ⟦i⟧italic⟦/i⟧."
+            "PLAIN TEXT ONLY: no markdown or HTML, no asterisks/underscores/backticks, no emphasis " +
+            "markers of any kind, no decorative symbols — the text goes into a plain input field as-is."
         val messages = JSONArray().apply {
             put(JSONObject().apply { put("role", "system"); put("content", sys) })
             put(JSONObject().apply { put("role", "user"); put("content", "Instruction: $instruction\n\nText:\n$text") })
@@ -166,7 +167,7 @@ Rules:
 - When using tools, after getting the result, provide a brief human-friendly summary.
 - Reply in the same language the user spoke in (English, Russian, or Latvian).
 - Be concise and natural.
-- NEVER output HTML or markdown tags (no <b>, **, etc.). For emphasis use these exact markers: ⟦b⟧bold text⟦/b⟧ for bold and ⟦i⟧italic text⟦/i⟧ for italic. The keyboard converts them to real formatting."""
+- PLAIN TEXT ONLY: no markdown or HTML, no asterisks/underscores/backticks, no emphasis markers, no decorative symbols. Your answer is inserted into a plain text field exactly as written."""
 
         val messages = JSONArray().apply {
             put(JSONObject().apply {

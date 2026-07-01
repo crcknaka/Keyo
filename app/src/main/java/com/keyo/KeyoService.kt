@@ -2036,27 +2036,36 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private fun modeKeyFont(): androidx.compose.ui.unit.TextUnit =
         (KeyboardPrefs.fontSizeSp(keyHeightDp.intValue, keyVGapDp.intValue) * 0.72f).sp
 
-    // ---- AI-output emphasis ----
-    private fun currentPkg(): String = currentInputEditorInfo?.packageName ?: ""
-
-    private fun isWhatsApp() = currentPkg().let { it == "com.whatsapp" || it == "com.whatsapp.w4b" }
-
-    private fun applyBold(text: String): String =
-        if (isWhatsApp()) "*$text*" else text     // WhatsApp renders *text* natively as bold
-
-    private fun applyItalic(text: String): String =
-        if (isWhatsApp()) "_${text}_" else text   // WhatsApp renders _text_ natively as italic
-
-    // The AI's ⟦b⟧/⟦i⟧ emphasis markers: WhatsApp gets its native * / _ markup; everywhere else the
-    // markers are simply stripped and the text stays PLAIN. (We used to map emphasis to Unicode
-    // "mathematical bold/italic" glyphs — that looked like the keyboard changed the font, broke
-    // search/copy/screen-readers, and users hated it. Never again.) Stray markdown **…** from the
-    // model is stripped for the same reason.
+    // ---- AI output sanitizer -------------------------------------------------------------------
+    // AI text is inserted as PLAIN TEXT, period. No italic, no bold, no markdown, no marker
+    // symbols — in ANY app (the earlier WhatsApp *…*/_…_ special case made answers italic there;
+    // before that, Unicode math glyphs looked like a font change — both removed for good).
+    // The prompts already demand plain text; this strips whatever emphasis the model emits anyway:
+    // legacy ⟦b⟧/⟦i⟧ markers, markdown **bold** / *italic* / __bold__ / _italic_ / `code`,
+    // heading/quote prefixes, and a quote wrapped around the entire answer.
     private fun formatEmphasis(text: String): String {
-        var t = Regex("⟦b⟧(.*?)⟦/b⟧", RegexOption.DOT_MATCHES_ALL).replace(text) { applyBold(it.groupValues[1]) }
-        t = Regex("⟦i⟧(.*?)⟦/i⟧", RegexOption.DOT_MATCHES_ALL).replace(t) { applyItalic(it.groupValues[1]) }
-        t = t.replace("⟦b⟧", "").replace("⟦/b⟧", "").replace("⟦i⟧", "").replace("⟦/i⟧", "")
-        if (!isWhatsApp()) t = Regex("\\*\\*(.+?)\\*\\*", RegexOption.DOT_MATCHES_ALL).replace(t) { it.groupValues[1] }
+        var t = text
+            .replace("⟦b⟧", "").replace("⟦/b⟧", "")
+            .replace("⟦i⟧", "").replace("⟦/i⟧", "")
+        t = Regex("\\*\\*\\*(.+?)\\*\\*\\*", RegexOption.DOT_MATCHES_ALL).replace(t) { it.groupValues[1] }
+        t = Regex("\\*\\*(.+?)\\*\\*", RegexOption.DOT_MATCHES_ALL).replace(t) { it.groupValues[1] }
+        t = Regex("__(.+?)__", RegexOption.DOT_MATCHES_ALL).replace(t) { it.groupValues[1] }
+        // Single * / _ pairs only when they hug the content (no inner newline, not snake_case / math):
+        t = Regex("(?<![\\w*])\\*([^*\\n]+)\\*(?![\\w*])").replace(t) { it.groupValues[1] }
+        t = Regex("(?<![\\p{L}\\p{N}_])_([^_\\n]+)_(?![\\p{L}\\p{N}_])").replace(t) { it.groupValues[1] }
+        t = t.replace("`", "")
+        // Markdown heading / blockquote prefixes at line starts.
+        t = Regex("(?m)^\\s*#{1,6}\\s+").replace(t, "")
+        t = Regex("(?m)^\\s*>\\s+").replace(t, "")
+        t = t.trim()
+        // The model sometimes wraps the whole answer in quotes — unwrap exactly that case
+        // (only when the closing quote is the first one after the opener, i.e. one outer pair).
+        if (t.length >= 2) {
+            val whole =
+                (t.first() == '"' && t.last() == '"' && t.indexOf('"', 1) == t.length - 1) ||
+                (t.first() == '«' && t.last() == '»' && t.indexOf('»', 1) == t.length - 1)
+            if (whole) t = t.substring(1, t.length - 1).trim()
+        }
         return t
     }
 
