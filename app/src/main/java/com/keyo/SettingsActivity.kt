@@ -413,6 +413,36 @@ class SettingsActivity : ComponentActivity() {
         }
         fun refreshDict() { dictWords = UserDictionary.wordsByFrequency() }
 
+        // Backup: the personal dictionary (learned words + next-word pairs) as a JSON file via the
+        // system file picker — survives reinstalls and moves to a new phone. Import MERGES (adds).
+        val exportDict = androidx.activity.compose.rememberLauncherForActivityResult(
+            ActivityResultContracts.CreateDocument("application/json")
+        ) { uri ->
+            if (uri != null) {
+                val msg = try {
+                    contentResolver.openOutputStream(uri)?.use { it.write(UserDictionary.exportJson().toByteArray(Charsets.UTF_8)) }
+                    "Exported ${UserDictionary.count()} words"
+                } catch (e: Exception) { "Export failed: ${e.message}" }
+                android.widget.Toast.makeText(this@SettingsActivity, msg, android.widget.Toast.LENGTH_SHORT).show()
+            }
+        }
+        val importDict = androidx.activity.compose.rememberLauncherForActivityResult(
+            ActivityResultContracts.OpenDocument()
+        ) { uri ->
+            if (uri != null) {
+                val msg = try {
+                    val json = contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
+                    val added = UserDictionary.importJson(json)
+                    if (added >= 0) {
+                        UserDictionary.save(this@SettingsActivity)
+                        refreshDict()
+                        "Imported: $added new words"
+                    } else "Not a Keyo dictionary file"
+                } catch (e: Exception) { "Import failed: ${e.message}" }
+                android.widget.Toast.makeText(this@SettingsActivity, msg, android.widget.Toast.LENGTH_SHORT).show()
+            }
+        }
+
         SubScreen("Clips & dictionary", onBack) {
             SectionLabel("Pinned clips")
             Group {
@@ -462,6 +492,18 @@ class SettingsActivity : ComponentActivity() {
                             }
                         }
                     }
+                    Spacer(Modifier.height(10.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(20.dp)) {
+                        Text("⬆ Export", color = accent, fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.clickable { exportDict.launch("keyo-dictionary.json") })
+                        Text("⬇ Import", color = accent, fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.clickable {
+                                importDict.launch(arrayOf("application/json", "text/plain", "application/octet-stream"))
+                            })
+                    }
+                    Spacer(Modifier.height(2.dp))
+                    Text("Back up your learned words to a file, or merge a backup from another device.",
+                        color = textMuted, fontSize = 12.sp)
                     if (dictWords.isEmpty()) {
                         Spacer(Modifier.height(10.dp))
                         Text("New words you keep (by tapping them) and words you add here appear in your dictionary. Common words aren't saved.",

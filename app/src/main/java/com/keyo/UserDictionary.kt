@@ -142,6 +142,56 @@ object UserDictionary {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(KEY_DATA).apply()
     }
 
+    // --- Backup: export / import (Settings) ---
+
+    /** The whole personal dictionary (words + next-word pairs) as a self-describing JSON string. */
+    fun exportJson(): String = synchronized(this) {
+        val root = JSONObject()
+        root.put("keyo_dictionary", 1)   // format marker + version, checked on import
+        val u = JSONObject(); for ((k, v) in unigram) u.put(k, v)
+        val b = JSONObject()
+        for ((prev, followers) in bigram) {
+            val inner = JSONObject(); for ((k, v) in followers) inner.put(k, v)
+            b.put(prev, inner)
+        }
+        root.put("u", u); root.put("b", b)
+        return root.toString()
+    }
+
+    /** Merge a previously exported dictionary into this one (nothing is deleted: unigram counts keep
+     *  the larger value, bigram counts add — same rules as the load-race merge). Returns the number
+     *  of words that were NEW, or -1 if [json] is not a Keyo dictionary export. */
+    fun importJson(json: String): Int = synchronized(this) {
+        val root = try { JSONObject(json) } catch (_: Exception) { return -1 }
+        if (!root.has("keyo_dictionary") || !root.has("u")) return -1
+        var newWords = 0
+        try {
+            root.optJSONObject("u")?.let { uj ->
+                for (k in uj.keys()) {
+                    val v = uj.optInt(k, 0)
+                    if (v <= 0 || k.length < 2 || k.length > 32) continue
+                    if (!unigram.containsKey(k)) newWords++
+                    unigram[k] = maxOf(unigram[k] ?: 0, v)
+                }
+            }
+            root.optJSONObject("b")?.let { bj ->
+                for (prev in bj.keys()) {
+                    val inner = bj.optJSONObject(prev) ?: continue
+                    val followers = bigram.getOrPut(prev) { HashMap() }
+                    for (next in inner.keys()) {
+                        val v = inner.optInt(next, 0)
+                        if (v > 0) followers[next] = (followers[next] ?: 0) + v
+                    }
+                    if (followers.size > MAX_FOLLOWERS) pruneSmallest(followers, MAX_FOLLOWERS)
+                }
+            }
+        } catch (_: Exception) { return -1 }
+        if (unigram.size > MAX_UNIGRAMS) pruneSmallest(unigram, MAX_UNIGRAMS)
+        if (bigram.size > MAX_BIGRAM_KEYS) pruneBigramKeys()
+        dirty = true
+        return newWords
+    }
+
     private fun pruneSmallest(map: HashMap<String, Int>, target: Int) {
         val remove = map.entries.sortedBy { it.value }.take((map.size - target).coerceAtLeast(0)).map { it.key }
         remove.forEach { map.remove(it) }
