@@ -817,10 +817,12 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                     fontSize = if (isDigit) digitFont else KeyboardPrefs.fontSizeSp(keyHeightDp.intValue, keyVGapDp.intValue).sp
                                 ) { commitText(s) }
                             }
+                            // Helper column, top→bottom: - + ⌫ . — Backspace sits SECOND FROM THE
+                            // BOTTOM (above the period), matching Gboard's phone pad for muscle-memory.
                             when (i) {
-                                0 -> BackspaceKey(keyColor, textColor, Modifier.weight(1f))
-                                1 -> KeyButton("-", keyColor, textColor, Modifier.weight(1f)) { commitText("-") }
-                                2 -> KeyButton("+", keyColor, textColor, Modifier.weight(1f)) { commitText("+") }
+                                0 -> KeyButton("-", keyColor, textColor, Modifier.weight(1f)) { commitText("-") }
+                                1 -> KeyButton("+", keyColor, textColor, Modifier.weight(1f)) { commitText("+") }
+                                2 -> BackspaceKey(keyColor, textColor, Modifier.weight(1f))
                                 3 -> KeyButton(".", keyColor, textColor, Modifier.weight(1f)) { commitChar('.') }
                             }
                         }
