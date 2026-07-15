@@ -485,12 +485,14 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         setSuggestions(emptyList(), null)
         confirmDeferred?.complete(false); confirmDeferred = null; pendingConfirm.value = null
         // Open in the layout the field asks for (Gboard behaviour): number/date fields get the
-        // numpad, phone fields the symbol page (has + * # ( ) -), everything else the letters.
+        // numpad, phone fields the symbol page (has + * # ( ) -), everything else the letters —
+        // or the sticky mini row when mini mode is on (numeric fields still get their pads:
+        // mini has no digit keys, and 123/symbols/⌨ in the mini row lead back).
         keyboardMode.value = when (cls) {
             android.text.InputType.TYPE_CLASS_NUMBER,
             android.text.InputType.TYPE_CLASS_DATETIME -> "numpad"
             android.text.InputType.TYPE_CLASS_PHONE -> "123"
-            else -> "abc"
+            else -> letterMode()
         }
         syncImeSubtype(currentLang.value)   // best-effort: keep the OS subtype on our language
         maybeAutoCapitalize()
@@ -515,10 +517,12 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     }
 
     override fun onEvaluateFullscreenMode(): Boolean {
-        // Portrait: stay non-fullscreen so the app shows above the keyboard.
-        // Landscape: go fullscreen so a text line (extract view) appears above the keys,
-        // like Gboard — otherwise the keyboard would cover the whole field.
-        return resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
+        // NEVER use the legacy fullscreen "extract" mode (the separate text box that takes over the
+        // whole screen). It used to turn on in ANY landscape configuration — which on a foldable's
+        // unfolded inner display (reported as landscape) hijacked the entire screen for a search
+        // field. Modern Gboard doesn't use extract mode either: the app stays visible above the
+        // keyboard and the text goes straight into the real field on every screen shape.
+        return false
     }
 
     override fun onComputeInsets(outInsets: Insets) {
@@ -576,7 +580,8 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         ) {
             // Dynamic top toolbar (Gboard-style). Priority: status > quick-paste chip > icons.
             // It reads statusText itself, so status changes never recompose the key grid below.
-            TopToolbar(textColor, accentColor)
+            // Hidden in mini mode — the whole point there is minimum height.
+            if (mode != "mini") TopToolbar(textColor, accentColor)
 
             // Confirmation bar for consequential AI actions (call / SMS).
             val confirmText by pendingConfirm
@@ -606,7 +611,56 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 }
             }
 
-            if (mode == "emoji") {
+            if (mode == "mini") {
+                // Mini keyboard: ONE row, minimum screen estate. STICKY: the mode is persisted, so
+                // the keyboard reopens in mini everywhere until explicitly left (long-press Enter —
+                // the only exit, chip shows "ABC"). 123 opens the full pad (symbols one tap further);
+                // its ABC key returns HERE while mini is on (letterMode()). The wide key is the REAL
+                // space bar — tap = space, hold = dictate, swipe = cursor. Enter is a NORMAL enter
+                // (newline or the field's Send/Search action); Shift+Enter forces a newline, exactly
+                // like Gboard — the Shift key also arms select-by-space-swipe as usual.
+                MiniStatusLine(accentColor)
+                Row(modifier = Modifier.fillMaxWidth()) {
+                    KeyButton("123", keyColor, textColor, Modifier.weight(0.9f), fontSize = modeKeyFont()) {
+                        keyboardMode.value = "123"   // symbols are one more tap away on the 123 page
+                    }
+                    val caps by isCapsLock
+                    ShiftKey(
+                        active = shift || caps,
+                        locked = caps,
+                        keyColor = keyColor,
+                        accentColor = accentColor,
+                        iconColor = if (shift || caps) Color.Black else textColor,
+                        height = keyHeight,
+                        modifier = Modifier.weight(0.9f)
+                    ) { onShiftTap() }
+                    SpaceKey(Modifier.weight(2.6f), lang.uppercase(), keyColor, textColor, accentColor, recordColor)
+                    BackspaceKey(keyColor, textColor, Modifier.weight(1.2f))
+                    val imeAction by imeActionId
+                    val multiline by fieldMultiline
+                    val noEnterAction by fieldNoEnterAction
+                    val hasImeAction = !(multiline || noEnterAction) &&
+                            imeAction != android.view.inputmethod.EditorInfo.IME_ACTION_NONE &&
+                            imeAction != android.view.inputmethod.EditorInfo.IME_ACTION_UNSPECIFIED
+                    val enterKind = when {
+                        !hasImeAction -> "return"
+                        else -> when (imeAction) {
+                            android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH -> "search"
+                            android.view.inputmethod.EditorInfo.IME_ACTION_SEND -> "send"
+                            android.view.inputmethod.EditorInfo.IME_ACTION_GO -> "send"
+                            android.view.inputmethod.EditorInfo.IME_ACTION_NEXT -> "next"
+                            else -> "return"
+                        }
+                    }
+                    EnterKey(enterKind, accentColor, Color.Black, keyHeight, Modifier.weight(1.2f),
+                        onMini = {
+                            KeyboardPrefs.setMiniMode(this@KeyoService, false)   // hold Enter = leave mini
+                            keyboardMode.value = "abc"
+                        }, miniHint = "ABC") {
+                        handleEnter(hasImeAction, imeAction)   // Shift+Enter forces a newline
+                    }
+                }
+            } else if (mode == "emoji") {
                 EmojiPanel(keyHeight, keyColor, textColor, accentColor)
             } else if (mode == "clipboard") {
                 ClipboardPanel(keyHeight, keyColor, textColor, accentColor)
@@ -871,7 +925,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     }
                     "123", "symbols", "numpad" -> {
                         KeyButton("ABC", accentColor, Color.Black, Modifier.weight(1.2f), fontSize = modeKeyFont()) {
-                            keyboardMode.value = "abc"
+                            keyboardMode.value = letterMode()
                         }
                     }
                 }
@@ -1012,17 +1066,12 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     }
                 }
 
-                EnterKey(enterKind, accentColor, Color.Black, keyHeight, Modifier.weight(1.0f)) {
-                    if (!hasImeAction) {
-                        commitChar('\n')
-                    } else {
-                        // Autocorrect the last word like a space would — Gboard also sends the
-                        // corrected text on Send/Search. finalizeComposing() is the safety net and
-                        // disarms backspace-revert (the text is leaving the field).
-                        finishWord()
-                        finalizeComposing()
-                        currentInputConnection?.performEditorAction(imeAction)
-                    }
+                EnterKey(enterKind, accentColor, Color.Black, keyHeight, Modifier.weight(1.0f),
+                    onMini = {
+                        KeyboardPrefs.setMiniMode(this@KeyoService, true)   // sticky until explicitly left
+                        keyboardMode.value = "mini"
+                    }) {
+                    handleEnter(hasImeAction, imeAction)   // Shift+Enter forces a newline (Gboard)
                 }
             }
             } // end else (normal keyboard layout)
@@ -1709,7 +1758,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             horizontalArrangement = Arrangement.SpaceEvenly,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            KeyButton("ABC", accentColor, Color.Black, Modifier.weight(1.4f), fontSize = modeKeyFont()) { keyboardMode.value = "abc" }
+            KeyButton("ABC", accentColor, Color.Black, Modifier.weight(1.4f), fontSize = modeKeyFont()) { keyboardMode.value = letterMode() }
             SpaceKey(Modifier.weight(4f), "space", keyColor, textColor, accentColor, Color(currentTheme.record))
             BackspaceKey(keyColor, textColor, Modifier.weight(1.4f))
         }
@@ -1723,20 +1772,82 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         iconColor: Color,
         height: androidx.compose.ui.unit.Dp,
         modifier: Modifier,
+        onMini: (() -> Unit)? = null,   // long-press → hint chip → toggle compact keyboard mode
+        miniHint: String = "мини",      // chip text: "мини" entering, "ABC" leaving (from the mini row)
         onClick: () -> Unit
     ) {
-        val interaction = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
-        val pressed by interaction.collectIsPressedAsState()
+        var pressed by remember { mutableStateOf(false) }
+        var showMini by remember { mutableStateOf(false) }
         Box(
             modifier = modifier
                 .height(height)
-                .semantics { contentDescription = "Enter" }
-                .clickable(interactionSource = interaction, indication = null) { performKeyFeedback(); onClick() }
+                .semantics { contentDescription = if (onMini != null) "Enter. Hold for mini keyboard" else "Enter" }
+                .pointerInput(Unit) {
+                    awaitEachGesture {
+                        awaitFirstDown()
+                        pressed = true
+                        var longPressed = false
+                        val job = serviceScope.launch {
+                            kotlinx.coroutines.delay(400)
+                            if (onMini != null && pressed) {
+                                longPressed = true
+                                showMini = true
+                                performKeyFeedback()
+                            }
+                        }
+                        try {
+                            while (true) {
+                                val c = awaitPointerEvent().changes.firstOrNull() ?: break
+                                if (!c.pressed) { c.consume(); break }
+                                c.consume()
+                            }
+                        } catch (_: kotlinx.coroutines.CancellationException) {}
+                        job.cancel()
+                        pressed = false
+                        val enterMini = showMini
+                        showMini = false
+                        if (enterMini) { performKeyFeedback(); onMini?.invoke() }
+                        else if (!longPressed) { performKeyFeedback(); onClick() }
+                    }
+                }
                 .padding(horizontal = keyHGapDp.intValue.dp, vertical = keyVGapDp.intValue.dp)
                 .background(if (pressed) lerp(bgColor, Color.Black, 0.22f) else bgColor, RoundedCornerShape(6.dp)),
             contentAlignment = Alignment.Center
         ) {
             EnterGlyph(kind, iconColor, Modifier.size(22.dp))
+            // "мини" hint while holding — release to switch to the compact keyboard.
+            if (showMini) {
+                androidx.compose.ui.window.Popup(
+                    alignment = Alignment.TopCenter,
+                    offset = with(androidx.compose.ui.platform.LocalDensity.current) {
+                        androidx.compose.ui.unit.IntOffset(0, (-52).dp.roundToPx())
+                    }
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .background(Color(currentTheme.accent), RoundedCornerShape(8.dp))
+                            .padding(horizontal = 14.dp, vertical = 7.dp)
+                    ) {
+                        Text(miniHint, color = Color.Black, fontSize = 14.sp,
+                            fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold)
+                    }
+                }
+            }
+        }
+    }
+
+    // Mini mode: slim status line (recording / transcribing / errors) — the toolbar is hidden there,
+    // so this is the only feedback surface. Zero height while idle. Reads statusText itself so
+    // status changes recompose only this line.
+    @Composable
+    private fun MiniStatusLine(accentColor: Color) {
+        val status by statusText
+        if (status.isNotEmpty()) {
+            Text(
+                status, color = accentColor, fontSize = 12.sp,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp)
+            )
         }
     }
 
@@ -2110,7 +2221,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             handler.postDelayed({ if (statusText.value.startsWith("✨")) statusText.value = "" }, 1500)
             return
         }
-        keyboardMode.value = "abc"
+        keyboardMode.value = letterMode()
         statusText.value = "✨ Improving…"
         GroqApi.rewrite(target, instruction) { res, err ->
             handler.post {
@@ -2149,7 +2260,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             handler.postDelayed({ if (statusText.value.startsWith("✨")) statusText.value = "" }, 1500)
             return
         }
-        keyboardMode.value = "abc"
+        keyboardMode.value = letterMode()
         statusText.value = "✨ Writing…"
         GroqApi.rewrite(before, "Continue this text naturally from where it ends. Output ONLY the continuation to append — do NOT repeat the existing text.") { res, err ->
             handler.post {
@@ -2933,7 +3044,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         // Gboard-style: a space on the symbol/number pages jumps back to letters, so after ending a
         // sentence ("?", "!", …) + space you're ready to type the next word without switching by hand.
         if (char == ' ' && (keyboardMode.value == "123" || keyboardMode.value == "symbols")) {
-            keyboardMode.value = "abc"
+            keyboardMode.value = letterMode()
         }
         maybeAutoCapitalize()
         updateSuggestions()
@@ -3517,6 +3628,18 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         }
     }
 
+    /** Where "back to letters" leads: the sticky mini row when mini mode is on, else the abc layout.
+     *  Every ABC/mode-switch key routes through this so mini survives 123/symbols/emoji round-trips. */
+    private fun letterMode(): String = if (KeyboardPrefs.isMiniMode(this)) "mini" else "abc"
+
+    /** Raw key-event fields (inputType TYPE_NULL): remote-desktop clients, terminal emulators, some
+     *  games. These apps replay EVERY edit we make as keystrokes on the other machine — an interim
+     *  composing update, a delete-and-retype swap or a modifier combo becomes phantom hotkeys there
+     *  (dictating into a remote Mac used to click things / open Finder). In such fields text must be
+     *  committed exactly ONCE, plainly, with no composing and no modifier key events. */
+    private fun rawKeyField(): Boolean =
+        (fieldInputType and android.text.InputType.TYPE_MASK_CLASS) == android.text.InputType.TYPE_NULL
+
     /** The on-screen layout for [lang]: Russian is Cyrillic; English and Latvian share Latin/QWERTY. */
     private fun layoutOf(lang: String) = if (lang == "ru") "ru" else "latin"
 
@@ -3602,6 +3725,53 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 SuggestionEngine.ensureLoaded(this@KeyoService, listOf(lang))
             }
             handler.post { updateSuggestions() }
+        }
+    }
+
+    // Enter behaviour shared by the main and mini layouts (Gboard semantics): a plain field gets a
+    // newline; a field with an IME action fires it — UNLESS Shift is on, which forces a line break
+    // instead (Shift+Enter). The forced break is sent as a real Shift+Enter key event, the combo
+    // chat editors map to "new line, don't send" (a committed "\n" gets swallowed by such fields).
+    private fun handleEnter(hasImeAction: Boolean, imeAction: Int) {
+        val shifted = isShift.value || isCapsLock.value
+        when {
+            // Remote desktop / terminal (raw key-event field): behave exactly like a physical
+            // keyboard. Enter sends the REAL Enter key (confirms dialogs, executes commands on the
+            // remote machine); Shift+Enter sends the shifted key (newline in chat apps there).
+            // Committing a literal "\n" here made both feel identical — just a line break.
+            rawKeyField() -> {
+                finalizeComposing()
+                val ic = currentInputConnection
+                val meta = if (shifted)
+                    android.view.KeyEvent.META_SHIFT_ON or android.view.KeyEvent.META_SHIFT_LEFT_ON
+                else 0
+                ic?.sendKeyEvent(android.view.KeyEvent(0, 0, android.view.KeyEvent.ACTION_DOWN,
+                    android.view.KeyEvent.KEYCODE_ENTER, 0, meta))
+                ic?.sendKeyEvent(android.view.KeyEvent(0, 0, android.view.KeyEvent.ACTION_UP,
+                    android.view.KeyEvent.KEYCODE_ENTER, 0, meta))
+                if (shifted && isShift.value && !isCapsLock.value) { isShift.value = false; shiftIsAuto = false }
+            }
+            hasImeAction && shifted -> {
+                finishWord()
+                finalizeComposing()
+                val ic = currentInputConnection
+                val meta = android.view.KeyEvent.META_SHIFT_ON or android.view.KeyEvent.META_SHIFT_LEFT_ON
+                ic?.sendKeyEvent(android.view.KeyEvent(0, 0, android.view.KeyEvent.ACTION_DOWN,
+                    android.view.KeyEvent.KEYCODE_ENTER, 0, meta))
+                ic?.sendKeyEvent(android.view.KeyEvent(0, 0, android.view.KeyEvent.ACTION_UP,
+                    android.view.KeyEvent.KEYCODE_ENTER, 0, meta))
+                // Consume a one-shot Shift like a letter would (caps lock stays).
+                if (isShift.value && !isCapsLock.value) { isShift.value = false; shiftIsAuto = false }
+            }
+            !hasImeAction -> commitChar('\n')
+            else -> {
+                // Autocorrect the last word like a space would — Gboard also sends the corrected
+                // text on Send/Search. finalizeComposing() is the safety net and disarms
+                // backspace-revert (the text is leaving the field).
+                finishWord()
+                finalizeComposing()
+                currentInputConnection?.performEditorAction(imeAction)
+            }
         }
     }
 
@@ -3774,8 +3944,9 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             return
         }
 
-        if (byWord) {
-            // Delete word: send Ctrl+Backspace
+        if (byWord && !rawKeyField()) {
+            // Delete word: send Ctrl+Backspace (NOT in raw key-event fields — a modifier combo
+            // becomes a hotkey on the remote machine; plain DEL below is safe there).
             ic.sendKeyEvent(android.view.KeyEvent(0, 0, android.view.KeyEvent.ACTION_DOWN,
                 android.view.KeyEvent.KEYCODE_DEL, 0, android.view.KeyEvent.META_CTRL_ON))
             ic.sendKeyEvent(android.view.KeyEvent(0, 0, android.view.KeyEvent.ACTION_UP,
@@ -3820,15 +3991,20 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     langTagOf(currentLang.value),
                     preferOffline = !networkAvailable(),
                     onPartial = { t ->
-                        try { currentInputConnection?.setComposingText(t, 1) } catch (_: Exception) {}
+                        // No interim text in raw key-event fields — every rewrite replays remotely.
+                        if (!rawKeyField()) try { currentInputConnection?.setComposingText(t, 1) } catch (_: Exception) {}
                     },
                     onFinal = { t ->
                         handler.post {
                             offlineSession = false
                             isRecording.value = false
                             try {
-                                if (!t.isNullOrBlank()) currentInputConnection?.setComposingText(t, 1)
-                                currentInputConnection?.finishComposingText()
+                                if (rawKeyField()) {
+                                    if (!t.isNullOrBlank()) currentInputConnection?.commitText(t, 1)
+                                } else {
+                                    if (!t.isNullOrBlank()) currentInputConnection?.setComposingText(t, 1)
+                                    currentInputConnection?.finishComposingText()
+                                }
                             } catch (_: Exception) {}
                             if (t.isNullOrBlank()) {
                                 statusText.value = "Didn't catch that"
@@ -3843,7 +4019,9 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             if (audioRecorder.start()) {
                 isRecording.value = true
                 statusText.value = "🎤 Recording..."
-                if (KeyboardPrefs.isLiveDictation(this)) {
+                // Live interim updates rewrite the composing region over and over — in a raw
+                // key-event field each rewrite would be replayed as keystrokes remotely. Skip.
+                if (KeyboardPrefs.isLiveDictation(this) && !rawKeyField()) {
                     finalizeComposing()        // so the interim transcript owns the composing region
                     liveBusy = false
                     handler.postDelayed(liveDictationTick, 1600)
@@ -3901,7 +4079,9 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 GroqApi.transcribe(audioFile) { text, error ->
                     if (text != null) {
                         val cleanup = KeyboardPrefs.isAutocorrectEnabled(this@KeyoService)
-                        val instant = KeyboardPrefs.isInstantDictation(this@KeyoService)
+                        // No instant swap in raw key-event fields: the later delete-and-retype would
+                        // replay as a burst of Backspace+typing on the remote machine (phantom hotkeys).
+                        val instant = KeyboardPrefs.isInstantDictation(this@KeyoService) && !rawKeyField()
                         if (cleanup && instant) {
                             // Instant dictation: COMMIT the raw transcription right away (text appears
                             // after one round-trip). NOT a composing span — a composing span would be

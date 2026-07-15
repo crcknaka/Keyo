@@ -31,6 +31,7 @@ object KeyboardPrefs {
     private const val KEY_SWIPE_TYPING = "swipe_typing"
     private const val KEY_LIVE_DICTATION = "live_dictation"
     private const val KEY_INSTANT_DICTATION = "instant_dictation"
+    private const val KEY_MINI_MODE = "mini_mode"
 
     // Defaults / ranges for the visual size editor.
     const val DEFAULT_KEY_HEIGHT = 48
@@ -303,6 +304,11 @@ object KeyboardPrefs {
      *  version a moment later (one round-trip to first text instead of two). On by default. */
     fun isInstantDictation(context: Context) = prefs(context).getBoolean(KEY_INSTANT_DICTATION, true)
     fun setInstantDictation(context: Context, v: Boolean) = prefs(context).edit().putBoolean(KEY_INSTANT_DICTATION, v).apply()
+
+    /** Mini keyboard mode is STICKY: once entered (long-press Enter) it survives field switches and
+     *  keyboard reopens until the user explicitly leaves it. */
+    fun isMiniMode(context: Context) = prefs(context).getBoolean(KEY_MINI_MODE, false)
+    fun setMiniMode(context: Context, v: Boolean) = prefs(context).edit().putBoolean(KEY_MINI_MODE, v).apply()
 
     private fun saveClips(context: Context, list: List<String>) {
         val arr = JSONArray()
