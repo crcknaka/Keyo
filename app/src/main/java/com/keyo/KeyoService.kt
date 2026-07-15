@@ -647,8 +647,14 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         height = keyHeight,
                         modifier = Modifier.weight(0.9f)
                     ) { onShiftTap() }
-                    SpaceKey(Modifier.weight(2.6f), lang.uppercase(), keyColor, textColor, accentColor, recordColor)
-                    BackspaceKey(keyColor, textColor, Modifier.weight(1.2f))
+                    SpaceKey(Modifier.weight(2.2f), lang.uppercase(), keyColor, textColor, accentColor, recordColor)
+                    BackspaceKey(keyColor, textColor, Modifier.weight(1.1f))
+                    // Dedicated LINE-BREAK key (gray ⏎, next to the accent send-Enter): in remote
+                    // desktop Shift+Enter proved unreliable (clients drop the meta flag), two
+                    // explicit keys always work — this one never sends, the accent one always does.
+                    EnterKey("return", keyColor, textColor, keyHeight, Modifier.weight(1.0f)) {
+                        insertNewline()
+                    }
                     val imeAction by imeActionId
                     val multiline by fieldMultiline
                     val noEnterAction by fieldNoEnterAction
@@ -3739,6 +3745,18 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 SuggestionEngine.ensureLoaded(this@KeyoService, listOf(lang))
             }
             handler.post { updateSuggestions() }
+        }
+    }
+
+    /** Insert a LINE BREAK, never firing the field's action: plain fields via the normal typing
+     *  path; raw key-event fields (remote desktop) via a text commit — clients type committed text
+     *  without pressing the real Enter key. Backs the mini row's dedicated ⏎ key. */
+    private fun insertNewline() {
+        if (rawKeyField()) {
+            finalizeComposing()
+            currentInputConnection?.commitText("\n", 1)
+        } else {
+            commitChar('\n')
         }
     }
 
