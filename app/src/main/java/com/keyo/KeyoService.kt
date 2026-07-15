@@ -3748,13 +3748,25 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         }
     }
 
-    /** Insert a LINE BREAK, never firing the field's action: plain fields via the normal typing
-     *  path; raw key-event fields (remote desktop) via a text commit — clients type committed text
-     *  without pressing the real Enter key. Backs the mini row's dedicated ⏎ key. */
+    /** Insert a LINE BREAK, never firing the field's action. Backs the mini row's dedicated ⏎ key.
+     *  Plain fields: the normal typing path. Raw key-event fields (remote desktop): committed text
+     *  ("\n") never reaches the host and a meta flag on an Enter event gets dropped, so we simulate a
+     *  PHYSICAL Shift+Enter chord — press the Shift KEY, press/release Enter while it's held, release
+     *  Shift — which forwards as a real held modifier the remote chat app maps to "newline". */
     private fun insertNewline() {
         if (rawKeyField()) {
             finalizeComposing()
-            currentInputConnection?.commitText("\n", 1)
+            val ic = currentInputConnection ?: return
+            val meta = android.view.KeyEvent.META_SHIFT_ON or android.view.KeyEvent.META_SHIFT_LEFT_ON
+            val t = android.os.SystemClock.uptimeMillis()
+            ic.sendKeyEvent(android.view.KeyEvent(t, t, android.view.KeyEvent.ACTION_DOWN,
+                android.view.KeyEvent.KEYCODE_SHIFT_LEFT, 0, android.view.KeyEvent.META_SHIFT_LEFT_ON))
+            ic.sendKeyEvent(android.view.KeyEvent(t, t, android.view.KeyEvent.ACTION_DOWN,
+                android.view.KeyEvent.KEYCODE_ENTER, 0, meta))
+            ic.sendKeyEvent(android.view.KeyEvent(t, t, android.view.KeyEvent.ACTION_UP,
+                android.view.KeyEvent.KEYCODE_ENTER, 0, meta))
+            ic.sendKeyEvent(android.view.KeyEvent(t, t, android.view.KeyEvent.ACTION_UP,
+                android.view.KeyEvent.KEYCODE_SHIFT_LEFT, 0, 0))
         } else {
             commitChar('\n')
         }
