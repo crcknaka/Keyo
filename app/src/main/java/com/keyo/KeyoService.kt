@@ -496,6 +496,12 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         }
         syncImeSubtype(currentLang.value)   // best-effort: keep the OS subtype on our language
         maybeAutoCapitalize()
+        // Some opens land before the window insets reach our (pre-warmed) view — the keyboard
+        // briefly renders squashed/clipped until they arrive. Re-request insets + a layout pass on
+        // the next frame so the correct size applies from the start.
+        window?.window?.decorView?.let { dv ->
+            dv.post { try { dv.requestApplyInsets(); dv.requestLayout() } catch (_: Exception) {} }
+        }
     }
 
     override fun onFinishInputView(finishingInput: Boolean) {
@@ -565,18 +571,25 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         val textColor = Color(theme.text)
         val recordColor = Color(theme.record)
 
+        val cfg = androidx.compose.ui.platform.LocalConfiguration.current
+        val landscape = cfg.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
+        // Wide displays (unfolded foldable, tablet): don't stretch the keys across the whole panel —
+        // cap the key area Gboard-style and center it; the background still fills the full width.
+        val wideScreen = cfg.screenWidthDp >= 600
+        Box(modifier = Modifier.fillMaxWidth().background(bgColor)) {
         Column(
             modifier = Modifier
-                .fillMaxWidth()
-                .background(bgColor)
+                .then(if (wideScreen) Modifier.width(560.dp) else Modifier.fillMaxWidth())
+                .align(Alignment.TopCenter)
                 // targetSdk 35 enforces edge-to-edge: without this the bottom key row slides under
                 // the system navigation area (gesture pill / hide-keyboard & IME-switcher buttons).
                 // The background stays painted behind the bar; only the keys are lifted above it.
                 // On top of the automatic inset, a user-tunable bottom offset (Appearance →
-                // Keyboard size) raises the keys further clear of the system buttons.
+                // Keyboard size) raises the keys further clear of the system buttons — portrait
+                // only: in landscape vertical space is precious and the extra gap looked wasteful.
                 .navigationBarsPadding()
                 .padding(start = 2.dp, end = 2.dp, top = 4.dp,
-                         bottom = (4 + bottomOffsetDp.intValue).dp)
+                         bottom = (4 + if (landscape) 0 else bottomOffsetDp.intValue).dp)
         ) {
             // Dynamic top toolbar (Gboard-style). Priority: status > quick-paste chip > icons.
             // It reads statusText itself, so status changes never recompose the key grid below.
@@ -1076,6 +1089,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             }
             } // end else (normal keyboard layout)
         }
+        } // end full-width background Box
     }
 
     // Dynamic top toolbar (Gboard-style): status text, a quick-paste chip, or action icons.
@@ -3735,21 +3749,24 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private fun handleEnter(hasImeAction: Boolean, imeAction: Int) {
         val shifted = isShift.value || isCapsLock.value
         when {
-            // Remote desktop / terminal (raw key-event field): behave exactly like a physical
-            // keyboard. Enter sends the REAL Enter key (confirms dialogs, executes commands on the
-            // remote machine); Shift+Enter sends the shifted key (newline in chat apps there).
-            // Committing a literal "\n" here made both feel identical — just a line break.
+            // Remote desktop / terminal (raw key-event field). Two DIFFERENT channels, matching how
+            // these clients treat them: a REAL Enter key event is forwarded as the Enter KEY on the
+            // remote machine (sends the message / confirms / executes) — that's plain Enter; a line
+            // break injected as TEXT ("\n") is typed without pressing Enter (a newline in the remote
+            // chat) — that's Shift+Enter. (A shifted Enter key event doesn't work: clients ignore
+            // the meta flag and forward a bare Enter.)
             rawKeyField() -> {
                 finalizeComposing()
-                val ic = currentInputConnection
-                val meta = if (shifted)
-                    android.view.KeyEvent.META_SHIFT_ON or android.view.KeyEvent.META_SHIFT_LEFT_ON
-                else 0
-                ic?.sendKeyEvent(android.view.KeyEvent(0, 0, android.view.KeyEvent.ACTION_DOWN,
-                    android.view.KeyEvent.KEYCODE_ENTER, 0, meta))
-                ic?.sendKeyEvent(android.view.KeyEvent(0, 0, android.view.KeyEvent.ACTION_UP,
-                    android.view.KeyEvent.KEYCODE_ENTER, 0, meta))
-                if (shifted && isShift.value && !isCapsLock.value) { isShift.value = false; shiftIsAuto = false }
+                if (shifted) {
+                    currentInputConnection?.commitText("\n", 1)
+                    if (isShift.value && !isCapsLock.value) { isShift.value = false; shiftIsAuto = false }
+                } else {
+                    val ic = currentInputConnection
+                    ic?.sendKeyEvent(android.view.KeyEvent(0, 0, android.view.KeyEvent.ACTION_DOWN,
+                        android.view.KeyEvent.KEYCODE_ENTER, 0, 0))
+                    ic?.sendKeyEvent(android.view.KeyEvent(0, 0, android.view.KeyEvent.ACTION_UP,
+                        android.view.KeyEvent.KEYCODE_ENTER, 0, 0))
+                }
             }
             hasImeAction && shifted -> {
                 finishWord()
