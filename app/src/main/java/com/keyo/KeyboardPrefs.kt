@@ -29,14 +29,18 @@ object KeyboardPrefs {
     private const val KEY_SUGGESTIONS = "suggestions_enabled"
     private const val KEY_AUTOCORRECT_TYPING = "autocorrect_typing"
     private const val KEY_SWIPE_TYPING = "swipe_typing"
-    private const val KEY_LIVE_DICTATION = "live_dictation"
     private const val KEY_INSTANT_DICTATION = "instant_dictation"
     private const val KEY_MINI_MODE = "mini_mode"
 
-    // Defaults / ranges for the visual size editor.
-    const val DEFAULT_KEY_HEIGHT = 48
-    const val DEFAULT_HGAP = 1
-    const val DEFAULT_VGAP = 2
+    // Defaults / ranges for the visual size editor. The three size defaults are MEASURED off Gboard
+    // on a 411dp-wide screen, because the row pitch is the vertical touch target and ours used to be
+    // noticeably smaller than Gboard's — the single biggest reason its keys felt easier to hit:
+    //   row pitch (key height)  Gboard ~56dp    was 48dp
+    //   drawn key height        Gboard 44.6dp   = 56 - 2*5
+    //   drawn key width (EN)    Gboard 35.4dp   = 40.8 pitch - 2*3
+    const val DEFAULT_KEY_HEIGHT = 56
+    const val DEFAULT_HGAP = 3
+    const val DEFAULT_VGAP = 5
     const val DEFAULT_BOTTOM_OFFSET = 32
     val KEY_HEIGHT_RANGE = 28..64
     val GAP_RANGE = 0..10
@@ -223,7 +227,6 @@ object KeyboardPrefs {
     // Pinned clips (kept above clipboard history, never auto-evicted). These double as saved
     // templates — they replaced the old "quick phrases" feature.
     fun getPinned(context: Context) = getList(context, KEY_PINNED)
-    fun isPinned(context: Context, text: String) = getPinned(context).contains(text)
     fun togglePin(context: Context, text: String) {
         val cur = getPinned(context).toMutableList()
         if (!cur.remove(text)) cur.add(0, text)
@@ -294,11 +297,6 @@ object KeyboardPrefs {
     /** Glide / swipe typing — slide across letters to type a word. Off by default. */
     fun isSwipeTyping(context: Context) = prefs(context).getBoolean(KEY_SWIPE_TYPING, false)
     fun setSwipeTyping(context: Context, v: Boolean) = prefs(context).edit().putBoolean(KEY_SWIPE_TYPING, v).apply()
-
-    /** Live dictation — show the transcript growing in the field while you speak (more API calls).
-     *  Off by default; the standard path transcribes once on release. */
-    fun isLiveDictation(context: Context) = prefs(context).getBoolean(KEY_LIVE_DICTATION, false)
-    fun setLiveDictation(context: Context, v: Boolean) = prefs(context).edit().putBoolean(KEY_LIVE_DICTATION, v).apply()
 
     /** When dictation cleanup is on: insert the raw transcription immediately and swap in the cleaned
      *  version a moment later (one round-trip to first text instead of two). On by default. */
@@ -418,20 +416,5 @@ object KeyboardPrefs {
         "qwen/qwen3-32b" to "Qwen 3 32B",
         "moonshotai/kimi-k2-instruct-0905" to "Kimi K2 (262K context)",
         "llama-3.1-8b-instant" to "Llama 3.1 8B (fastest)"
-    )
-
-    val AI_TOOLS = listOf(
-        "📞 Call" to "\"Call Mom\"",
-        "💬 SMS" to "\"Text Arthur: running 10 min late\"",
-        "⏰ Alarm" to "\"Set an alarm for 7:30\"",
-        "⏱ Timer" to "\"Timer for 5 minutes\"",
-        "📱 Apps" to "\"Open Telegram\"",
-        "🔦 Flashlight" to "\"Turn on the flashlight\"",
-        "🔊 Volume" to "\"Set volume to 50%\"",
-        "🔍 Search" to "\"Google the weather in Riga\"",
-        "📋 Clipboard" to "\"What's in the clipboard?\"",
-        "🔋 Battery" to "\"How much battery is left?\"",
-        "🌍 Translate" to "\"Translate to English: ...\"",
-        "✍️ Text" to "\"Write an email to a colleague...\""
     )
 }

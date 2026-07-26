@@ -31,6 +31,9 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * Settings are organised as a home screen of category tiles, each opening a focused sub-screen
@@ -50,7 +53,8 @@ class SettingsActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        deepLink.value = intent?.getStringExtra("section")
+        // Only a fresh launch follows the deep link; on a configuration change the saved screen wins.
+        if (savedInstanceState == null) deepLink.value = intent?.getStringExtra("section")
         setContent { SettingsApp() }
     }
 
@@ -107,11 +111,14 @@ class SettingsActivity : ComponentActivity() {
     @Composable
     fun SettingsApp() {
         var screen by rememberSaveable { mutableStateOf("home") }
-        // Honour a deep link (e.g. the ★ key opening straight to Phrases).
+        // Honour a deep link (e.g. the clipboard panel's "Edit ›" opening straight to Phrases).
+        // Consumed once: the intent extra survives a configuration change, so without clearing it
+        // a rotation would throw the user back to the deep-linked screen.
         LaunchedEffect(deepLink.value) {
             when (deepLink.value) {
                 "phrases" -> screen = "phrases"
             }
+            if (deepLink.value != null) deepLink.value = null
         }
         Surface(modifier = Modifier.fillMaxSize(), color = bg) {
             // targetSdk 35 enforces edge-to-edge: keep content clear of the status/navigation bars
@@ -149,8 +156,10 @@ class SettingsActivity : ComponentActivity() {
         val pinnedCount = KeyboardPrefs.getPinned(this@SettingsActivity).size
         var dictCount by remember { mutableStateOf(0) }
         LaunchedEffect(Unit) {
-            UserDictionary.ensureLoaded(this@SettingsActivity)
-            dictCount = UserDictionary.wordsByFrequency().size
+            dictCount = withContext(Dispatchers.IO) {
+                UserDictionary.ensureLoaded(this@SettingsActivity)
+                UserDictionary.count()
+            }
         }
 
         Column(
@@ -365,7 +374,6 @@ class SettingsActivity : ComponentActivity() {
         var selectedModel by remember { mutableStateOf(KeyboardPrefs.getModel(this@SettingsActivity)) }
         var selectedAiModel by remember { mutableStateOf(KeyboardPrefs.getAiModel(this@SettingsActivity)) }
         var autocorrect by remember { mutableStateOf(KeyboardPrefs.isAutocorrectEnabled(this@SettingsActivity)) }
-        var liveDictation by remember { mutableStateOf(KeyboardPrefs.isLiveDictation(this@SettingsActivity)) }
         var instantDictation by remember { mutableStateOf(KeyboardPrefs.isInstantDictation(this@SettingsActivity)) }
 
         SubScreen("Voice & AI", onBack) {
@@ -377,10 +385,6 @@ class SettingsActivity : ComponentActivity() {
                 selectedAiModel = id; KeyboardPrefs.setAiModel(this@SettingsActivity, id); GroqApi.aiModel = id
             }
             Group {
-                ToggleRow("Live dictation", "Show words in the field as you speak (uses more data)", liveDictation) {
-                    liveDictation = it; KeyboardPrefs.setLiveDictation(this@SettingsActivity, it)
-                }
-                Sep()
                 ToggleRow("Dictation cleanup", "Tidies up dictation: punctuation, fillers, casing", autocorrect) {
                     autocorrect = it; KeyboardPrefs.setAutocorrectEnabled(this@SettingsActivity, it)
                 }
@@ -407,38 +411,49 @@ class SettingsActivity : ComponentActivity() {
         var dictQuery by remember { mutableStateOf("") }
         var newWord by remember { mutableStateOf("") }
         var dictGroup by remember { mutableStateOf("en") }   // which learned-words group is shown
+        var confirmClear by remember { mutableStateOf(false) }   // "Clear all words" needs two taps
         LaunchedEffect(Unit) {
-            UserDictionary.ensureLoaded(this@SettingsActivity)
-            dictWords = UserDictionary.wordsByFrequency()
+            // Reading the store parses JSON off SharedPreferences and sorts the whole learned
+            // vocabulary — off the main thread, or the screen's first frame stalls.
+            withContext(Dispatchers.IO) { UserDictionary.ensureLoaded(this@SettingsActivity) }
+            dictWords = withContext(Dispatchers.Default) { UserDictionary.wordsByFrequency() }
         }
         fun refreshDict() { dictWords = UserDictionary.wordsByFrequency() }
 
         // Backup: the personal dictionary (learned words + next-word pairs) as a JSON file via the
         // system file picker — survives reinstalls and moves to a new phone. Import MERGES (adds).
+        // The picker can hand back a cloud document (Drive), so the stream work runs on IO — doing it
+        // in the result callback froze the UI for as long as the provider took to answer.
+        val scope = rememberCoroutineScope()
         val exportDict = androidx.activity.compose.rememberLauncherForActivityResult(
             ActivityResultContracts.CreateDocument("application/json")
         ) { uri ->
-            if (uri != null) {
-                val msg = try {
-                    contentResolver.openOutputStream(uri)?.use { it.write(UserDictionary.exportJson().toByteArray(Charsets.UTF_8)) }
-                    "Exported ${UserDictionary.count()} words"
-                } catch (e: Exception) { "Export failed: ${e.message}" }
+            if (uri != null) scope.launch {
+                val msg = withContext(Dispatchers.IO) {
+                    try {
+                        val json = UserDictionary.exportJson()
+                        contentResolver.openOutputStream(uri)?.use { it.write(json.toByteArray(Charsets.UTF_8)) }
+                        "Exported ${UserDictionary.count()} words"
+                    } catch (e: Exception) { "Export failed: ${e.message}" }
+                }
                 android.widget.Toast.makeText(this@SettingsActivity, msg, android.widget.Toast.LENGTH_SHORT).show()
             }
         }
         val importDict = androidx.activity.compose.rememberLauncherForActivityResult(
             ActivityResultContracts.OpenDocument()
         ) { uri ->
-            if (uri != null) {
-                val msg = try {
-                    val json = contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
-                    val added = UserDictionary.importJson(json)
-                    if (added >= 0) {
-                        UserDictionary.save(this@SettingsActivity)
-                        refreshDict()
-                        "Imported: $added new words"
-                    } else "Not a Keyo dictionary file"
-                } catch (e: Exception) { "Import failed: ${e.message}" }
+            if (uri != null) scope.launch {
+                val msg = withContext(Dispatchers.IO) {
+                    try {
+                        val json = contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
+                        val added = UserDictionary.importJson(json)
+                        if (added >= 0) {
+                            UserDictionary.save(this@SettingsActivity)
+                            "Imported: $added new words"
+                        } else "Not a Keyo dictionary file"
+                    } catch (e: Exception) { "Import failed: ${e.message}" }
+                }
+                refreshDict()
                 android.widget.Toast.makeText(this@SettingsActivity, msg, android.widget.Toast.LENGTH_SHORT).show()
             }
         }
@@ -550,8 +565,16 @@ class SettingsActivity : ComponentActivity() {
                             Text("+${filtered.size - shown.size} more — narrow with search", color = textMuted, fontSize = 12.sp)
                         }
                         Spacer(Modifier.height(12.dp))
-                        Text("Clear all words", color = Color(0xFFE5484D), fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
-                            modifier = Modifier.clickable { UserDictionary.clear(this@SettingsActivity); refreshDict(); dictQuery = "" })
+                        // Two taps: this sits right under a scrolling list and wipes everything the
+                        // keyboard has learned, with no undo.
+                        Text(if (confirmClear) "Tap again to erase every learned word" else "Clear all words",
+                            color = Color(0xFFE5484D), fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.clickable {
+                                if (confirmClear) {
+                                    UserDictionary.clear(this@SettingsActivity); refreshDict()
+                                    dictQuery = ""; confirmClear = false
+                                } else confirmClear = true
+                            })
                     }
                 }
             }
@@ -638,8 +661,11 @@ class SettingsActivity : ComponentActivity() {
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     Button(
                         onClick = {
-                            KeyboardPrefs.setApiKey(this@SettingsActivity, apiKey)
-                            GroqApi.apiKey = apiKey.ifBlank { BuildConfig.GROQ_API_KEY }
+                            // Trim here too: the prefs store the trimmed key, so a pasted key with a
+                            // trailing newline used to fail every call until the process restarted.
+                            val k = apiKey.trim()
+                            KeyboardPrefs.setApiKey(this@SettingsActivity, k)
+                            GroqApi.apiKey = k.ifBlank { BuildConfig.GROQ_API_KEY }
                             android.widget.Toast.makeText(this@SettingsActivity, "API key saved", android.widget.Toast.LENGTH_SHORT).show()
                         },
                         modifier = Modifier.weight(1f), shape = RoundedCornerShape(10.dp),
@@ -647,9 +673,11 @@ class SettingsActivity : ComponentActivity() {
                     ) { Text("Save key", color = Color.White, fontWeight = FontWeight.SemiBold) }
                     OutlinedButton(
                         onClick = {
-                            GroqApi.apiKey = apiKey.ifBlank { BuildConfig.GROQ_API_KEY }
+                            // Test the typed candidate WITHOUT installing it — the keyboard runs in
+                            // this process, so assigning an unsaved key here used to break dictation
+                            // for the whole session when the test failed.
                             testing = true
-                            GroqApi.testKey { ok, err ->
+                            GroqApi.testKey(apiKey.trim().ifBlank { BuildConfig.GROQ_API_KEY }) { ok, err ->
                                 runOnUiThread {
                                     testing = false
                                     android.widget.Toast.makeText(this@SettingsActivity,

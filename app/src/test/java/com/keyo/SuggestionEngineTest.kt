@@ -101,34 +101,37 @@ class SuggestionEngineTest {
         assertTrue(SuggestionEngine.completeFrom("", vocab, emptyMap(), 3).isEmpty())
     }
 
-    // --- correctFrom ---
+    // --- correctionsFrom: the single best correction (what finishWord acts on) ---
 
     private val words = listOf("hello", "help", "world", "keyboard")
     private val wordSet = words.toSet()
 
+    private fun bestCorrection(word: String, learned: Map<String, Int> = emptyMap()): String? =
+        SuggestionEngine.correctionsFrom(word, words, wordSet, learned, 1).firstOrNull()
+
     @Test fun correct_fixesSingleTypo() {
-        assertEquals("hello", SuggestionEngine.correctFrom("helo", words, wordSet, emptyMap()))
+        assertEquals("hello", bestCorrection("helo"))
     }
 
     @Test fun correct_returnsNullForKnownWord() {
-        assertNull(SuggestionEngine.correctFrom("world", words, wordSet, emptyMap()))
+        assertNull(bestCorrection("world"))
     }
 
     @Test fun correct_returnsNullForShortWord() {
-        assertNull(SuggestionEngine.correctFrom("wo", words, wordSet, emptyMap()))
+        assertNull(bestCorrection("wo"))
     }
 
     @Test fun correct_returnsNullWhenNothingClose() {
-        assertNull(SuggestionEngine.correctFrom("zzzzz", words, wordSet, emptyMap()))
+        assertNull(bestCorrection("zzzzz"))
     }
 
     @Test fun correct_skipsWordsAlreadyLearned() {
-        assertNull(SuggestionEngine.correctFrom("teh", words, wordSet, mapOf("teh" to 3)))
+        assertNull(bestCorrection("teh", mapOf("teh" to 3)))
     }
 
     @Test fun correct_fixesTypoOfLearnedWordOutsideBundledDict() {
         // "awesome" lives only in the user's learned vocab; a typo of it must still correct.
-        assertEquals("awesome", SuggestionEngine.correctFrom("awesom", words, wordSet, mapOf("awesome" to 4)))
+        assertEquals("awesome", bestCorrection("awesom", mapOf("awesome" to 4)))
     }
 
     // --- correctionsFrom (multiple typo candidates for the suggestion strip) ---
@@ -202,27 +205,6 @@ class SuggestionEngineTest {
         assertTrue(SuggestionEngine.nextFrom("bad", bigrams, 3).isEmpty())
     }
 
-    // --- mergeRanked (bilingual Latin keyboard: English + Latvian word lists) ---
-
-    @Test fun merge_interleavesByRankAndDedups() {
-        val en = listOf("the", "and", "test")
-        val lv = listOf("un", "test", "ir")
-        // round-robin by rank: the, un, and, test(en), [test(lv) deduped], ir
-        assertEquals(listOf("the", "un", "and", "test", "ir"), SuggestionEngine.mergeRanked(listOf(en, lv)))
-    }
-
-    @Test fun merge_singleOrEmptyListsPassThrough() {
-        val en = listOf("hello", "world")
-        assertEquals(en, SuggestionEngine.mergeRanked(listOf(en, emptyList())))
-        assertTrue(SuggestionEngine.mergeRanked(listOf(emptyList(), emptyList())).isEmpty())
-    }
-
-    @Test fun merge_keepsBothLanguagesReachable() {
-        // A frequent English word and a frequent Latvian word both survive the merge.
-        val merged = SuggestionEngine.mergeRanked(listOf(listOf("hello"), listOf("paldies")))
-        assertTrue(merged.contains("hello") && merged.contains("paldies"))
-    }
-
     // --- foldKey (glide skeleton: diacritics collapse to base keys) ---
 
     @Test fun foldKey_collapsesAllLatvianDiacritics() {
@@ -259,6 +241,13 @@ class SuggestionEngineTest {
     @Test fun correct_treatsYoYeAsSameLetter() {
         // "серьезно" (typed with е) should be treated as already correct -> no correction.
         val foldedSet = ru.map { SuggestionEngine.fold(it) }.toSet()
-        assertNull(SuggestionEngine.correctFrom("серьезно", ru, foldedSet, emptyMap()))
+        assertTrue(SuggestionEngine.correctionsFrom("серьезно", ru, foldedSet, emptyMap(), 1).isEmpty())
+    }
+
+    @Test fun isKnown_learnedWordFoldsYoYe() {
+        // A name learned WITH ё must also count as known when typed with plain е, or autocorrect
+        // rewrites the user's own word.
+        assertTrue(SuggestionEngine.isKnown("семенов", listOf("ru"), mapOf("семёнов" to 3)))
+        assertTrue(SuggestionEngine.isKnown("семёнов", listOf("ru"), mapOf("семёнов" to 3)))
     }
 }

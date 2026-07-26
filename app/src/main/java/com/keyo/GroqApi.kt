@@ -31,10 +31,6 @@ object GroqApi {
     private var lastAiActivityMs = 0L
     private const val CONTEXT_TIMEOUT_MS = 60 * 60 * 1000L // 1 hour — clear context after inactivity
 
-    fun clearAiHistory() {
-        aiHistory.clear()
-    }
-
     private fun usingDefaultKey() = apiKey == BuildConfig.GROQ_API_KEY
 
     // Per https://console.groq.com/docs/errors — short, actionable messages.
@@ -56,8 +52,11 @@ object GroqApi {
         }
     }
 
-    /** Validate the current API key with a tiny request. callback(ok, errorMessage). */
-    fun testKey(callback: (Boolean, String?) -> Unit) {
+    /** Validate an API key with a tiny request. callback(ok, errorMessage).
+     *  Checks the key WITHOUT installing it: [key] defaults to the active one, so Settings can test
+     *  a candidate the user hasn't saved yet and a failed test can't break the working key in use. */
+    fun testKey(key: String = apiKey, callback: (Boolean, String?) -> Unit) {
+        val apiKey = key
         if (apiKey.isBlank()) { callback(false, "No API key set"); return }
         val json = JSONObject().apply {
             put("model", aiModel)
@@ -131,17 +130,6 @@ object GroqApi {
         chat(model, messages, 0.4, 2048, 0, callback)
     }
 
-    /** Find emoji matching a query (any language). Returns a string of emoji characters. */
-    fun suggestEmojis(query: String, callback: (String?, String?) -> Unit) {
-        val sys = "You are an emoji search engine. For the given word or phrase (any language), reply with " +
-            "ONLY relevant emoji characters (10-30 of them), most relevant first. No words, no explanations."
-        val messages = JSONArray().apply {
-            put(JSONObject().apply { put("role", "system"); put("content", sys) })
-            put(JSONObject().apply { put("role", "user"); put("content", query) })
-        }
-        chat("llama-3.1-8b-instant", messages, 0.3, 200, 0, callback)
-    }
-
     fun executeTask(
         task: String,
         context: Context? = null,
@@ -150,15 +138,19 @@ object GroqApi {
     ) {
         // Clear history if inactive for too long
         val now = System.currentTimeMillis()
-        if (now - lastAiActivityMs > CONTEXT_TIMEOUT_MS) {
-            aiHistory.clear()
+        // The history is touched from OkHttp callback threads and from the tool-loop coroutine, so a
+        // second task started while the first is still running used to iterate it while the other
+        // appended — a ConcurrentModificationException on a thread with no catch, i.e. a crash.
+        val history = synchronized(aiHistory) {
+            if (now - lastAiActivityMs > CONTEXT_TIMEOUT_MS) aiHistory.clear()
+            aiHistory.toList()
         }
         lastAiActivityMs = now
 
         val systemPrompt = """You are a keyboard AI assistant with tools. You can execute actions on the user's phone AND generate text.
 
 Rules:
-- If the user asks to DO something (alarm, timer, open app, flashlight, search, volume, etc.) — USE THE APPROPRIATE TOOL.
+- If the user asks to DO something (alarm, timer, open app, flashlight, web search, clipboard) — USE THE APPROPRIATE TOOL.
 - If the user asks to WRITE/COMPOSE text — output the text directly without tools.
 - If user asks to write/say something in a specific language, translate and output in that language.
 - If user asks to compose something (email, message, etc.), write it directly.
@@ -174,7 +166,7 @@ Rules:
                 put("role", "system")
                 put("content", systemPrompt)
             })
-            for (msg in aiHistory) { put(msg) }
+            for (msg in history) { put(msg) }
             put(JSONObject().apply {
                 put("role", "user")
                 put("content", task)
@@ -241,7 +233,10 @@ Rules:
                         JSONObject()
                     }
 
-                    Log.d(TAG, "Executing tool: $toolName($toolArgs)")
+                    // Tool ARGUMENTS and RESULTS are never logged: ClipboardTool returns whatever
+                    // the user copied last, which can be a password or a 2FA code, and Log.d is not
+                    // stripped from release builds.
+                    Log.d(TAG, "Executing tool: $toolName")
 
                     val toolResult = if (context != null) {
                         val tool = ToolRegistry.get(toolName)
@@ -265,7 +260,7 @@ Rules:
                         ToolResult(false, "No context for tool execution")
                     }
 
-                    Log.d(TAG, "Tool result: ${toolResult.output}")
+                    Log.d(TAG, "Tool $toolName finished (ok=${toolResult.success})")
 
                     // Add tool result to messages
                     currentMessages.put(JSONObject().apply {
@@ -282,17 +277,19 @@ Rules:
             val content = message.optString("content", "").trim()
 
             // Save to history
-            aiHistory.add(JSONObject().apply {
-                put("role", "user")
-                put("content", originalTask)
-            })
-            aiHistory.add(JSONObject().apply {
-                put("role", "assistant")
-                put("content", content)
-            })
-            while (aiHistory.size > MAX_HISTORY * 2) {
-                aiHistory.removeAt(0)
-                aiHistory.removeAt(0)
+            synchronized(aiHistory) {
+                aiHistory.add(JSONObject().apply {
+                    put("role", "user")
+                    put("content", originalTask)
+                })
+                aiHistory.add(JSONObject().apply {
+                    put("role", "assistant")
+                    put("content", content)
+                })
+                while (aiHistory.size > MAX_HISTORY * 2) {
+                    aiHistory.removeAt(0)
+                    aiHistory.removeAt(0)
+                }
             }
 
             return content
@@ -385,7 +382,10 @@ Rules:
                     "NEVER translate; 4) keep the meaning, tone and person exactly as dictated. Output ONLY the " +
                     "cleaned transcript text, without the delimiters, with no additions or explanations.")
             })
-            put(JSONObject().apply { put("role", "user"); put("content", "<<<\n$rawText\n>>>") })
+            // Strip any delimiter sequence out of the transcript itself: a dictation Whisper renders
+            // containing ">>>" would close the fence early and leave the tail reading as instructions.
+            val fenced = rawText.replace("<<<", "<< <").replace(">>>", "> >>")
+            put(JSONObject().apply { put("role", "user"); put("content", "<<<\n$fenced\n>>>") })
         }
         chat(model, messages, 0.3, 2048, 0, callback)
     }

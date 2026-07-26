@@ -9,7 +9,7 @@ import android.content.Context
  *  - a bundled frequency word list per language (assets/dict/<lang>.txt, most-frequent first), and
  *  - the user's learned vocabulary ([UserDictionary]) which personalises and improves over time.
  *
- * The ranking/matching algorithms ([completeFrom], [correctFrom], [nextFrom], [editDistanceAtMost])
+ * The ranking/matching algorithms ([completeFrom], [correctionsFrom], [nextFrom], [editDistanceAtMost])
  * are pure functions that take their data as parameters, so they are unit-tested directly without a
  * Context. The public methods just feed them the loaded dictionary + learned maps.
  */
@@ -21,9 +21,6 @@ object SuggestionEngine {
     // Russian dictionary + bigram model alone are several MB parsed). ConcurrentHashMap because
     // suggestions are computed on background dispatchers while another language may still be loading.
     private val byLang = java.util.concurrent.ConcurrentHashMap<String, Vocab>()
-    // Cache of merged dictionaries keyed by the sorted language set (e.g. "en+lv"), so a
-    // multilingual keyboard (English + Latvian share one Latin layout) builds the union once.
-    private val mergedByLangs = HashMap<String, Vocab>()
     // Bundled bigram model per language: prev-word -> followers, most-frequent first (from a corpus,
     // assets/dict/bigram_<lang>.txt). Gives next-word prediction / context from day one, before the
     // user's own [UserDictionary] bigrams have learned anything.
@@ -80,59 +77,26 @@ object SuggestionEngine {
 
     private fun vocab(lang: String): Vocab? = byLang[lang] ?: byLang["en"]
 
-    /** Vocab covering every language in [langs], merged. One language returns its own Vocab; several
-     *  (e.g. English + Latvian on a shared Latin keyboard) are interleaved by frequency rank and
-     *  deduped, then cached. Empty/unknown langs fall back to English. */
+    /** Vocab for the active language. [langs] is a list only because a keyboard could once merge two
+     *  dictionaries (the reverted EN+LV experiment); today it always holds exactly one language and
+     *  anything past the first is ignored. Empty/unknown falls back to English. */
     private fun vocab(langs: List<String>): Vocab? {
-        if (langs.size <= 1) return vocab(langs.firstOrNull() ?: return byLang["en"])
-        val key = langs.toSortedSet().joinToString("+")
-        // Suggestions are computed off the main thread now, so the merged-vocab cache can be hit
-        // from several threads — build/publish under a lock.
-        synchronized(mergedByLangs) {
-            mergedByLangs[key]?.let { return it }
-            val wanted = langs.toSortedSet()
-            val parts = wanted.mapNotNull { byLang[it] }.filter { it.words.isNotEmpty() }
-            if (parts.size <= 1) return parts.firstOrNull() ?: byLang["en"]
-            val words = mergeRanked(parts.map { it.words })
-            val folded = HashSet<String>(words.size * 2)
-            words.forEach { folded.add(fold(it)) }
-            val merged = Vocab(words, folded)
-            // Only cache a COMPLETE merge — with lazy per-language loading a language may still be
-            // loading, and caching a partial union would freeze it out permanently.
-            if (parts.size == wanted.count { byLang.containsKey(it) } && parts.size == wanted.size)
-                mergedByLangs[key] = merged
-            return merged
-        }
+        val lang = langs.firstOrNull() ?: return byLang["en"]
+        return vocab(lang)
     }
 
     /** Completions that extend [prefixLower] (all lowercase), personalised words first. */
-    fun complete(prefixLower: String, lang: String, learnedUni: Map<String, Int>, limit: Int = 3): List<String> =
-        complete(prefixLower, listOf(lang), learnedUni, limit)
     fun complete(prefixLower: String, langs: List<String>, learnedUni: Map<String, Int>, limit: Int = 3): List<String> {
         val v = vocab(langs) ?: return emptyList()
         return completeFrom(prefixLower, v.words, learnedUni, limit)
     }
 
-    /** Best correction for [wordLower], or null if it is already known or nothing close is found. */
-    fun correct(wordLower: String, lang: String, learnedUni: Map<String, Int>): String? =
-        correct(wordLower, listOf(lang), learnedUni)
-    fun correct(wordLower: String, langs: List<String>, learnedUni: Map<String, Int>): String? {
-        val v = vocab(langs) ?: return null
-        return correctFrom(wordLower, v.words, v.set, learnedUni)
-    }
-
     /** Up to [limit] closest known words to [wordLower] (typo candidates), best first; empty if the
      *  word is already known. The user's learned words are included as high-priority targets. */
-    fun corrections(wordLower: String, lang: String, learnedUni: Map<String, Int>, limit: Int = 2): List<String> =
-        corrections(wordLower, listOf(lang), learnedUni, limit)
     fun corrections(wordLower: String, langs: List<String>, learnedUni: Map<String, Int>, limit: Int = 2, maxEdits: Int = 0, prefer: Set<String> = emptySet()): List<String> {
         val v = vocab(langs) ?: return emptyList()
         return correctionsFrom(wordLower, v.words, v.set, learnedUni, limit, maxEdits = maxEdits, prefer = prefer)
     }
-
-    /** Predicted next words after [prevLower], from the user's learned bigrams. */
-    fun nextWords(prevLower: String, learnedBi: Map<String, Map<String, Int>>, limit: Int = 3): List<String> =
-        nextFrom(prevLower, learnedBi, limit)
 
     /** Merged "what tends to follow [prevLower]" with weights, combining the bundled bigram model
      *  ([langs]) with the user's learned bigrams (weighted heavily, since personal). Empty when
@@ -148,7 +112,10 @@ object SuggestionEngine {
                 if (weight > (out[w] ?: 0)) out[w] = weight
             }
         }
-        learnedBi[prevLower]?.forEach { (w, c) -> out[w] = (out[w] ?: 0) + c * 4 }   // personal wins
+        // Personal pairs win — and are looked up folded like the bundled model, so counts learned
+        // after "ещё" still apply when the user types the (equally correct) "еще".
+        learnedBi[prevLower]?.forEach { (w, c) -> out[w] = (out[w] ?: 0) + c * 4 }
+        if (p != prevLower) learnedBi[p]?.forEach { (w, c) -> out[w] = (out[w] ?: 0) + c * 4 }
         return out
     }
 
@@ -160,14 +127,17 @@ object SuggestionEngine {
     }
 
     /** The frequency-ordered bundled word list for [langs] (most frequent first). For glide typing. */
-    fun wordList(lang: String): List<String> = vocab(lang)?.words ?: emptyList()
     fun wordList(langs: List<String>): List<String> = vocab(langs)?.words ?: emptyList()
 
-    fun isKnown(wordLower: String, lang: String, learnedUni: Map<String, Int>): Boolean =
-        isKnown(wordLower, listOf(lang), learnedUni)
     fun isKnown(wordLower: String, langs: List<String>, learnedUni: Map<String, Int>): Boolean {
         if (learnedUni.containsKey(wordLower)) return true
-        return vocab(langs)?.set?.contains(fold(wordLower)) == true
+        val f = fold(wordLower)
+        // Personal words fold too (ё == е), the same way the bundled set does. Without this, a name
+        // learned as "семёнов" left the everyday ё-less spelling "семенов" unknown — and so fair game
+        // for autocorrect. Only worth scanning when an е/ё is actually in play.
+        if ((wordLower.indexOf('е') >= 0 || wordLower.indexOf('ё') >= 0) &&
+            learnedUni.keys.any { fold(it) == f }) return true
+        return vocab(langs)?.set?.contains(f) == true
     }
 
     /** Treat ё and е as the same letter (Russian text routinely omits ё). No-op for en/lv. */
@@ -238,24 +208,6 @@ object SuggestionEngine {
     // Pure algorithms (no Android dependency) — unit-tested directly.
     // ---------------------------------------------------------------------------------------------
 
-    /** Merge several frequency-ordered word lists into one. Round-robins by rank (each list's rank-0
-     *  word, then every rank-1 word, …) so both languages keep equal footing, and dedupes by exact
-     *  word — the first (best-ranked) occurrence wins. Backs the bilingual Latin keyboard. */
-    internal fun mergeRanked(lists: List<List<String>>): List<String> {
-        val parts = lists.filter { it.isNotEmpty() }
-        if (parts.size <= 1) return parts.firstOrNull() ?: emptyList()
-        val out = ArrayList<String>(parts.sumOf { it.size })
-        val seen = HashSet<String>(out.size)
-        var i = 0
-        var more = true
-        while (more) {
-            more = false
-            for (l in parts) if (i < l.size) { val w = l[i]; if (seen.add(w)) out.add(w); more = true }
-            i++
-        }
-        return out
-    }
-
     /** Words that start with [prefix] and are longer than it; learned words (by count) first, then
      *  the frequency-ordered [words]. */
     internal fun completeFrom(
@@ -281,16 +233,6 @@ object SuggestionEngine {
         }
         return out.toList()
     }
-
-    /** Closest dictionary/learned word to [word] within a small edit distance, or null when [word]
-     *  is already known. Thin wrapper over [correctionsFrom]. */
-    internal fun correctFrom(
-        word: String,
-        words: List<String>,
-        vocabSet: Set<String>,
-        learnedUni: Map<String, Int>,
-        scanLimit: Int = 6000
-    ): String? = correctionsFrom(word, words, vocabSet, learnedUni, 1, scanLimit).firstOrNull()
 
     /** Ranked typo corrections for [word]: closest edit distance first, and at equal distance the
      *  user's learned words rank above the bundled list, which is ordered by frequency. Returns an
@@ -359,8 +301,27 @@ object SuggestionEngine {
         return s
     }
 
+    /** Fingers land BELOW the point the user is aiming at — the contact patch sits behind the
+     *  fingertip — so a key's effective target centre is this fraction of a key height lower than
+     *  its drawn centre. Only affects the spatial tie-breaking below, never which key Android's own
+     *  hit-testing reports, so an imperfect value can't misroute a plain tap. */
+    const val TOUCH_BIAS_Y = 0.12f
+
+    /** Distance from a touch to a key centre measured in CELLS: horizontal error normalised by key
+     *  width, vertical by key height. Keyboard cells aren't square (a key is wider than it is tall,
+     *  or the reverse), and the old width-only normalisation therefore understated vertical error —
+     *  a tap barely below centre already put the key in the row below into contention. */
+    fun cellDistance(
+        px: Float, py: Float, cx: Float, cy: Float,
+        keyW: Float, keyH: Float, biasY: Float = TOUCH_BIAS_Y
+    ): Float {
+        val dx = (px - cx) / keyW
+        val dy = (py - (cy + biasY * keyH)) / keyH
+        return kotlin.math.sqrt(dx * dx + dy * dy)
+    }
+
     /** Gboard-style dynamic key targets: decide which key a tap near a key boundary actually meant.
-     *  [cands] = the two nearest keys with their distances from the tap point in key-widths
+     *  [cands] = the two nearest keys with their distances from the tap point in cells
      *  (nearest first); [strength] scores how well a key continues the word being typed (e.g.
      *  [prefixStrength] of prefix+key). Keeps [tapped] unless the alternative wins clearly on the
      *  combined spatial × language score — dead-centre taps are never second-guessed. */

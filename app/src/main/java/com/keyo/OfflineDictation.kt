@@ -3,6 +3,8 @@ package com.keyo
 import android.content.Context
 import android.content.Intent
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
@@ -17,6 +19,20 @@ class OfflineDictation(private val context: Context) {
     private var recognizer: SpeechRecognizer? = null
     var active = false
         private set
+
+    private val handler = Handler(Looper.getMainLooper())
+    private var watchdog: Runnable? = null
+
+    companion object {
+        /** Some OEM recognizer services are killed (or simply hang) without ever delivering
+         *  onResults or onError, which used to leave dictation stuck on "Transcribing…" with a live
+         *  mic until the IME was destroyed. The watchdog fires after this long with NO SIGN OF LIFE —
+         *  it is re-armed on every partial result / speech event, so it never cuts off someone who
+         *  is simply still talking. */
+        private const val SESSION_TIMEOUT_MS = 20_000L
+        /** Once stopListening() has been called the result is due immediately, so the grace is short. */
+        private const val FINISH_TIMEOUT_MS = 6_000L
+    }
 
     fun isAvailable(): Boolean =
         try { SpeechRecognizer.isRecognitionAvailable(context) } catch (_: Throwable) { false }
@@ -35,26 +51,33 @@ class OfflineDictation(private val context: Context) {
         recognizer = r
         active = true
         var finished = false
+        var lastPartial: String? = null
         fun finish(text: String?) {
             if (finished) return
             finished = true
             active = false
+            cancelWatchdog()
             onFinal(text)
             destroy()
         }
+        // Keep the best interim text if the service dies silently — better than losing the utterance.
+        armWatchdog(SESSION_TIMEOUT_MS) { finish(lastPartial) }
         r.setRecognitionListener(object : RecognitionListener {
             override fun onPartialResults(partialResults: Bundle?) {
                 val t = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
-                if (!t.isNullOrBlank() && active) onPartial(t)
+                if (!t.isNullOrBlank() && active) { lastPartial = t; onPartial(t) }
+                rearmWatchdog(SESSION_TIMEOUT_MS)
             }
             override fun onResults(results: Bundle?) =
                 finish(results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull())
             override fun onError(error: Int) = finish(null)
-            override fun onReadyForSpeech(params: Bundle?) {}
-            override fun onBeginningOfSpeech() {}
-            override fun onRmsChanged(rmsdB: Float) {}
+            override fun onReadyForSpeech(params: Bundle?) = rearmWatchdog(SESSION_TIMEOUT_MS)
+            override fun onBeginningOfSpeech() = rearmWatchdog(SESSION_TIMEOUT_MS)
+            // Fires continuously while the mic is live: the clearest "the service is alive and the
+            // user may still be talking" signal, so a long dictation is never cut short.
+            override fun onRmsChanged(rmsdB: Float) = rearmWatchdog(SESSION_TIMEOUT_MS)
             override fun onBufferReceived(buffer: ByteArray?) {}
-            override fun onEndOfSpeech() {}
+            override fun onEndOfSpeech() = rearmWatchdog(FINISH_TIMEOUT_MS)
             override fun onEvent(eventType: Int, params: Bundle?) {}
         })
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
@@ -69,13 +92,36 @@ class OfflineDictation(private val context: Context) {
     /** Finish listening; the final result still arrives via the session's onFinal. */
     fun stop() {
         try { recognizer?.stopListening() } catch (_: Throwable) {}
+        // The result is due now, so shorten the watchdog: a recognizer that never answers should
+        // not hold "Transcribing…" and the mic for the full session timeout.
+        if (active) rearmWatchdog(FINISH_TIMEOUT_MS)
     }
 
     /** Abort without a result. */
     fun cancel() {
         active = false
+        cancelWatchdog()
         try { recognizer?.cancel() } catch (_: Throwable) {}
         destroy()
+    }
+
+    private fun armWatchdog(delay: Long, onTimeout: () -> Unit) {
+        cancelWatchdog()
+        val r = Runnable { if (active) onTimeout() }
+        watchdog = r
+        handler.postDelayed(r, delay)
+    }
+
+    /** Re-post the existing timeout action with a new delay. */
+    private fun rearmWatchdog(delay: Long) {
+        val r = watchdog ?: return
+        handler.removeCallbacks(r)
+        handler.postDelayed(r, delay)
+    }
+
+    private fun cancelWatchdog() {
+        watchdog?.let { handler.removeCallbacks(it) }
+        watchdog = null
     }
 
     private fun destroy() {

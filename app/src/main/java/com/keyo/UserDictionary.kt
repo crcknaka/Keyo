@@ -19,6 +19,9 @@ object UserDictionary {
     private const val MAX_UNIGRAMS = 4000
     private const val MAX_BIGRAM_KEYS = 2500
     private const val MAX_FOLLOWERS = 12
+    private const val MAX_COUNT = 1_000_000            // per-entry ceiling, keeps counts overflow-free
+    // A full export of a capped dictionary is well under 1 MB; anything larger is not one of ours.
+    private const val MAX_IMPORT_CHARS = 4_000_000
 
     // @Volatile vars (not vals): ensureLoaded builds fresh maps on the IO thread and publishes them
     // atomically, so main-thread readers see either the old map or the complete new one — never a
@@ -80,12 +83,18 @@ object UserDictionary {
     /** Manually add a word so it shows up in suggestions. Returns false if it isn't a valid word. */
     fun addWord(word: String): Boolean = synchronized(this) {
         val w = word.trim().lowercase()
-        if (w.length < 2 || w.length > 32) return false
-        if (w.any { !it.isLetter() && it != '\'' && it != '-' }) return false
+        if (!isValidWord(w)) return false
         unigram[w] = maxOf(unigram[w] ?: 0, 5) // seed a count so it ranks among learned words
+        if (unigram.size > MAX_UNIGRAMS) pruneSmallest(unigram, MAX_UNIGRAMS, keep = w)
         dirty = true
         return true
     }
+
+    /** A word the dictionary will accept: letters (any script) plus apostrophe/hyphen. Rejects the
+     *  spaces, newlines and control characters an imported file could otherwise smuggle in. */
+    private fun isValidWord(w: String): Boolean =
+        w.length in 2..32 && w.any { it.isLetter() } &&
+            w.all { it.isLetter() || it == '\'' || it == '-' }
 
     /** Remove a word and any bigrams that reference it. */
     fun removeWord(word: String): Unit = synchronized(this) {
@@ -107,7 +116,9 @@ object UserDictionary {
         if (word.length < 2 || word.length > 32) return
         if (bumpUnigram) {
             unigram[word] = (unigram[word] ?: 0) + 1
-            if (unigram.size > MAX_UNIGRAMS) pruneSmallest(unigram, MAX_UNIGRAMS)
+            // keep = word: at the cap, every fresh word has count 1, so an unqualified prune could
+            // evict the very word just learned (HashMap order decides the tie) — silently doing nothing.
+            if (unigram.size > MAX_UNIGRAMS) pruneSmallest(unigram, MAX_UNIGRAMS, keep = word)
             dirty = true
         }
         if (!prev.isNullOrEmpty()) {
@@ -162,25 +173,38 @@ object UserDictionary {
      *  the larger value, bigram counts add — same rules as the load-race merge). Returns the number
      *  of words that were NEW, or -1 if [json] is not a Keyo dictionary export. */
     fun importJson(json: String): Int = synchronized(this) {
+        // The file comes from outside the app (any document the picker can reach), so treat it as
+        // untrusted: bail out on an oversized payload before parsing, validate every key as a real
+        // word, and stop once the caps are reached instead of materializing the whole thing first.
+        if (json.length > MAX_IMPORT_CHARS) return -1
         val root = try { JSONObject(json) } catch (_: Exception) { return -1 }
         if (!root.has("keyo_dictionary") || !root.has("u")) return -1
         var newWords = 0
         try {
             root.optJSONObject("u")?.let { uj ->
                 for (k in uj.keys()) {
+                    // continue, not break: at the cap we stop taking NEW words but must still merge
+                    // counts for words already present, or re-importing your own export no-ops.
+                    if (unigram.size >= MAX_UNIGRAMS && !unigram.containsKey(k)) continue
                     val v = uj.optInt(k, 0)
-                    if (v <= 0 || k.length < 2 || k.length > 32) continue
+                    if (v <= 0 || !isValidWord(k)) continue
                     if (!unigram.containsKey(k)) newWords++
                     unigram[k] = maxOf(unigram[k] ?: 0, v)
                 }
             }
             root.optJSONObject("b")?.let { bj ->
                 for (prev in bj.keys()) {
+                    if (bigram.size >= MAX_BIGRAM_KEYS && !bigram.containsKey(prev)) continue
+                    if (!isValidWord(prev)) continue
                     val inner = bj.optJSONObject(prev) ?: continue
                     val followers = bigram.getOrPut(prev) { HashMap() }
                     for (next in inner.keys()) {
+                        if (!isValidWord(next)) continue
                         val v = inner.optInt(next, 0)
-                        if (v > 0) followers[next] = (followers[next] ?: 0) + v
+                        // Clamp instead of adding blindly: a count near Int.MAX_VALUE would wrap
+                        // negative on a second import and sink the pair to the bottom of every rank.
+                        if (v > 0) followers[next] = ((followers[next] ?: 0).toLong() + v)
+                            .coerceAtMost(MAX_COUNT.toLong()).toInt()
                     }
                     if (followers.size > MAX_FOLLOWERS) pruneSmallest(followers, MAX_FOLLOWERS)
                 }
@@ -192,8 +216,14 @@ object UserDictionary {
         return newWords
     }
 
-    private fun pruneSmallest(map: HashMap<String, Int>, target: Int) {
-        val remove = map.entries.sortedBy { it.value }.take((map.size - target).coerceAtLeast(0)).map { it.key }
+    /** Drop the lowest-count entries down to [target]. [keep] is never evicted. */
+    private fun pruneSmallest(map: HashMap<String, Int>, target: Int, keep: String? = null) {
+        val remove = map.entries.asSequence()
+            .filter { it.key != keep }
+            .sortedBy { it.value }
+            .take((map.size - target).coerceAtLeast(0))
+            .map { it.key }
+            .toList()
         remove.forEach { map.remove(it) }
     }
 

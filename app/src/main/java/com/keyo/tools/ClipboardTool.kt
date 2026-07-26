@@ -37,9 +37,9 @@ class ClipboardTool : Tool {
                 val clip = clipboard.primaryClip
                 if (clip != null && clip.itemCount > 0) {
                     val text = clip.getItemAt(0).coerceToText(context).toString()
-                    ToolResult(true, "Clipboard: $text", silent = true)
+                    ToolResult(true, "Clipboard: $text")
                 } else {
-                    ToolResult(true, "Clipboard is empty", silent = true)
+                    ToolResult(true, "Clipboard is empty")
                 }
             }
             "write" -> {

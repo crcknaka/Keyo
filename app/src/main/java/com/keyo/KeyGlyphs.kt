@@ -97,25 +97,6 @@ internal fun ClipboardGlyph(color: Color, modifier: Modifier) {
 }
 
 @Composable
-internal fun StarGlyph(color: Color, modifier: Modifier) {
-    Canvas(modifier) {
-        val cx = size.width / 2f; val cy = size.height / 2f
-        val rOut = size.minDimension / 2f * 0.92f
-        val rIn = rOut * 0.42f
-        val path = androidx.compose.ui.graphics.Path()
-        for (i in 0 until 10) {
-            val r = if (i % 2 == 0) rOut else rIn
-            val a = Math.toRadians((-90.0 + i * 36.0))
-            val x = cx + (kotlin.math.cos(a) * r).toFloat()
-            val y = cy + (kotlin.math.sin(a) * r).toFloat()
-            if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
-        }
-        path.close()
-        drawPath(path, color)
-    }
-}
-
-@Composable
 internal fun GearGlyph(color: Color, modifier: Modifier) {
     Canvas(modifier) {
         val cx = size.width / 2f; val cy = size.height / 2f

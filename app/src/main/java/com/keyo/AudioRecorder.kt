@@ -9,7 +9,9 @@ import java.io.FileOutputStream
 
 class AudioRecorder {
     private var audioRecord: AudioRecord? = null
-    private var isRecording = false
+    // Written on the main thread (start/stop), read by the capture thread's loop condition — without
+    // @Volatile the thread can miss the stop and keep reading a released AudioRecord.
+    @Volatile private var isRecording = false
     private var recordingThread: Thread? = null
     private val sampleRate = 16000
     private val channelConfig = AudioFormat.CHANNEL_IN_MONO
@@ -27,63 +29,77 @@ class AudioRecorder {
                 MediaRecorder.AudioSource.MIC,
                 sampleRate, channelConfig, audioFormat, bufferSize * 4
             )
-            if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) return false
+            // A recorder that failed to initialize (mic held by another app) still owns a native
+            // handle — release it, or repeated retries exhaust the device's recorders.
+            if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
+                try { audioRecord?.release() } catch (_: Exception) {}
+                audioRecord = null
+                return false
+            }
 
             pcmData = ByteArrayOutputStream()
             audioRecord?.startRecording()
             isRecording = true
 
+            val rec = audioRecord
             recordingThread = Thread {
-                val buffer = ByteArray(bufferSize)
-                while (isRecording) {
-                    val read = audioRecord?.read(buffer, 0, buffer.size) ?: -1
-                    if (read > 0) {
-                        synchronized(pcmData) {
-                            pcmData.write(buffer, 0, read)
-                        }
+                try {
+                    val buffer = ByteArray(bufferSize)
+                    while (isRecording) {
+                        // A negative read is an error code (ERROR_INVALID_OPERATION / DEAD_OBJECT) —
+                        // leave the loop instead of spinning on it forever.
+                        val read = try { rec?.read(buffer, 0, buffer.size) ?: -1 } catch (_: Exception) { -1 }
+                        if (read > 0) {
+                            synchronized(pcmData) {
+                                pcmData.write(buffer, 0, read)
+                            }
+                        } else if (read < 0) break
                     }
+                } finally {
+                    // The capture thread OWNS the recorder's teardown: releasing it from stop()
+                    // instead would leave this thread reading a freed object whenever it outlives
+                    // the join (the join is a safety net, not a guarantee).
+                    try { rec?.stop() } catch (_: Exception) {}
+                    try { rec?.release() } catch (_: Exception) {}
                 }
             }.also { it.start() }
 
             return true
         } catch (e: SecurityException) {
+            try { audioRecord?.release() } catch (_: Exception) {}
+            audioRecord = null
             return false
         }
     }
 
     fun stop(outputFile: File): Boolean {
-        if (!isRecording) return false
-        isRecording = false
-
-        try {
-            recordingThread?.join(2000)
-            audioRecord?.stop()
-            audioRecord?.release()
-            audioRecord = null
-
-            val pcmBytes: ByteArray
-            synchronized(pcmData) {
-                pcmBytes = pcmData.toByteArray()
-            }
-
-            if (pcmBytes.isEmpty()) return false
-
-            // Write WAV file
-            writeWav(outputFile, pcmBytes)
-            return true
-        } catch (e: Exception) {
-            return false
-        }
-    }
-
-    /** Write the audio captured SO FAR to [outputFile] as WAV without stopping the recording.
-     *  Used by live dictation to transcribe the growing utterance periodically. */
-    fun snapshot(outputFile: File): Boolean {
-        if (!isRecording) return false
-        val pcmBytes: ByteArray
-        synchronized(pcmData) { pcmBytes = pcmData.toByteArray() }
+        val pcmBytes = stopAndDrain() ?: return false
         if (pcmBytes.isEmpty()) return false
         return try { writeWav(outputFile, pcmBytes); true } catch (e: Exception) { false }
+    }
+
+    /** Stop recording and DISCARD the audio — nothing is written to disk. Used when the user
+     *  cancels a dictation: audio they asked to throw away must not linger in the cache. */
+    fun discard() { stopAndDrain() }
+
+    /** Stops the capture thread and returns the captured PCM (null on error). The recorder itself is
+     *  stopped and released by that thread as it exits. */
+    private fun stopAndDrain(): ByteArray? {
+        if (!isRecording) return null
+        isRecording = false
+        return try {
+            // The capture thread notices the flag within one read() (a buffer's worth of audio, tens
+            // of ms); the join just makes the common case deterministic. It runs on the main thread,
+            // so it must stay short — the audio is already safe either way, since it's collected
+            // under the pcmData lock.
+            recordingThread?.join(500)
+            recordingThread = null
+            audioRecord = null
+            synchronized(pcmData) { pcmData.toByteArray() }
+        } catch (e: Exception) {
+            audioRecord = null
+            null
+        }
     }
 
     private fun writeWav(file: File, pcmData: ByteArray) {

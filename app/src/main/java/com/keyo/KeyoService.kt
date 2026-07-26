@@ -69,30 +69,6 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     // keeps working offline (on-device recognition with downloaded language packs).
     private val offlineDictation by lazy { OfflineDictation(this) }
     private var offlineSession = false
-    // Live dictation: while recording, periodically transcribe the audio-so-far and show it as a
-    // growing composing region (the final commitText on release replaces it). One transcription in
-    // flight at a time (liveBusy). Off unless KeyboardPrefs.isLiveDictation.
-    private var liveBusy = false
-    private val liveDictationTick = object : Runnable {
-        override fun run() {
-            if (!audioRecorder.isActive()) return
-            if (!liveBusy) {
-                val f = File(cacheDir, "voice_live.wav")
-                if (audioRecorder.snapshot(f)) {
-                    liveBusy = true
-                    GroqApi.transcribe(f) { text, _ ->
-                        handler.post {
-                            liveBusy = false
-                            if (audioRecorder.isActive() && !text.isNullOrBlank()) {
-                                try { currentInputConnection?.setComposingText(text, 1) } catch (_: Exception) {}
-                            }
-                        }
-                    }
-                }
-            }
-            handler.postDelayed(this, 1600)
-        }
-    }
     // One lifecycle-scoped coroutine scope for the whole service. Cancelled in onDestroy() so no
     // launched job (long-press timers, AI/voice callbacks) can outlive the keyboard and touch
     // destroyed Compose state.
@@ -138,6 +114,62 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     // The raw inputType of the current field; getCursorCapsMode reads its CAP_* flags.
     private var fieldInputType = 0
 
+    // ---- Wrong-field protection for long-running voice / AI results ----
+    // A Groq round-trip takes seconds (the assistant's tool loop: minutes). Committing the answer
+    // blindly into `currentInputConnection` at callback time lands it in whatever field the user
+    // moved to meanwhile — including a password box in another app — and the rewrite path would
+    // first DELETE up to 4000 characters of it. Every such callback captures a field token when the
+    // request starts and re-checks it before touching the field.
+    //
+    // The token identifies the FIELD (view id + package + type), not a monotonic session counter:
+    // apps call restartInput mid-dictation all the time, and the earlier counter-based attempt
+    // dropped perfectly good transcriptions whenever that happened.
+    //
+    // Resolution limit: Compose text fields and WebView inputs report no view id, so two same-typed
+    // fields on one screen share a token. What it reliably catches is the case that matters — a
+    // different app, a different field type, and (via the password check below) any password box.
+    private fun fieldToken(): String {
+        val info = currentInputEditorInfo ?: return ""
+        return "${info.packageName}|${info.fieldId}|${info.inputType}"
+    }
+
+    // Is it still safe to write the result of a request that started in `token`'s field?
+    // Unknown tokens fail OPEN (some apps report no field id, and dropping real dictation is worse
+    // than a rare stray insert) — but a password field is never written into, token or not.
+    private fun canCommitTo(token: String): Boolean {
+        if (currentInputConnection == null) return false
+        if (isPasswordType(currentInputEditorInfo?.inputType ?: 0)) return false
+        val now = fieldToken()
+        if (token.isEmpty() || now.isEmpty()) return true
+        return now == token
+    }
+
+    // Clear the status line after `delay`, but only if it still shows `expected`. An unconditional
+    // clear blanks a NEWER message — e.g. a failure toast queued at +2.5s wiping the
+    // "🎤 Recording…" of a dictation the user started right after it.
+    private fun clearStatusLater(expected: String, delay: Long) {
+        handler.postDelayed({ if (statusText.value == expected) statusText.value = "" }, delay)
+    }
+
+    /** Say so when a transcription/answer is thrown away because the user moved to another field —
+     *  silently blanking the spinner looks like dictation just failed. */
+    private fun showDroppedDictation() {
+        val msg = "🎤 Field changed — dictation dropped"
+        statusText.value = msg
+        clearStatusLater(msg, 2500)
+    }
+
+    private fun isPasswordType(inputType: Int): Boolean {
+        val cls = inputType and android.text.InputType.TYPE_MASK_CLASS
+        val variation = inputType and android.text.InputType.TYPE_MASK_VARIATION
+        return (cls == android.text.InputType.TYPE_CLASS_TEXT && (
+            variation == android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD ||
+            variation == android.text.InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD ||
+            variation == android.text.InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD)) ||
+            (cls == android.text.InputType.TYPE_CLASS_NUMBER &&
+                variation == android.text.InputType.TYPE_NUMBER_VARIATION_PASSWORD)
+    }
+
     // Cached hot-path settings (refreshed in reloadPrefs) to avoid SharedPreferences reads per keystroke.
     private var doubleSpaceOn = true
     private var autoCapOn = true
@@ -153,6 +185,9 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private var glideOrigin = Offset.Zero               // window position of the key-grid container
     private val glideTrail = mutableStateListOf<Offset>()  // container-local coords; drawn by the Canvas
     private val glideActive = mutableStateOf(false)
+    // The key-press preview (glyph + the key's window rect), rendered once by the key-grid overlay
+    // rather than by each key in its own Popup window. Null when no key is held.
+    private val previewKey = mutableStateOf<Pair<String, Rect>?>(null)
     // The word a just-finished glide inserted (followed by an auto-space). While set, the strip shows
     // [glideAlts] so a wrong guess is one tap away, Backspace undoes the whole glide, and the next
     // sentence punctuation pulls back onto the word. Cleared as soon as you type past it / move away.
@@ -170,10 +205,19 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     // previous word ("чау как" -> "чаук ак"). So a space tap is marked "pending" on key-down and the
     // next character flushes it first, keeping the real key order.
     private var pendingSpaceTap = false
+    // True when the last letter was committed WITHOUT a composing region (a mid-word insert: a word
+    // character follows the caret). A glide starting on such a key must delete that letter before
+    // splicing its word in, or the start letter is duplicated ("|world" + glide "hello" -> "hhello").
+    private var plainLetterCommitted = false
     // When the last of OUR OWN edits happened. onUpdateSelection uses this to tell a stale
     // out-of-order callback (arrives milliseconds after our keystroke) from a genuine external
     // finalize of the composing region while the keyboard is idle.
     private var lastSelfEditMs = 0L
+
+    /** Stamp "the keyboard just edited the field". onUpdateSelection uses this to tell our own
+     *  callbacks from a caret move the USER made — so every path that writes to the
+     *  InputConnection must call it, not just the plain keystroke ones. */
+    private fun markSelfEdit() { lastSelfEditMs = System.currentTimeMillis() }
     // Live glide preview: the current best guess shown above the keys while the finger is still
     // swiping (Gboard-style). Throttled: one background decode in flight, every ~6 new points.
     private val glidePreview = mutableStateOf<String?>(null)
@@ -219,7 +263,15 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private val clipListener = android.content.ClipboardManager.OnPrimaryClipChangedListener {
         if (!noLearn) {
             try {
-                val text = clipboardManager?.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString()
+                val clip = clipboardManager?.primaryClip
+                // Password managers and OTP fields flag their copies as sensitive (API 33+, but the
+                // extra is set by many apps below it too). Those must never reach a plaintext history
+                // — this listener also runs while no field of ours is focused, so the field-based
+                // `noLearn` gate above says nothing about where the text came from.
+                val sensitive = clip?.description?.extras
+                    ?.getBoolean("android.content.extra.IS_SENSITIVE") == true
+                val text = if (sensitive) null
+                    else clip?.getItemAt(0)?.coerceToText(this)?.toString()
                 if (!text.isNullOrBlank()) {
                     KeyboardPrefs.addClip(this, text)
                     handler.post {
@@ -444,13 +496,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         val inputType = info?.inputType ?: 0
         val cls = inputType and android.text.InputType.TYPE_MASK_CLASS
         val variation = inputType and android.text.InputType.TYPE_MASK_VARIATION
-        val isPassword =
-            (cls == android.text.InputType.TYPE_CLASS_TEXT && (
-                variation == android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD ||
-                variation == android.text.InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD ||
-                variation == android.text.InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD)) ||
-            (cls == android.text.InputType.TYPE_CLASS_NUMBER &&
-                variation == android.text.InputType.TYPE_NUMBER_VARIATION_PASSWORD)
+        val isPassword = isPasswordType(inputType)
         val noLearning = ((info?.imeOptions ?: 0) and
             android.view.inputmethod.EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING) != 0
         secureField = isPassword              // blocks voice/AI/suggestions/composing (passwords only)
@@ -481,7 +527,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         pendingAutoSpace = false
         autoSpaceSkipNextSel = false
         pendingSpaceTap = false
+        plainLetterCommitted = false
+        previewKey.value = null   // a key held while the field changed must not leave its preview up
         handler.removeCallbacks(updateSuggestionsRunnable)   // drop any debounced compute from the old field
+        suggGen++            // invalidate any pass already running for the previous field
         setSuggestions(emptyList(), null)
         confirmDeferred?.complete(false); confirmDeferred = null; pendingConfirm.value = null
         // Open in the layout the field asks for (Gboard behaviour): number/date fields get the
@@ -520,6 +569,9 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         pendingAutoSpace = false
         autoSpaceSkipNextSel = false
         pendingSpaceTap = false
+        handler.removeCallbacks(updateSuggestionsRunnable)
+        suggGen++            // no suggestion pass from this field may publish into the next one
+        setSuggestions(emptyList(), null)
     }
 
     override fun onEvaluateFullscreenMode(): Boolean {
@@ -547,6 +599,11 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         // Cancel pending delayed work and all launched coroutines so nothing fires after teardown.
         handler.removeCallbacksAndMessages(null)
         offlineDictation.cancel()
+        // Release the mic: a recording still running when the IME is destroyed keeps the capture
+        // thread alive and leaves the system's "microphone in use" indicator on.
+        try { audioRecorder.discard() } catch (_: Exception) {}
+        try { aiAudioRecorder.discard() } catch (_: Exception) {}
+        try { rewriteRecorder.discard() } catch (_: Exception) {}
         UserDictionary.save(this)
         confirmDeferred?.complete(false); confirmDeferred = null
         serviceJob.cancel()
@@ -554,13 +611,45 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         super.onDestroy()
     }
 
+    /** Row pitch for the CURRENT orientation, in dp.
+     *
+     *  Rotated, the screen is only ~411dp tall, and a portrait-height keyboard would cover ~86% of
+     *  it — the text being typed disappears behind it. Gboard shrinks its rows to about two thirds
+     *  in landscape (measured: 37.3dp row pitch there vs 56dp portrait), leaving the app roughly
+     *  40% of the screen. Whatever height the user picked is scaled by the same factor. */
+    @Composable
+    private fun rowHeightDp(): Int {
+        val cfg = androidx.compose.ui.platform.LocalConfiguration.current
+        val h = keyHeightDp.intValue
+        return if (cfg.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE)
+            (h * 2 / 3).coerceAtLeast(28) else h
+    }
+
+    @Composable
+    private fun rowHeight(): androidx.compose.ui.unit.Dp = rowHeightDp().dp
+
+    /** Vertical gap between keys for the current orientation. Gboard shrinks this MORE than it
+     *  shrinks the rows themselves in landscape (measured 2.45dp per side there vs 5.5dp portrait):
+     *  with short rows the gap would otherwise eat most of the key. */
+    @Composable
+    private fun gapV(): androidx.compose.ui.unit.Dp {
+        val cfg = androidx.compose.ui.platform.LocalConfiguration.current
+        val g = keyVGapDp.intValue
+        return (if (cfg.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE)
+            (g / 2).coerceAtLeast(2) else g).dp
+    }
+
+    /** Glyph size that matches the current row height (so landscape keys don't keep portrait text). */
+    @Composable
+    private fun keyFontSize(): androidx.compose.ui.unit.TextUnit =
+        KeyboardPrefs.fontSizeSp(rowHeightDp(), keyVGapDp.intValue).sp
+
     @Composable
     fun KeyboardLayout() {
         val lang by currentLang
         val shift by isShift
         val mode by keyboardMode
         val numberRow by showNumberRow
-        val keyHeight = keyHeightDp.intValue.dp
 
         // Read the theme reactively so changing it in settings applies on the next keyboard open
         val theme = KeyboardPrefs.THEMES.find { it.id == themeId.value } ?: KeyboardPrefs.THEMES[0]
@@ -573,9 +662,13 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
 
         val cfg = androidx.compose.ui.platform.LocalConfiguration.current
         val landscape = cfg.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
-        // Wide displays (unfolded foldable, tablet): don't stretch the keys across the whole panel —
-        // cap the key area Gboard-style and center it; the background still fills the full width.
-        val wideScreen = cfg.screenWidthDp >= 600
+        val keyHeight = rowHeight()
+        // Very wide displays (tablet, unfolded foldable held upright): don't stretch the keys across
+        // the whole panel — cap the key area and center it; the background still fills the width.
+        // NOT applied in landscape: measured on Gboard at 914dp wide, it spans essentially the full
+        // width there (862dp of 914), so capping it left our landscape keyboard a narrow block
+        // floating in the middle of the screen.
+        val wideScreen = cfg.screenWidthDp >= 600 && !landscape
         Box(modifier = Modifier.fillMaxWidth().background(bgColor)) {
         Column(
             modifier = Modifier
@@ -696,24 +789,49 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 modifier = Modifier
                     .fillMaxWidth()
                     .onGloballyPositioned { glideOrigin = it.positionInWindow() }
+                    // (1) TAP-POINT CAPTURE — the input for coordinate spatial autocorrect. Kept in
+                    // its own pointer node, independent of glide, and reading raw events instead of
+                    // awaitFirstDown: awaitFirstDown only resolves when ALL pointers are newly down,
+                    // so during fast rollover typing (finger B lands before finger A lifts) it never
+                    // fired and every rollover keystroke lost its touch point — disabling spatial
+                    // correction exactly when fat-finger errors are most likely.
+                    // Initial pass = parent before child, so the point is stored before the
+                    // KeyButton underneath commits its letter on the Main pass.
+                    .pointerInput(lang, mode) {
+                        awaitPointerEventScope {
+                            while (true) {
+                                val event = awaitPointerEvent(
+                                    androidx.compose.ui.input.pointer.PointerEventPass.Initial)
+                                for (ch in event.changes) {
+                                    // "newly down", regardless of consumption — spelled out rather
+                                    // than via changedToDownIgnoreConsumed() so no wildcard import
+                                    // can shadow it.
+                                    if (!ch.pressed || ch.previousPressed) continue
+                                    val start = ch.position + glideOrigin
+                                    if (mode == "abc" && !secureField && !fieldNoSuggestions &&
+                                        keyAt(start) != null) pendingTapPos = start
+                                    // Only the FIRST new touch of an event: if two fingers land in
+                                    // the same frame, the next commitChar belongs to the first one,
+                                    // and letting the second overwrite the point would hand that
+                                    // keystroke the wrong finger's coordinates.
+                                    break
+                                }
+                            }
+                        }
+                    }
+                    // (2) GLIDE TRACKING — single finger only. This node OBSERVES (never consumes),
+                    // so tap typing is unaffected; a second finger aborts it, since that's typing.
                     .pointerInput(lang, mode, swipeTypingOn) {
                         val threshold = 16.dp.toPx()
                         awaitPointerEventScope {
                             while (true) {
-                                // Initial pass: parents see the event BEFORE children. The KeyButton
-                                // underneath commits its letter during the Main pass (child-first),
-                                // so pendingTapPos must be set here, in Initial — otherwise every
-                                // recorded tap point would belong to the PREVIOUS keystroke.
                                 val down = awaitFirstDown(
                                     requireUnconsumed = false,
                                     pass = androidx.compose.ui.input.pointer.PointerEventPass.Initial
                                 )
                                 glideActive.value = false
                                 val start = down.position + glideOrigin
-                                // Record the touch point of a letter tap (in window coords) for the
-                                // coordinate spatial autocorrect — even when glide typing is off.
                                 val onLetter = mode == "abc" && !secureField && !fieldNoSuggestions && keyAt(start) != null
-                                if (onLetter) pendingTapPos = start
                                 // Glide only on the letter layout, when enabled, starting on a letter.
                                 if (!onLetter || !swipeTypingOn) {
                                     var c = down
@@ -723,8 +841,12 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                 val points = ArrayList<Offset>(); points.add(down.position)
                                 val crossed = HashSet<Char>(); keyAt(start)?.let { crossed.add(it) }
                                 var glide = false
+                                var aborted = false
                                 while (true) {
-                                    val ch = awaitPointerEvent().changes.firstOrNull() ?: break
+                                    val ev = awaitPointerEvent()
+                                    if (ev.changes.size > 1) { aborted = true; break }   // rollover, not a glide
+                                    val ch = ev.changes.firstOrNull() ?: break
+                                    if (ch.id != down.id) { aborted = true; break }
                                     if (!ch.pressed) break
                                     points.add(ch.position)
                                     nearestKey(ch.position + glideOrigin)?.let { crossed.add(it) }
@@ -739,7 +861,8 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                         glidePreviewTick(points)
                                     }
                                 }
-                                if (glide) commitGlide(points)
+                                if (glide && !aborted) commitGlide(points)
+                                glideActive.value = false
                                 glideTrail.clear()
                                 glidePreview.value = null
                                 glidePreviewAt = 0
@@ -755,56 +878,83 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             ) {
             when (mode) {
                 "abc" -> {
-                    // Number row (toggleable)
-                    if (numberRow) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.Center
-                        ) {
-                            "1234567890".forEach { digit ->
-                                KeyButton(digit.toString(), keyColor, textColor, Modifier.weight(1f)) {
-                                    commitText(digit.toString())
-                                }
-                            }
-                        }
-                    }
-
-                    // Russian uses a Cyrillic layout; English and Latvian share QWERTY
-                    // (Latvian diacritics ā č ē ģ ī ķ ļ ņ š ū ž are on long-press alternates).
+                    // Row shapes and side weights are copied from Gboard, MEASURED off it key by key
+                    // on a 411dp screen — the two layouts genuinely differ and neither is "the"
+                    // standard:
+                    //   Latin   — one uniform 10-column grid; the 9- and 7-key rows are INDENTED by
+                    //             the leftover half / one-and-a-half units, so columns line up.
+                    //   Cyrillic — the two 11-key rows fill the full width (no indent at all); only
+                    //             the last row carries Shift/Backspace, and its 9 letters therefore
+                    //             run at a slightly tighter pitch. Columns do NOT line up between
+                    //             rows here, and Gboard doesn't try to make them.
+                    // ъ is deliberately NOT a key: Gboard's ЙЦУКЕН is 11 wide and reaches ъ through
+                    // a long-press of ь. Giving it its own key makes all 12 columns narrower, which
+                    // costs more accuracy than the long-press costs convenience.
                     val ruRows = listOf("йцукенгшщзх", "фывапролджэ", "ячсмитьбю")
                     val enRows = listOf("qwertyuiop", "asdfghjkl", "zxcvbnm")
-                    val rows = if (lang == "ru") ruRows else enRows
+                    val cyrillic = lang == "ru"
+                    val rows = if (cyrillic) ruRows else enRows
+                    // Leftover units on each side of a row: an indent on a letter row, the width of
+                    // Shift/Backspace on the last one.
+                    val sides = if (cyrillic) listOf(0f, 0f, 1.3f) else listOf(0f, 0.5f, 1.5f)
 
-                    rows.forEachIndexed { index, row ->
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.Center
-                        ) {
-                            val caps by isCapsLock
-                            if (index == 2) {
-                                ShiftKey(
-                                    active = shift || caps,
-                                    locked = caps,
-                                    keyColor = keyColor,
-                                    accentColor = accentColor,
-                                    iconColor = if (shift || caps) Color.Black else textColor,
-                                    height = keyHeight,
-                                    modifier = Modifier.weight(1.3f)
-                                ) { onShiftTap() }
-                            }
-                            row.forEach { char ->
-                                val up = shift || caps
-                                val displayChar = if (up) char.uppercase() else char.toString()
-                                KeyButton(
-                                    displayChar, keyColor, textColor,
-                                    Modifier.weight(1f).onGloballyPositioned { keyBounds[char] = it.boundsInWindow() }
-                                ) {
-                                    commitChar(if (up) char.uppercaseChar() else char)
-                                    if (shift && !caps) { isShift.value = false; shiftIsAuto = false }
+                    BoxWithConstraints(Modifier.fillMaxWidth()) {
+                        val rowWidth = maxWidth
+                        Column(Modifier.fillMaxWidth()) {
+                            // The number row is its own 10-column row at full width in BOTH layouts,
+                            // exactly as Gboard does it — it is not squeezed into the letter grid.
+                            // (Squeezing it into 12 Cyrillic columns made the digits 32dp wide and
+                            // pushed them into the middle of the keyboard.)
+                            if (numberRow) {
+                                Row(modifier = Modifier.fillMaxWidth()) {
+                                    "1234567890".forEach { digit ->
+                                        KeyButton(digit.toString(), keyColor, textColor, Modifier.weight(1f)) {
+                                            commitText(digit.toString())
+                                        }
+                                    }
                                 }
                             }
-                            if (index == 2) {
-                                BackspaceKey(keyColor, textColor, Modifier.weight(1.3f))
+
+                            rows.forEachIndexed { index, row ->
+                                Row(modifier = Modifier.fillMaxWidth()) {
+                                    val caps by isCapsLock
+                                    val side = sides[index]
+                                    val lastRow = index == rows.lastIndex
+                                    // One unit for THIS row. The indent must stay TAPPABLE (it belongs
+                                    // to the outer key, Gboard-style) — an inert Spacer there would be
+                                    // a dead strip exactly where a thumb reaching for the outermost
+                                    // key lands, so the edge keys absorb it and only their VISUAL box
+                                    // is inset.
+                                    val unitDp = rowWidth / (row.length + 2 * side)
+                                    if (lastRow) {
+                                        ShiftKey(
+                                            active = shift || caps,
+                                            locked = caps,
+                                            keyColor = keyColor,
+                                            accentColor = accentColor,
+                                            iconColor = if (shift || caps) Color.Black else textColor,
+                                            height = keyHeight,
+                                            modifier = Modifier.weight(side)
+                                        ) { onShiftTap() }
+                                    }
+                                    row.forEachIndexed { i, char ->
+                                        val up = shift || caps
+                                        val displayChar = if (up) char.uppercase() else char.toString()
+                                        val first = !lastRow && i == 0 && side > 0f
+                                        val last = !lastRow && i == row.lastIndex && side > 0f
+                                        val w = 1f + (if (first || last) side else 0f)
+                                        KeyButton(
+                                            displayChar, keyColor, textColor, Modifier.weight(w),
+                                            insetStart = if (first) unitDp * side else 0.dp,
+                                            insetEnd = if (last) unitDp * side else 0.dp,
+                                            onBounds = { keyBounds[char] = it }
+                                        ) {
+                                            commitChar(if (up) char.uppercaseChar() else char)
+                                            if (shift && !caps) { isShift.value = false; shiftIsAuto = false }
+                                        }
+                                    }
+                                    if (lastRow) BackspaceKey(keyColor, textColor, Modifier.weight(side))
+                                }
                             }
                         }
                     }
@@ -812,12 +962,11 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 "123" -> {
                     val numRows = listOf(
                         listOf("1","2","3","4","5","6","7","8","9","0"),
-                        listOf("@","#","$","_","&","-","+","(",")","/"),
-                        null // handled separately for special keys
+                        listOf("@","#","$","_","&","-","+","(",")","/")
                     )
                     // Row 1 — digits
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-                        numRows[0]!!.forEach { s ->
+                        numRows[0].forEach { s ->
                             KeyButton(s, keyColor, textColor, Modifier.weight(1f)) { commitText(s) }
                         }
                     }
@@ -829,7 +978,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     }
                     // Row 3 — punctuation/symbols
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-                        numRows[1]!!.forEach { s ->
+                        numRows[1].forEach { s ->
                             KeyButton(s, keyColor, textColor, Modifier.weight(1f)) { commitText(s) }
                         }
                     }
@@ -847,16 +996,15 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 "symbols" -> {
                     val symRows = listOf(
                         listOf("~","`","|","·","√","π","τ","÷","×","="),
-                        listOf("©","®","™","℅","[","]","{","}","<",">"),
-                        null
+                        listOf("©","®","™","℅","[","]","{","}","<",">")
                     )
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-                        symRows[0]!!.forEach { s ->
+                        symRows[0].forEach { s ->
                             KeyButton(s, keyColor, textColor, Modifier.weight(1f)) { commitText(s) }
                         }
                     }
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-                        symRows[1]!!.forEach { s ->
+                        symRows[1].forEach { s ->
                             KeyButton(s, keyColor, textColor, Modifier.weight(1f)) { commitText(s) }
                         }
                     }
@@ -874,7 +1022,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     // Phone-style pad (Gboard-like): big plain digits 1-2-3 on top, a helper
                     // column on the right (backspace + the symbols number fields actually need).
                     // Space / Enter / ABC live on the shared bottom row as usual.
-                    val digitFont = (KeyboardPrefs.fontSizeSp(keyHeightDp.intValue, keyVGapDp.intValue) * 1.3f).sp
+                    val digitFont = (KeyboardPrefs.fontSizeSp(rowHeightDp(), keyVGapDp.intValue) * 1.3f).sp
                     val padRows = listOf(
                         listOf("1", "2", "3"),
                         listOf("4", "5", "6"),
@@ -887,7 +1035,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                 val isDigit = s[0].isDigit()
                                 KeyButton(
                                     s, keyColor, textColor, Modifier.weight(1f),
-                                    fontSize = if (isDigit) digitFont else KeyboardPrefs.fontSizeSp(keyHeightDp.intValue, keyVGapDp.intValue).sp
+                                    fontSize = if (isDigit) digitFont else keyFontSize()
                                 ) { commitText(s) }
                             }
                             // Helper column, top→bottom: - + ⌫ . — Backspace sits SECOND FROM THE
@@ -915,6 +1063,31 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         p, color = accentColor.copy(alpha = 0.5f),
                         style = Stroke(width = 12f, cap = StrokeCap.Round, join = StrokeJoin.Round)
                     )
+                }
+            }
+            // Key preview — the enlarged glyph above the pressed key. Drawn HERE, inside the
+            // keyboard's own hierarchy, instead of in a Popup: a Popup is a real WindowManager
+            // window, and creating + destroying one on every keystroke (5-8 per second) is a
+            // needless source of jank right on the typing path. Nothing between here and the
+            // keyboard root clips, so it can overhang the toolbar above the top row.
+            previewKey.value?.let { (glyph, rect) ->
+                val density = androidx.compose.ui.platform.LocalDensity.current
+                with(density) {
+                    val x = (rect.center.x - glideOrigin.x).toDp() - 24.dp
+                    // Clamped to the space that actually exists above the key grid (the 40dp toolbar
+                    // plus the root's 4dp padding). For a key in the TOP row the unclamped -52dp
+                    // would push the preview past the keyboard window, which clips it — the very
+                    // thing the old Popup was there to avoid.
+                    val y = maxOf((rect.top - glideOrigin.y).toDp() - 52.dp, (-44).dp)
+                    Box(
+                        modifier = Modifier.offset(x = x, y = y).size(48.dp)
+                            .background(Color(currentTheme.text), RoundedCornerShape(8.dp)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(glyph, color = Color(currentTheme.bg), fontSize = 28.sp,
+                            fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
+                            textAlign = TextAlign.Center)
+                    }
                 }
             }
             // Live glide preview — the current best guess floats above the keys while swiping.
@@ -1003,7 +1176,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                 }
                             }
                         }
-                        .padding(horizontal = keyHGapDp.intValue.dp, vertical = keyVGapDp.intValue.dp)
+                        .padding(horizontal = keyHGapDp.intValue.dp, vertical = gapV())
                         .background(
                             when {
                                 recordingAI && aiDragX < -cancelThreshold -> Color(0xFF666666)
@@ -1243,16 +1416,6 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         }
     }
 
-    @Composable
-    private fun ToolbarIcon(glyph: String, textColor: Color, onClick: () -> Unit) {
-        Box(
-            modifier = Modifier.size(40.dp)
-                .semantics { contentDescription = keyDescription(glyph) }
-                .clickable { onClick() },
-            contentAlignment = Alignment.Center
-        ) { Text(glyph, fontSize = 18.sp, color = textColor) }
-    }
-
     // Toolbar slot that hosts a drawn (vector) icon.
     @Composable
     private fun ToolbarVec(desc: String, onClick: () -> Unit, glyph: @Composable () -> Unit) {
@@ -1262,52 +1425,6 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 .clickable { onClick() },
             contentAlignment = Alignment.Center
         ) { glyph() }
-    }
-
-    // The cursor slider's dial: a knurled wheel with a soft halo and gradient face that spins as
-    // you scrub, with an I-beam text cursor in the hub so it reads as "cursor control" at a glance.
-    @Composable
-    private fun BezelKnob(rotationDeg: Float, ring: Color, hub: Color, modifier: Modifier) {
-        Canvas(modifier = modifier) {
-            val r = size.minDimension / 2f
-            val c = androidx.compose.ui.geometry.Offset(size.width / 2f, size.height / 2f)
-            // soft halo + gradient disc (light falling from the top-left)
-            drawCircle(color = ring.copy(alpha = 0.28f), radius = r, center = c)
-            drawCircle(
-                brush = androidx.compose.ui.graphics.Brush.radialGradient(
-                    colors = listOf(lerp(ring, Color.White, 0.30f), ring),
-                    center = c + androidx.compose.ui.geometry.Offset(-r * 0.25f, -r * 0.30f),
-                    radius = r * 1.6f
-                ),
-                radius = r * 0.90f, center = c
-            )
-            // knurled edge: rounded ticks (alternating length) that rotate with the drag
-            val ticks = 16
-            for (i in 0 until ticks) {
-                val ang = Math.toRadians(i * (360.0 / ticks) + rotationDeg)
-                val ca = kotlin.math.cos(ang).toFloat()
-                val sa = kotlin.math.sin(ang).toFloat()
-                val inner = if (i % 2 == 0) 0.62f else 0.72f
-                drawLine(
-                    color = hub.copy(alpha = if (i % 2 == 0) 0.85f else 0.40f),
-                    start = androidx.compose.ui.geometry.Offset(c.x + ca * r * inner, c.y + sa * r * inner),
-                    end = androidx.compose.ui.geometry.Offset(c.x + ca * r * 0.85f, c.y + sa * r * 0.85f),
-                    strokeWidth = r * 0.10f,
-                    cap = StrokeCap.Round
-                )
-            }
-            // hub face + I-beam text cursor
-            drawCircle(color = hub.copy(alpha = 0.14f), radius = r * 0.50f, center = c)
-            val ib = r * 0.28f      // half-height of the I-beam stem
-            val serif = r * 0.15f   // half-width of its serifs
-            val w = r * 0.11f
-            drawLine(hub, androidx.compose.ui.geometry.Offset(c.x, c.y - ib),
-                androidx.compose.ui.geometry.Offset(c.x, c.y + ib), w, StrokeCap.Round)
-            drawLine(hub, androidx.compose.ui.geometry.Offset(c.x - serif, c.y - ib),
-                androidx.compose.ui.geometry.Offset(c.x + serif, c.y - ib), w, StrokeCap.Round)
-            drawLine(hub, androidx.compose.ui.geometry.Offset(c.x - serif, c.y + ib),
-                androidx.compose.ui.geometry.Offset(c.x + serif, c.y + ib), w, StrokeCap.Round)
-        }
     }
 
     // Emoji-only panel (mode == "emoji"). No clipboard here.
@@ -1320,99 +1437,46 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     ) {
         val category by emojiCategory
         val recent by recentEmoji
-        var suggestions by remember { mutableStateOf<List<String>>(emptyList()) }
-        var suggesting by remember { mutableStateOf(false) }
         Column(modifier = Modifier.fillMaxWidth().height(keyHeight * (maxContentRows + 1))) {
-            // Category tabs + AI "suggest emoji for my text" button
             Row(
                 modifier = Modifier.fillMaxWidth().height(36.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 EMOJI_TABS.forEachIndexed { idx, tab ->
-                    val selected = idx == category && suggestions.isEmpty()
+                    val selected = idx == category
                     Box(
                         modifier = Modifier.weight(1f).fillMaxHeight()
                             .semantics { contentDescription = "Emoji category $tab" }
-                            .clickable { emojiCategory.intValue = idx; suggestions = emptyList() },
+                            .clickable { emojiCategory.intValue = idx },
                         contentAlignment = Alignment.Center
                     ) {
                         Text(tab, fontSize = 18.sp,
                             color = if (selected) accentColor else textColor.copy(alpha = 0.6f))
                     }
                 }
-                // AI emoji search: suggests emoji matching the text just written. Drawn as a tinted
-                // round button so it reads as tappable, and always reacts — with a hint when
-                // there's nothing to match yet, or an error note when the lookup fails.
-                Box(
-                    modifier = Modifier.weight(1f).fillMaxHeight()
-                        .semantics { contentDescription = "Suggest emoji for my text" }
-                        .clickable {
-                            performKeyFeedback()
-                            val t = currentTargetText()
-                            when {
-                                secureField -> {}
-                                t.isBlank() -> {
-                                    statusText.value = "✨ Type a message first — I'll match emoji to it"
-                                    handler.postDelayed({ if (statusText.value.startsWith("✨ Type")) statusText.value = "" }, 2200)
-                                }
-                                else -> {
-                                    suggesting = true
-                                    GroqApi.suggestEmojis(t) { res, _ ->
-                                        handler.post {
-                                            suggesting = false
-                                            suggestions = splitEmojis(res ?: "")
-                                            if (suggestions.isEmpty()) {
-                                                statusText.value = "✨ Couldn't fetch suggestions"
-                                                handler.postDelayed({ if (statusText.value.startsWith("✨ Could")) statusText.value = "" }, 2000)
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        },
-                    contentAlignment = Alignment.Center
-                ) {
-                    Box(
-                        modifier = Modifier.size(28.dp).background(
-                            if (suggestions.isNotEmpty()) accentColor else accentColor.copy(alpha = 0.16f),
-                            androidx.compose.foundation.shape.CircleShape
-                        ),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        EnterGlyph("search",
-                            if (suggestions.isNotEmpty()) Color.Black else accentColor,
-                            Modifier.size(16.dp))
-                    }
-                }
             }
             androidx.compose.material3.HorizontalDivider(color = textColor.copy(alpha = 0.12f))
 
             val emojis = when {
-                suggestions.isNotEmpty() -> suggestions
                 category == 0 -> recent.ifEmpty { EMOJI_GROUPS[0] }
                 else -> EMOJI_GROUPS[(category - 1).coerceIn(0, EMOJI_GROUPS.size - 1)]
             }
             Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
-                if (suggesting) {
-                    Text("✨ Finding emoji…", color = textColor.copy(alpha = 0.6f),
-                        fontSize = 13.sp, modifier = Modifier.align(Alignment.Center))
-                } else {
-                    androidx.compose.foundation.lazy.grid.LazyVerticalGrid(
-                        columns = androidx.compose.foundation.lazy.grid.GridCells.Fixed(8),
-                        modifier = Modifier.fillMaxSize()
-                    ) {
-                        items(emojis.size) { i ->
-                            val e = emojis[i]
-                            Box(
-                                modifier = Modifier.aspectRatio(1f)
-                                    .clickable {
-                                        performKeyFeedback(); commitText(e)
-                                        KeyboardPrefs.addRecentEmoji(this@KeyoService, e)
-                                        recentEmoji.value = KeyboardPrefs.getRecentEmoji(this@KeyoService)
-                                    },
-                                contentAlignment = Alignment.Center
-                            ) { Text(e, fontSize = 22.sp) }
-                        }
+                androidx.compose.foundation.lazy.grid.LazyVerticalGrid(
+                    columns = androidx.compose.foundation.lazy.grid.GridCells.Fixed(8),
+                    modifier = Modifier.fillMaxSize()
+                ) {
+                    items(emojis.size) { i ->
+                        val e = emojis[i]
+                        Box(
+                            modifier = Modifier.aspectRatio(1f)
+                                .clickable {
+                                    performKeyFeedback(); commitText(e)
+                                    KeyboardPrefs.addRecentEmoji(this@KeyoService, e)
+                                    recentEmoji.value = KeyboardPrefs.getRecentEmoji(this@KeyoService)
+                                },
+                            contentAlignment = Alignment.Center
+                        ) { Text(e, fontSize = 22.sp) }
                     }
                 }
             }
@@ -1535,7 +1599,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
 
         Box(
             modifier = modifier
-                .height(keyHeightDp.intValue.dp)
+                .height(rowHeight())
                 .semantics { contentDescription = "Space. Long-press to dictate, swipe to move the cursor" }
                 .pointerInput(Unit) {
                     // A deliberate horizontal drag starts the cursor slider. The threshold is in dp
@@ -1616,7 +1680,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         }
                     }
                 }
-                .padding(horizontal = keyHGapDp.intValue.dp, vertical = keyVGapDp.intValue.dp)
+                .padding(horizontal = keyHGapDp.intValue.dp, vertical = gapV())
                 .background(
                     when {
                         recording && micDragX < -cancelThreshold -> Color(0xFF666666)
@@ -1639,6 +1703,9 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     }
                 }
             } else if (cursorVisual) {
+                // Scrubbing the caret: a plain thumb that tracks the drag. The gesture is what
+                // matters here — the old knurled dial and gradient rail were 86 lines of decoration
+                // redrawn on every pointer move.
                 val density = androidx.compose.ui.platform.LocalDensity.current
                 BoxWithConstraints(
                     modifier = Modifier.fillMaxSize().clipToBounds().padding(horizontal = 10.dp),
@@ -1646,39 +1713,13 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 ) {
                     val halfTravelPx = with(density) { (maxWidth / 2 - 16.dp).toPx() }
                     val knobOffset = with(density) { dragXVisual.coerceIn(-halfTravelPx, halfTravelPx).toDp() }
-                    // Rail: a gradient track that fades out at the ends, with direction chevrons
-                    // that light up toward the side being dragged.
-                    Canvas(Modifier.fillMaxWidth().height(20.dp)) {
-                        val cy = size.height / 2f
-                        val th = 4.dp.toPx()
-                        drawRoundRect(
-                            brush = androidx.compose.ui.graphics.Brush.horizontalGradient(
-                                0f to textColor.copy(alpha = 0f),
-                                0.15f to textColor.copy(alpha = 0.22f),
-                                0.85f to textColor.copy(alpha = 0.22f),
-                                1f to textColor.copy(alpha = 0f)
-                            ),
-                            topLeft = androidx.compose.ui.geometry.Offset(0f, cy - th / 2f),
-                            size = androidx.compose.ui.geometry.Size(size.width, th),
-                            cornerRadius = androidx.compose.ui.geometry.CornerRadius(th / 2f)
-                        )
-                        val s = 5.dp.toPx()
-                        fun chevron(xc: Float, dir: Float, alpha: Float) {
-                            val p = Path()
-                            p.moveTo(xc + dir * s * 0.6f, cy - s)
-                            p.lineTo(xc - dir * s * 0.6f, cy)
-                            p.lineTo(xc + dir * s * 0.6f, cy + s)
-                            drawPath(p, color = textColor.copy(alpha = alpha),
-                                style = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round))
-                        }
-                        chevron(6.dp.toPx(), 1f, if (dragXVisual < -12f) 0.95f else 0.35f)
-                        chevron(size.width - 6.dp.toPx(), -1f, if (dragXVisual > 12f) 0.95f else 0.35f)
-                    }
-                    BezelKnob(
-                        rotationDeg = dragXVisual * 0.9f,
-                        ring = accentColor,
-                        hub = textColor,
-                        modifier = Modifier.offset(x = knobOffset).size(34.dp)
+                    Box(
+                        Modifier.fillMaxWidth().height(4.dp)
+                            .background(textColor.copy(alpha = 0.22f), RoundedCornerShape(2.dp))
+                    )
+                    Box(
+                        Modifier.offset(x = knobOffset).size(28.dp)
+                            .background(accentColor, androidx.compose.foundation.shape.CircleShape)
                     )
                 }
             } else {
@@ -1830,7 +1871,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         else if (!longPressed) { performKeyFeedback(); onClick() }
                     }
                 }
-                .padding(horizontal = keyHGapDp.intValue.dp, vertical = keyVGapDp.intValue.dp)
+                .padding(horizontal = keyHGapDp.intValue.dp, vertical = gapV())
                 .background(if (pressed) lerp(bgColor, Color.Black, 0.22f) else bgColor, RoundedCornerShape(6.dp)),
             contentAlignment = Alignment.Center
         ) {
@@ -1887,7 +1928,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 .height(height)
                 .semantics { contentDescription = "Switch language" }
                 .clickable(interactionSource = interaction, indication = null) { performKeyFeedback(); onClick() }
-                .padding(horizontal = keyHGapDp.intValue.dp, vertical = keyVGapDp.intValue.dp)
+                .padding(horizontal = keyHGapDp.intValue.dp, vertical = gapV())
                 .background(if (pressed) lerp(keyColor, Color.Black, 0.22f) else keyColor, RoundedCornerShape(6.dp)),
             contentAlignment = Alignment.Center
         ) {
@@ -1954,7 +1995,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         if (!longPressed) onClick()
                     }
                 }
-                .padding(horizontal = keyHGapDp.intValue.dp, vertical = keyVGapDp.intValue.dp)
+                .padding(horizontal = keyHGapDp.intValue.dp, vertical = gapV())
                 .background(if (pressed) lerp(base, Color.Black, 0.22f) else base, RoundedCornerShape(6.dp)),
             contentAlignment = Alignment.Center
         ) {
@@ -1989,7 +2030,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     fun BackspaceKey(bgColor: Color, textColor: Color, modifier: Modifier) {
         var isPressed by remember { mutableStateOf(false) }
         var swipedClear by remember { mutableStateOf(false) }
-        val bsHeight = keyHeightDp.intValue.dp
+        val bsHeight = rowHeight()
 
         Box(
             modifier = modifier
@@ -2050,7 +2091,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         swipedClear = false
                     }
                 }
-                .padding(horizontal = keyHGapDp.intValue.dp, vertical = keyVGapDp.intValue.dp)
+                .padding(horizontal = keyHGapDp.intValue.dp, vertical = gapV())
                 .background(
                     when {
                         swipedClear -> Color(0xFFFF5555)
@@ -2140,34 +2181,21 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                "👂","👃","👀","🧠","👶","🧒","👦","👧","🧑","👨","👩","🧓","👴","👵","🙋","🤷")
     )
 
-    // Spoken label for TalkBack / accessibility services.
+    // Spoken label for TalkBack / accessibility services. Only reached from KeyButton, i.e. for the
+    // labels a generic key can carry — every dedicated key (Enter, Backspace, Shift, Space, the
+    // toolbar icons) sets its own contentDescription.
     private fun keyDescription(label: String): String = when (label) {
-        "⌫" -> "Delete"
-        "↵" -> "Enter"
-        "✓" -> "Done"
-        "➤" -> "Send"
-        "🔍" -> "Search"
         "123" -> "Numbers and symbols"
         "ABC" -> "Letters"
         "!?#" -> "More symbols"
         "🔢" -> "Number pad"
-        "🌐" -> "Switch language"
-        "🤖" -> "AI assistant"
-        "⬆" -> "Shift"
-        "😀" -> "Emoji"
-        "📋" -> "Clipboard"
-        "⚙" -> "Settings"
-        "↶" -> "Undo"
-        "↷" -> "Redo"
-        "⬚" -> "Select all"
-        "★" -> "Quick phrases"
-        " " -> "Space"
         else -> label
     }
 
     // Slightly smaller font for multi-character mode keys (123 / ABC / !?#) so they don't look bulky.
+    @Composable
     private fun modeKeyFont(): androidx.compose.ui.unit.TextUnit =
-        (KeyboardPrefs.fontSizeSp(keyHeightDp.intValue, keyVGapDp.intValue) * 0.72f).sp
+        (KeyboardPrefs.fontSizeSp(rowHeightDp(), keyVGapDp.intValue) * 0.72f).sp
 
     // ---- AI output sanitizer -------------------------------------------------------------------
     // AI text is inserted as PLAIN TEXT, period. No italic, no bold, no markdown, no marker
@@ -2210,20 +2238,6 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         return ic.getTextBeforeCursor(200, 0)?.toString() ?: ""
     }
 
-    // Split a string into emoji (grapheme clusters), dropping plain ASCII/whitespace.
-    private fun splitEmojis(s: String): List<String> {
-        val bi = java.text.BreakIterator.getCharacterInstance()
-        bi.setText(s)
-        val out = mutableListOf<String>()
-        var start = bi.first(); var end = bi.next()
-        while (end != java.text.BreakIterator.DONE) {
-            val g = s.substring(start, end).trim()
-            if (g.isNotEmpty() && g[0].code > 0x2030) out.add(g)
-            start = end; end = bi.next()
-        }
-        return out
-    }
-
     // ---- AI rewrite of the selected text (or the text before the cursor) ----
     private fun runRewrite(instruction: String) {
         if (secureField) {
@@ -2243,14 +2257,31 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         }
         keyboardMode.value = letterMode()
         statusText.value = "✨ Improving…"
+        val token = fieldToken()
         GroqApi.rewrite(target, instruction) { res, err ->
             handler.post {
                 if (res != null) {
                     val out = formatEmphasis(res)
-                    currentInputConnection?.let { c ->
-                        if (hadSelection) c.commitText(out, 1)
-                        else { c.deleteSurroundingText(target.length, 0); c.commitText(out, 1) }
+                    // The reply can arrive tens of seconds later. Replacing text is destructive
+                    // (it deletes `target.length` characters first), so it only runs when we are
+                    // still in the same field AND that field still ends with the text we sent.
+                    // Only the TAIL is compared: getTextBeforeCursor may legitimately return fewer
+                    // characters than asked for (WebViews cap it), and a 4000-char target would then
+                    // never match even though nothing changed.
+                    val c = currentInputConnection
+                    val tail = target.takeLast(200)
+                    val stillHere = c != null && canCommitTo(token) &&
+                        (if (hadSelection) c.getSelectedText(0)?.toString() == target
+                         else c.getTextBeforeCursor(tail.length, 0)?.toString() == tail)
+                    if (!stillHere) {
+                        statusText.value = "✨ Text changed — rewrite dropped"
+                        handler.postDelayed({ if (statusText.value.startsWith("✨")) statusText.value = "" }, 2500)
+                        return@post
                     }
+                    c!!.beginBatchEdit()
+                    if (hadSelection) c.commitText(out, 1)
+                    else { c.deleteSurroundingText(target.length, 0); c.commitText(out, 1) }
+                    c.endBatchEdit()
                     statusText.value = ""
                     // Offer a quick undo of the rewrite
                     rewriteBackup = target
@@ -2260,7 +2291,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     handler.postDelayed(hideUndoRewrite, 8000)
                 } else {
                     statusText.value = err ?: "Rewrite failed"
-                    handler.postDelayed({ statusText.value = "" }, 2500)
+                    clearStatusLater(err ?: "Rewrite failed", 2500)
                 }
             }
         }
@@ -2282,9 +2313,15 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         }
         keyboardMode.value = letterMode()
         statusText.value = "✨ Writing…"
+        val token = fieldToken()
         GroqApi.rewrite(before, "Continue this text naturally from where it ends. Output ONLY the continuation to append — do NOT repeat the existing text.") { res, err ->
             handler.post {
                 if (res != null) {
+                    if (!canCommitTo(token)) {
+                        statusText.value = "✨ Field changed — result dropped"
+                        clearStatusLater("✨ Field changed — result dropped", 2500)
+                        return@post
+                    }
                     val out = formatEmphasis(res)
                     val sep = if (before.isNotEmpty() && !before.last().isWhitespace() &&
                         out.isNotEmpty() && !out.first().isWhitespace()) " " else ""
@@ -2292,7 +2329,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     statusText.value = ""
                 } else {
                     statusText.value = err ?: "Failed"
-                    handler.postDelayed({ statusText.value = "" }, 2500)
+                    clearStatusLater(err ?: "Failed", 2500)
                 }
             }
         }
@@ -2304,8 +2341,14 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         bgColor: Color,
         textColor: Color,
         modifier: Modifier,
-        height: androidx.compose.ui.unit.Dp = keyHeightDp.intValue.dp,
-        fontSize: androidx.compose.ui.unit.TextUnit = KeyboardPrefs.fontSizeSp(keyHeightDp.intValue, keyVGapDp.intValue).sp,
+        height: androidx.compose.ui.unit.Dp = rowHeight(),
+        fontSize: androidx.compose.ui.unit.TextUnit = keyFontSize(),
+        // Extra touch area on one side that is NOT drawn: an edge key of an indented row keeps its
+        // one-unit look but stays tappable all the way to the screen edge, so the indent is never a
+        // dead strip. Everything visual (background, label, reported bounds) uses the inset box.
+        insetStart: androidx.compose.ui.unit.Dp = 0.dp,
+        insetEnd: androidx.compose.ui.unit.Dp = 0.dp,
+        onBounds: ((Rect) -> Unit)? = null,
         onClick: () -> Unit
     ) {
         var pressed by remember { mutableStateOf(false) }
@@ -2318,6 +2361,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         var shownFromRight by remember { mutableStateOf(false) }
         var selectedAltIdx by remember { mutableIntStateOf(-1) }   // visual index in the popup row
         var keyCenterX by remember { mutableFloatStateOf(0f) }
+        var keyRect by remember { mutableStateOf(Rect.Zero) }
         // Long-press digit when the number row is hidden; it becomes the primary alternate.
         val digitHint = if (!showNumberRow.value) topRowDigits[label.lowercase()] else null
         val alts = if (digitHint != null) listOf(digitHint) + (altChars[label] ?: emptyList())
@@ -2339,7 +2383,6 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         Box(
             modifier = modifier
                 .height(height)
-                .onGloballyPositioned { keyCenterX = it.positionInWindow().x + it.size.width / 2f }
                 .semantics { contentDescription = keyDescription(label) }
                 .pointerInput(Unit) {
                     val stepPx = 40.dp.toPx()   // one popup item is 40dp wide; selection step matches
@@ -2355,6 +2398,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         val pressHasAlts = curHasAlts
                         pressed = true
                         showAlts = false
+                        if (pressLabel.length == 1) previewKey.value = pressLabel to keyRect
                         var longPressed = false
                         var selectedAlt: String? = null
 
@@ -2371,6 +2415,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                             if (pressed && pressHasAlts && a != null && a.isNotEmpty() && !glideActive.value) {
                                 longPressed = true
                                 showAlts = true
+                                previewKey.value = null    // the alt row replaces the plain preview
                                 shownAlts = a              // popup shows the same list the gesture uses
                                 shownFromRight = fromRight
                                 // Default to the primary alternate (Gboard-style): releasing
@@ -2410,6 +2455,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         showAlts = false
                         shownAlts = null
                         selectedAltIdx = -1
+                        previewKey.value = null
 
                         // The base character was already committed on key-down. On long-press,
                         // delete it and substitute the chosen alternate (or open settings).
@@ -2446,7 +2492,20 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(horizontal = keyHGapDp.intValue.dp, vertical = keyVGapDp.intValue.dp)
+                    .padding(
+                        start = keyHGapDp.intValue.dp + insetStart,
+                        end = keyHGapDp.intValue.dp + insetEnd,
+                        top = gapV(),
+                        bottom = gapV()
+                    )
+                    .onGloballyPositioned {
+                        // The DRAWN key is what the user aims at, so that is the rect reported for
+                        // the spatial model and used to place the press preview — not the touch
+                        // cell, which includes the gaps and any edge inset.
+                        keyRect = it.boundsInWindow()
+                        keyCenterX = keyRect.center.x
+                        onBounds?.invoke(keyRect)
+                    }
                     .background(if (pressed) lerp(bgColor, Color.Black, 0.22f) else bgColor, RoundedCornerShape(6.dp)),
                 contentAlignment = Alignment.Center
             ) {
@@ -2466,28 +2525,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 }
             }
 
-            // Key preview popup → uses Popup to escape clipping
-            if (pressed && label.length == 1 && !showAlts) {
-                androidx.compose.ui.window.Popup(
-                    alignment = Alignment.TopCenter,
-                    offset = androidx.compose.ui.unit.IntOffset(0, with(androidx.compose.ui.platform.LocalDensity.current) { (-52).dp.roundToPx() })
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .size(48.dp)
-                            .background(Color(currentTheme.text), RoundedCornerShape(8.dp)),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            text = label,
-                            color = Color(currentTheme.bg),
-                            fontSize = 28.sp,
-                            fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
-                            textAlign = TextAlign.Center
-                        )
-                    }
-                }
-            }
+            // (The key-press preview is rendered once by the key-grid overlay — see previewKey.)
 
             // Alt characters popup — uses Popup to escape parent clipping. The row is anchored so
             // the PRIMARY alternate sits directly above the key (reversed and extending left near
@@ -2573,62 +2611,6 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         "yall" to "y'all", "oclock" to "o'clock"
     )
 
-    // Emoticons -> emoji, swapped inline as soon as the closing character is typed (only when preceded
-    // by a space or the start of text, so URLs like "http://" are never touched). Longest match wins.
-    private val emoticons = listOf(
-        ":')" to "😢", ":-)" to "😊", ":-(" to "🙁", ":-D" to "😃", ":-P" to "😛",
-        ";-)" to "😉", "</3" to "💔",
-        ":)" to "😊", ":(" to "🙁", ":D" to "😃", ":P" to "😛",
-        ";)" to "😉", ":O" to "😮", ":|" to "😐", ":/" to "😕",
-        ":*" to "😘", "<3" to "❤️", "xD" to "😆", "XD" to "😆", "=)" to "😊"
-    ).sortedByDescending { it.first.length }
-    private val emoticonEndChars = emoticons.map { it.first.last() }.toSet()
-
-    // Word -> emoji offered in the suggestion strip while typing (tap swaps the word for the emoji).
-    private val emojiKeywords = mapOf(
-        "love" to "❤️", "heart" to "❤️", "like" to "👍", "ok" to "👌", "okay" to "👌",
-        "yes" to "✅", "no" to "❌", "fire" to "🔥", "lit" to "🔥", "happy" to "😊", "smile" to "😊",
-        "sad" to "😢", "cry" to "😭", "lol" to "😂", "haha" to "😂", "laugh" to "😂", "funny" to "😂",
-        "cool" to "😎", "wow" to "😮", "omg" to "😱", "angry" to "😠", "mad" to "😠",
-        "kiss" to "😘", "wink" to "😉", "party" to "🎉", "birthday" to "🎂", "cake" to "🎂",
-        "gift" to "🎁", "star" to "⭐", "sun" to "☀️", "snow" to "❄️", "coffee" to "☕",
-        "beer" to "🍺", "wine" to "🍷", "pizza" to "🍕", "food" to "🍔", "music" to "🎵",
-        "money" to "💰", "phone" to "📱", "home" to "🏠", "car" to "🚗", "dog" to "🐶", "cat" to "🐱",
-        "thanks" to "🙏", "please" to "🙏", "sleep" to "😴", "tired" to "😴", "sick" to "🤒",
-        "think" to "🤔", "eyes" to "👀", "hi" to "👋", "hello" to "👋", "bye" to "👋", "hug" to "🤗",
-        "strong" to "💪", "clap" to "👏", "perfect" to "💯", "rocket" to "🚀", "flower" to "🌸", "rose" to "🌹",
-        "любовь" to "❤️", "сердце" to "❤️", "люблю" to "❤️", "огонь" to "🔥", "круто" to "😎",
-        "смех" to "😂", "ахах" to "😂", "хаха" to "😂", "смешно" to "😂", "грустно" to "😢",
-        "плачу" to "😭", "счастье" to "😊", "улыбка" to "😊", "злой" to "😠", "поцелуй" to "😘",
-        "праздник" to "🎉", "торт" to "🎂", "подарок" to "🎁", "звезда" to "⭐", "солнце" to "☀️",
-        "кофе" to "☕", "пиво" to "🍺", "вино" to "🍷", "пицца" to "🍕", "еда" to "🍔",
-        "музыка" to "🎵", "деньги" to "💰", "телефон" to "📱", "дом" to "🏠", "машина" to "🚗",
-        "собака" to "🐶", "кошка" to "🐱", "кот" to "🐱", "спасибо" to "🙏", "привет" to "👋",
-        "пока" to "👋", "сила" to "💪", "цветок" to "🌸", "роза" to "🌹", "думаю" to "🤔",
-        "сон" to "😴", "устал" to "😴", "вау" to "😮", "да" to "✅", "нет" to "❌"
-    )
-
-    /** If the text right before the cursor ends with an emoticon (preceded by a space or start of
-     *  text), swap it for the matching emoji. Returns true if it replaced. */
-    private fun maybeReplaceEmoticon(): Boolean {
-        if (secureField || fieldNoSuggestions) return false
-        val ic = currentInputConnection ?: return false
-        val before = ic.getTextBeforeCursor(4, 0)?.toString() ?: return false
-        for ((emo, glyph) in emoticons) {
-            if (before.endsWith(emo)) {
-                val pre = before.dropLast(emo.length)
-                if (pre.isEmpty() || pre.last() == ' ' || pre.last() == '\n') {
-                    composing.clear()
-                    ic.finishComposingText()
-                    ic.deleteSurroundingText(emo.length, 0)
-                    ic.commitText(glyph, 1)
-                    return true
-                }
-            }
-        }
-        return false
-    }
-
     /** Commit the active composing word (if any) so the following edit starts on clean text. */
     private fun finalizeComposing() {
         autocorrectUndo = null   // any non-typing action commits the autocorrect (no longer revertable)
@@ -2661,20 +2643,30 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         return (s / keyBounds.size).coerceAtLeast(1f)
     }
 
-    // Physical key-adjacency map (each letter -> the keys within ~1.7 key-widths of it), used by
+    private fun avgKeyHeight(): Float {
+        if (keyBounds.isEmpty()) return 1f
+        var s = 0f; for (r in keyBounds.values) s += r.height
+        return (s / keyBounds.size).coerceAtLeast(1f)
+    }
+
+    // Physical key-adjacency map (each letter -> the keys touching it, including diagonals), used by
     // spatial autocorrect to recognise fat-finger taps. Rebuilt lazily from the current layout's
     // keyBounds and invalidated (cleared) alongside keyBounds on every language/layout switch.
     private var keyNeighbors: Map<Char, Set<Char>> = emptyMap()
     private fun neighbors(): Map<Char, Set<Char>> {
         if (keyNeighbors.isEmpty() && keyBounds.size >= 2) {
             val entries = keyBounds.entries.toList()
-            val thr = avgKeyWidth() * 1.7f
-            val thr2 = thr * thr
+            val kw = avgKeyWidth()
+            val kh = avgKeyHeight()
+            // Measured in CELLS, so the radius doesn't depend on the key aspect ratio: a side or
+            // above/below neighbour is 1.0, a diagonal 1.41. (A width-based radius silently dropped
+            // vertical neighbours whenever keys got narrow — 12-column Cyrillic — or tall.)
+            val thr = 1.5f
             val m = HashMap<Char, MutableSet<Char>>(entries.size * 2)
             for (i in entries.indices) for (j in entries.indices) if (i != j) {
-                val a = entries[i]; val b = entries[j]
-                if ((a.value.center - b.value.center).getDistanceSquared() <= thr2)
-                    m.getOrPut(a.key) { HashSet() }.add(b.key)
+                val a = entries[i].value.center; val b = entries[j].value.center
+                if (SuggestionEngine.cellDistance(a.x, a.y, b.x, b.y, kw, kh, biasY = 0f) <= thr)
+                    m.getOrPut(entries[i].key) { HashSet() }.add(entries[j].key)
             }
             keyNeighbors = m
         }
@@ -2705,11 +2697,13 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private fun disambiguateTap(tapped: Char, point: Offset): Char {
         if (composing.isEmpty() || !SuggestionEngine.isReady() || keyBounds.size < 2) return tapped
         val kw = avgKeyWidth()
-        if (kw <= 1f) return tapped
+        val kh = avgKeyHeight()
+        if (kw <= 1f || kh <= 1f) return tapped
         val lower = tapped.lowercaseChar()
-        val near = keyBounds.entries.sortedBy { (it.value.center - point).getDistanceSquared() }.take(2)
+        fun cell(r: Rect) = SuggestionEngine.cellDistance(point.x, point.y, r.center.x, r.center.y, kw, kh)
+        val near = keyBounds.entries.sortedBy { cell(it.value) }.take(2)
         if (near.size < 2 || near.none { it.key == lower }) return tapped
-        val cands = near.map { it.key to (it.value.center - point).getDistance() / kw }
+        val cands = near.map { it.key to cell(it.value) }
         val prefix = composing.toString().lowercase()
         val langs = dictLangs()
         // Runs on the critical path (before the letter appears). Use ONLY the frequency-sorted bundled
@@ -2738,10 +2732,8 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         return out
     }
 
-    /** Average per-letter distance (in key-widths) between [points] and [cand]'s own key centres.
-     *  Lower = the finger physically spelled [cand]. Null when a char has no key on this layout. */
     /** Physical plausibility of [cand] as a SUBSTITUTION slip of [typed]: the WORST distance (in
-     *  key-widths) between the finger's tap and [cand]'s key, over only the positions where they
+     *  cells — see SuggestionEngine.cellDistance) between the finger's tap and [cand]'s key, over only the positions where they
      *  differ. Small = the finger really hovered near the other key at every differing spot.
      *  Judged on the worst position, never the average — an average dilutes over the matching
      *  letters and would favour a wrong substitution over a true transposition (device-verified:
@@ -2753,13 +2745,15 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         val fc = SuggestionEngine.foldKey(cand)
         if (ft.length != fc.length) return null
         var kwSum = 0f
-        for (r in bounds.values) kwSum += r.width
+        var khSum = 0f
+        for (r in bounds.values) { kwSum += r.width; khSum += r.height }
         val kw = (kwSum / bounds.size).coerceAtLeast(1f)
+        val kh = (khSum / bounds.size).coerceAtLeast(1f)
         var worst = -1f
         for (i in fc.indices) {
             if (ft[i] == fc[i]) continue
             val ctr = bounds[cand[i]]?.center ?: bounds[fc[i]]?.center ?: return null
-            val d = (points[i] - ctr).getDistance() / kw
+            val d = SuggestionEngine.cellDistance(points[i].x, points[i].y, ctr.x, ctr.y, kw, kh)
             if (d > worst) worst = d
         }
         return if (worst < 0f) null else worst
@@ -2912,6 +2906,9 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             SuggestionEngine.followerWeights(it, langs, UserDictionary.bigrams())
         }
         val composingBefore = composing.toString()
+        // Did the start key's letter land as plain committed text (mid-word) instead of in the
+        // composing region? Then it isn't covered by the setComposingText replace below.
+        val dropStartLetter = composingBefore.isEmpty() && plainLetterCommitted
         serviceScope.launch(kotlinx.coroutines.Dispatchers.Default) {
             val cands = try {
                 decodeGlide(path, followers, bounds, langs)
@@ -2928,10 +2925,21 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 fun cased(s: String) = if (cap) s.replaceFirstChar { it.uppercaseChar() } else s
                 val word = cased(cands[0])
                 composing.setLength(0)
-                ic.setComposingText(word, 1)   // replace the lone letter the start key dropped on touch-down
+                // The glide's own edits are ours: without this stamp the selection updates they
+                // produce look like a user caret move (the last keystroke was the start key, one
+                // whole swipe + decode ago) and would immediately wipe glideWord/glideAlts.
+                markSelfEdit()
+                ic.beginBatchEdit()
+                // The start key drops a letter on touch-down. Normally it sits in the composing
+                // region and setComposingText replaces it; when it was committed plainly (glide
+                // started with the caret right before a word) it has to be deleted by hand.
+                if (dropStartLetter) ic.deleteSurroundingText(1, 0)
+                ic.setComposingText(word, 1)
                 ic.finishComposingText()
                 composing.clear()
+                plainLetterCommitted = false
                 ic.commitText(" ", 1)          // auto-space so the next word/glide flows on
+                ic.endBatchEdit()
                 performKeyFeedback()
                 isShift.value = false; shiftIsAuto = false
                 autocorrectUndo = null
@@ -2959,7 +2967,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         val ic = currentInputConnection ?: return
         // Auto-space already present (glide / suggestion tap): the flushed space is redundant.
         if ((glideWord != null || pendingAutoSpace) && ic.getTextBeforeCursor(1, 0)?.toString() == " ") return
-        if (doubleSpaceOn) {
+        if (doubleSpaceOn && !secureField && !rawKeyField()) {
             val before = ic.getTextBeforeCursor(2, 0)?.toString() ?: ""
             if (before.length == 2 && before[1] == ' ' && before[0].isLetterOrDigit()) {
                 ic.deleteSurroundingText(1, 0)
@@ -2975,7 +2983,8 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     // not here, so every key vibrates exactly once.
     private fun commitChar(char: Char) {
         val ic = currentInputConnection
-        lastSelfEditMs = System.currentTimeMillis()
+        markSelfEdit()
+        plainLetterCommitted = false   // re-armed below only by the mid-word plain-insert branch
         // Flush a still-pending space tap BEFORE this character, so a fast next-key press lands
         // after the space instead of gluing onto the previous word.
         flushPendingSpace()
@@ -3019,6 +3028,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             if (tail.isNotEmpty() && isWordChar(tail[0])) {
                 finalizeComposing()
                 ic?.commitText(char.toString(), 1)
+                plainLetterCommitted = true   // a glide starting here must remove this letter first
                 pendingTapPos = null
                 maybeAutoCapitalize()
                 updateSuggestions()
@@ -3038,15 +3048,17 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             composing.append(ch)
             recordTap(ch)   // remember where the finger landed, for coordinate spatial autocorrect
             ic?.setComposingText(composing.toString(), 1)
-            // Emoticons ending in a letter (e.g. :D :P xD) complete here.
-            if (ch in emoticonEndChars && maybeReplaceEmoticon()) { maybeAutoCapitalize(); updateSuggestions(); return }
             maybeAutoCapitalize()
             updateSuggestions()
             return
         }
         pendingTapPos = null   // not part of a word: drop any captured touch point
-        // Double-space -> ". " (only after a word character)
-        if (char == ' ' && doubleSpaceOn) {
+        // Double-space -> ". " (only after a word character). Off where it would do harm: silently
+        // turning "ab  " into "ab. " inside a password is data corruption, and in a raw key-event
+        // field (remote desktop) the delete-and-retype replays as phantom keystrokes. Deliberately
+        // NOT gated on fieldNoSuggestions — plenty of ordinary composers set NO_SUGGESTIONS just to
+        // kill the editor's spell-check underline, and they should still get the period.
+        if (char == ' ' && doubleSpaceOn && !secureField && !rawKeyField()) {
             val before = ic?.getTextBeforeCursor(2, 0)?.toString() ?: ""
             if (before.length == 2 && before[1] == ' ' && before[0].isLetterOrDigit()) {
                 ic?.deleteSurroundingText(1, 0)
@@ -3151,6 +3163,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         // English suggestions on a Latvian/Russian keyboard.
         if (secureField || fieldNoSuggestions || !suggestionsOn || !SuggestionEngine.isReady() ||
             !SuggestionEngine.isLangLoaded(currentLang.value)) {
+            // Bump BEFORE returning: an in-flight pass from the previous field must not publish its
+            // suggestions over this one (tapping such a chip would commit that word here — in a
+            // password field, no less).
+            suggGen++
             setSuggestions(emptyList(), null); return
         }
         // Never let a suggestion computation crash the IME — onUpdateSelection runs this and an
@@ -3199,7 +3215,6 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         val pts = tapsFor(word.lowercase())
         val bounds = if (pts != null) HashMap(keyBounds) else null
         val prevLower = prevW?.lowercase()
-        val emoji = emojiKeywords[word.lowercase()]   // offer a matching emoji as an extra strip chip
         serviceScope.launch(kotlinx.coroutines.Dispatchers.Default) {
             val result = try {
                 computeSuggestions(word, langs, uni, prefer, prevLower, pts, bounds)
@@ -3209,8 +3224,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             }
             kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
                 if (gen == suggGen) {
-                    val list = if (emoji != null && emoji !in result.first) result.first + emoji else result.first
-                    setSuggestions(list, result.second)
+                    setSuggestions(result.first, result.second)
                 }
             }
         }
@@ -3270,7 +3284,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             // Context: prefer a fix that fits the previous word (bundled + learned bigrams).
             var corr = SuggestionEngine.corrections(lower, langs, uni, 2, prefer = prefer)
             // Spatial re-rank, promote-only: fixes whose differing keys the finger physically
-            // grazed (slip cost ≤ 0.75 key-widths) float to the front in cost order; everything
+            // grazed (slip cost ≤ 0.75 cells) float to the front in cost order; everything
             // else (incl. transpositions, where taps are far by construction) keeps rank order.
             if (corr.size > 1 && pts != null && bounds != null) {
                 corr = corr.mapIndexed { i, c ->
@@ -3305,6 +3319,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         val undo = autocorrectUndo ?: return
         autocorrectUndo = null
         val ic = currentInputConnection ?: return
+        markSelfEdit()
         val n = undo.corrected.length + 1
         val before = ic.getTextBeforeCursor(n, 0)?.toString() ?: return
         if (before.length == n && before.startsWith(undo.corrected)) {
@@ -3324,9 +3339,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         performKeyFeedback()
         if (s.startsWith("↩ ")) { revertAutocorrectKeepBoundary(); return }
         val ic = currentInputConnection ?: return
-        // Emoji suggestion (e.g. typed "love" -> tapped ❤️): replace the word with the emoji, but
-        // don't learn the glyph as a personal word. Detected by a high first code point (emoji/symbol).
-        val isEmoji = s.isNotEmpty() && s[0].code > 0x2000
+        // A strip tap always lands long after the last keystroke — stamp it so the selection updates
+        // it causes aren't mistaken for the user moving the caret (which would drop the glide
+        // alternates / pending auto-space this very function sets up).
+        markSelfEdit()
         // Tapping a glide alternate: swap the just-glided word for it, keeping the auto-space.
         val gw = glideWord
         if (gw != null) {
@@ -3379,10 +3395,8 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         }
         ic.endBatchEdit()
         if (pendingAutoSpace) autoSpaceSkipNextSel = true
-        if (!isEmoji) {
-            learnFromTap(prev?.lowercase(), s.lowercase())
-            scheduleUserDictSave()
-        }
+        learnFromTap(prev?.lowercase(), s.lowercase())
+        scheduleUserDictSave()
         isShift.value = false; shiftIsAuto = false
         updateSuggestions()
     }
@@ -3440,7 +3454,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 // (v3) Coordinate refinement: only when v1 already decided to correct AND the taps for
                 // this word were fully captured. Re-pick among the SAME candidate set the word whose
                 // keys the finger was physically closest to — but only if that's clearly confident
-                // (avg < 0.65 key-widths). Can't correct anything v1 wouldn't; just chooses better.
+                // (worst differing position < 0.65 cells). Can't correct anything v1 wouldn't; just chooses better.
                 if (corr != null) {
                     val pts = tapsFor(learned)
                     if (pts != null) {
@@ -3472,8 +3486,11 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     SuggestionEngine.isKnown(learned, dictLangs(), UserDictionary.unigrams())) {
                     val fw = SuggestionEngine.followerWeights(prev.lowercase(), dictLangs(), UserDictionary.bigrams())
                     if (fw.isNotEmpty() && (fw[learned] ?: 0) == 0) {
+                        // Strongest follower first — iterating the map's hash order could otherwise
+                        // apply a weaker candidate than the one the context actually expects.
                         corr = fw.entries.asSequence()
                             .filter { it.value >= 7 }
+                            .sortedByDescending { it.value }
                             .map { it.key }
                             .firstOrNull { SuggestionEngine.isConfidentSlip(learned, it, neighbors()) }
                     }
@@ -3556,6 +3573,15 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             if (autoSpaceSkipNextSel) autoSpaceSkipNextSel = false
             else pendingAutoSpace = false
         }
+        // A caret move the user made (not one of our own edits, which report back within a few ms)
+        // disarms the one-tap undo state. Backspace-revert and the "↩ word" chip match by TEXT only,
+        // so parked at ANOTHER occurrence of the same word — and "the " is everywhere — they would
+        // rewrite that unrelated one instead; the glide undo would swallow a whole innocent word.
+        if (System.currentTimeMillis() - lastSelfEditMs >= 500) {
+            autocorrectUndo = null
+            glideWord = null
+            glideAlts = emptyList()
+        }
         maybeAutoCapitalize()   // keep Shift in sync when the cursor moves (arm at sentence starts, disarm mid-text)
         updateSuggestions()
     }
@@ -3586,6 +3612,13 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         if (!autoCapOn || secureField) return
         val cls = fieldInputType and android.text.InputType.TYPE_MASK_CLASS
         if (cls != android.text.InputType.TYPE_CLASS_TEXT || fieldNoSuggestions) return
+        // Mid-word there is nothing to decide: the caret sits at the end of the composing word, no
+        // sentence can start here, and the first letter already consumed any one-shot Shift. Bailing
+        // out here removes a blocking InputConnection round-trip (getCursorCapsMode /
+        // getTextBeforeCursor) from every keystroke but the first of each word.
+        // All-caps fields are excluded — there Shift must be re-armed for every letter.
+        val capsField = (fieldInputType and android.text.InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS) != 0
+        if (!capsField && composing.isNotEmpty()) return
         val capFlags = fieldInputType and (
             android.text.InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS or
             android.text.InputType.TYPE_TEXT_FLAG_CAP_WORDS or
@@ -3608,11 +3641,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     }
 
     private fun commitText(text: String) {
+        markSelfEdit()
         flushPendingSpace()   // a fast digit/symbol/emoji tap must not overtake a pending space tap
         finalizeComposing()   // symbols / digits / paste / emoji end the current word first
         currentInputConnection?.commitText(text, 1)
-        // Emoticons ending in a symbol/digit (e.g. :) :( ;) :/ <3) complete here.
-        if (text.isNotEmpty() && text.last() in emoticonEndChars) maybeReplaceEmoticon()
     }
 
     // Unified key feedback. Every key (letters, backspace, mode, shift, space) routes through
@@ -3754,6 +3786,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
      *  PHYSICAL Shift+Enter chord — press the Shift KEY, press/release Enter while it's held, release
      *  Shift — which forwards as a real held modifier the remote chat app maps to "newline". */
     private fun insertNewline() {
+        markSelfEdit()
         if (rawKeyField()) {
             finalizeComposing()
             val ic = currentInputConnection ?: return
@@ -3777,6 +3810,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     // instead (Shift+Enter). The forced break is sent as a real Shift+Enter key event, the combo
     // chat editors map to "new line, don't send" (a committed "\n" gets swallowed by such fields).
     private fun handleEnter(hasImeAction: Boolean, imeAction: Int) {
+        markSelfEdit()
+        // A space tapped just before Enter commits on finger-UP; flush it first so it can't land
+        // AFTER the action fired (a stray leading space in the next message).
+        flushPendingSpace()
         val shifted = isShift.value || isCapsLock.value
         when {
             // Remote desktop / terminal (raw key-event field). Two DIFFERENT channels, matching how
@@ -3885,11 +3922,13 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         performKeyFeedback()
         shiftIsAuto = false   // this is a deliberate Shift, so it enables selection on space-swipe
         val now = System.currentTimeMillis()
-        if (now - lastShiftTapMs < 300) {
+        // Caps lock exits FIRST: otherwise a third quick tap re-entered the double-tap branch and
+        // caps could only be released after pausing for 300 ms.
+        if (isCapsLock.value) {
+            isCapsLock.value = false; isShift.value = false
+        } else if (now - lastShiftTapMs < 300) {
             isCapsLock.value = true
             isShift.value = true
-        } else if (isCapsLock.value) {
-            isCapsLock.value = false; isShift.value = false
         } else {
             isShift.value = !isShift.value
         }
@@ -3917,7 +3956,9 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private fun openSettings(section: String? = null) {
         try {
             startActivity(Intent(this, SettingsActivity::class.java).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                // SINGLE_TOP delivers the section extra to an already-open Settings via onNewIntent;
+                // with NEW_TASK alone the task was merely brought forward and the deep link was lost.
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
                 if (section != null) putExtra("section", section)
             })
         } catch (e: Exception) {
@@ -3936,9 +3977,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
 
     private fun deleteSmart(byWord: Boolean) {
         performKeyFeedback()
-        lastSelfEditMs = System.currentTimeMillis()
+        markSelfEdit()
         flushPendingSpace()   // keep real key order: a space tapped before this backspace lands first
         pendingAutoSpace = false
+        plainLetterCommitted = false   // that letter is gone / no longer the one a glide would replace
         val ic = currentInputConnection ?: return
 
         // Backspace right after a glide deletes the whole inserted word + its auto-space in one tap.
@@ -4034,28 +4076,36 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 offlineSession = true
                 isRecording.value = true
                 statusText.value = "🎤 Recording (on-device)…"
+                val token = fieldToken()
                 offlineDictation.start(
                     langTagOf(currentLang.value),
                     preferOffline = !networkAvailable(),
                     onPartial = { t ->
                         // No interim text in raw key-event fields — every rewrite replays remotely.
-                        if (!rawKeyField()) try { currentInputConnection?.setComposingText(t, 1) } catch (_: Exception) {}
+                        if (!rawKeyField() && canCommitTo(token)) {
+                            try { currentInputConnection?.setComposingText(t, 1) } catch (_: Exception) {}
+                        }
                     },
                     onFinal = { t ->
                         handler.post {
                             offlineSession = false
                             isRecording.value = false
+                            val ok = canCommitTo(token)
                             try {
-                                if (rawKeyField()) {
+                                if (!ok) currentInputConnection?.finishComposingText()
+                                else if (rawKeyField()) {
                                     if (!t.isNullOrBlank()) currentInputConnection?.commitText(t, 1)
                                 } else {
                                     if (!t.isNullOrBlank()) currentInputConnection?.setComposingText(t, 1)
                                     currentInputConnection?.finishComposingText()
                                 }
                             } catch (_: Exception) {}
-                            if (t.isNullOrBlank()) {
+                            if (!ok) {
+                                statusText.value = "🎤 Field changed — dictation dropped"
+                                clearStatusLater("🎤 Field changed — dictation dropped", 2000)
+                            } else if (t.isNullOrBlank()) {
                                 statusText.value = "Didn't catch that"
-                                handler.postDelayed({ if (statusText.value == "Didn't catch that") statusText.value = "" }, 2000)
+                                clearStatusLater("Didn't catch that", 2000)
                             } else statusText.value = ""
                         }
                     }
@@ -4066,13 +4116,6 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             if (audioRecorder.start()) {
                 isRecording.value = true
                 statusText.value = "🎤 Recording..."
-                // Live interim updates rewrite the composing region over and over — in a raw
-                // key-event field each rewrite would be replayed as keystrokes remotely. Skip.
-                if (KeyboardPrefs.isLiveDictation(this) && !rawKeyField()) {
-                    finalizeComposing()        // so the interim transcript owns the composing region
-                    liveBusy = false
-                    handler.postDelayed(liveDictationTick, 1600)
-                }
             } else {
                 statusText.value = "⚠ Failed to start recording"
             }
@@ -4095,12 +4138,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             handler.postDelayed({ if (statusText.value == "✕ Cancelled") statusText.value = "" }, 1500)
             return
         }
-        handler.removeCallbacks(liveDictationTick)
         try {
-            audioRecorder.stop(File(cacheDir, "voice_input.wav"))
+            audioRecorder.discard()   // cancelled: throw the audio away, don't write it to the cache
         } catch (_: Exception) {}
-        // Drop any live-dictation interim text from the field.
-        try { currentInputConnection?.setComposingText("", 1); currentInputConnection?.finishComposingText() } catch (_: Exception) {}
+        try { currentInputConnection?.finishComposingText() } catch (_: Exception) {}
         isRecording.value = false
         statusText.value = "✕ Cancelled"
         handler.postDelayed({ if (statusText.value == "✕ Cancelled") statusText.value = "" }, 1500)
@@ -4114,7 +4155,6 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 offlineDictation.stop()
                 return
             }
-            handler.removeCallbacks(liveDictationTick)   // stop live-interim updates; final replaces them
             if (!audioRecorder.isActive()) return
             finalizeComposing()   // commit any composing word so the transcript appends after it
 
@@ -4122,8 +4162,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             if (audioRecorder.stop(audioFile)) {
                 isRecording.value = false
                 statusText.value = "⏳ Transcribing..."
+                val token = fieldToken()
 
                 GroqApi.transcribe(audioFile) { text, error ->
+                    audioFile.delete()   // don't leave the recorded speech sitting in the cache
                     if (text != null) {
                         val cleanup = KeyboardPrefs.isAutocorrectEnabled(this@KeyoService)
                         // No instant swap in raw key-event fields: the later delete-and-retype would
@@ -4139,14 +4181,17 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                             // is dropped.
                             handler.post {
                                 try {
-                                    currentInputConnection?.commitText(text, 1)
-                                    statusText.value = "🧹 Cleaning up…"
+                                    if (canCommitTo(token)) {
+                                        markSelfEdit()
+                                        currentInputConnection?.commitText(text, 1)
+                                        statusText.value = "🧹 Cleaning up…"
+                                    } else showDroppedDictation()
                                 } catch (_: Exception) {}
                             }
                             GroqApi.cleanupText(text) { cleaned, _ ->
                                 handler.post {
                                     try {
-                                        if (cleaned != null && cleaned != text) {
+                                        if (cleaned != null && cleaned != text && canCommitTo(token)) {
                                             val c = currentInputConnection
                                             if (c?.getTextBeforeCursor(text.length, 0)?.toString() == text) {
                                                 c.beginBatchEdit()
@@ -4164,8 +4209,11 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                             GroqApi.cleanupText(text) { cleaned, _ ->
                                 handler.post {
                                     try {
-                                        currentInputConnection?.commitText(cleaned ?: text, 1)
-                                        statusText.value = ""
+                                        if (canCommitTo(token)) {
+                                            markSelfEdit()
+                                            currentInputConnection?.commitText(cleaned ?: text, 1)
+                                            statusText.value = ""
+                                        } else showDroppedDictation()
                                     } catch (e: Exception) {
                                         statusText.value = "⚠ ${e.message}"
                                     }
@@ -4174,8 +4222,11 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         } else {
                             handler.post {
                                 try {
-                                    currentInputConnection?.commitText(text, 1)
-                                    statusText.value = ""
+                                    if (canCommitTo(token)) {
+                                        markSelfEdit()
+                                        currentInputConnection?.commitText(text, 1)
+                                        statusText.value = ""
+                                    } else showDroppedDictation()
                                 } catch (e: Exception) {
                                     statusText.value = "⚠ ${e.message}"
                                 }
@@ -4183,10 +4234,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         }
                     } else {
                         handler.post {
-                            // Keep whatever live dictation already recognised (commit the interim).
+                            // Nothing to commit — just release any composing region we might hold.
                             try { currentInputConnection?.finishComposingText() } catch (_: Exception) {}
                             statusText.value = error ?: "Transcription failed"
-                            handler.postDelayed({ statusText.value = "" }, 3000)
+                            clearStatusLater(error ?: "Transcription failed", 3000)
                         }
                     }
                 }
@@ -4194,7 +4245,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 try { currentInputConnection?.finishComposingText() } catch (_: Exception) {}
                 isRecording.value = false
                 statusText.value = "⚠ Recording too short"
-                handler.postDelayed({ statusText.value = "" }, 2000)
+                clearStatusLater("⚠ Recording too short", 2000)
             }
         } catch (e: Exception) {
             isRecording.value = false
@@ -4228,6 +4279,9 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         if (rewriteRecorder.start()) {
             customRecording = true
             statusText.value = "🎤 Say how to change the text…"
+        } else {
+            statusText.value = "⚠ Failed to start recording"
+            clearStatusLater("⚠ Failed to start recording", 2000)
         }
     }
 
@@ -4238,14 +4292,19 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         if (rewriteRecorder.stop(f)) {
             statusText.value = "⏳ Transcribing…"
             GroqApi.transcribe(f) { instr, err ->
+                f.delete()
                 handler.post {
                     if (!instr.isNullOrBlank()) runRewrite(instr.trim())
                     else {
                         statusText.value = err ?: "Couldn't hear that"
-                        handler.postDelayed({ statusText.value = "" }, 2000)
+                        clearStatusLater(err ?: "Couldn't hear that", 2000)
                     }
                 }
             }
+        } else {
+            // Too short to transcribe — don't leave "🎤 Say how to change the text…" hanging.
+            statusText.value = "⚠ Recording too short"
+            clearStatusLater("⚠ Recording too short", 2000)
         }
     }
 
@@ -4274,7 +4333,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
 
     private fun cancelAIRecording() {
         try {
-            aiAudioRecorder.stop(File(cacheDir, "ai_voice_input.wav"))
+            aiAudioRecorder.discard()
         } catch (_: Exception) {}
         isRecordingAI.value = false
         statusText.value = "✕ Cancelled"
@@ -4290,19 +4349,28 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             if (aiAudioRecorder.stop(audioFile)) {
                 isRecordingAI.value = false
                 statusText.value = "🤖 Transcribing task..."
+                val token = fieldToken()
 
                 GroqApi.transcribe(audioFile) { text, error ->
+                    audioFile.delete()
                     if (text != null) {
                         handler.post { statusText.value = "🤖 Executing: $text" }
                         GroqApi.executeTask(text, this@KeyoService, confirm = { summary -> requestConfirm(summary) }) { result, taskError ->
                             handler.post {
                                 try {
                                     if (result != null) {
-                                        currentInputConnection?.commitText(formatEmphasis(result), 1)
-                                        statusText.value = ""
+                                        // The tool loop can run for minutes — never let the answer
+                                        // land in whatever field the user has moved on to.
+                                        if (canCommitTo(token)) {
+                                            currentInputConnection?.commitText(formatEmphasis(result), 1)
+                                            statusText.value = ""
+                                        } else {
+                                            statusText.value = "🤖 Field changed — answer dropped"
+                                            clearStatusLater("🤖 Field changed — answer dropped", 3000)
+                                        }
                                     } else {
                                         statusText.value = taskError ?: "Task failed"
-                                        handler.postDelayed({ statusText.value = "" }, 3000)
+                                        clearStatusLater(taskError ?: "Task failed", 3000)
                                     }
                                 } catch (e: Exception) {
                                     statusText.value = "⚠ ${e.message}"
@@ -4312,7 +4380,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     } else {
                         handler.post {
                             statusText.value = error ?: "Transcription failed"
-                            handler.postDelayed({ statusText.value = "" }, 3000)
+                            clearStatusLater(error ?: "Transcription failed", 3000)
                         }
                     }
                 }

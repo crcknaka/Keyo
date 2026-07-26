@@ -36,6 +36,5 @@ interface Tool {
 
 data class ToolResult(
     val success: Boolean,
-    val output: String,
-    val silent: Boolean = false  // if true, don't show output to user, just feed to LLM
+    val output: String
 )

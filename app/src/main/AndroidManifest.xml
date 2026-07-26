@@ -4,12 +4,25 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
-    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
     <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- Required by the "set an alarm / timer" voice commands: stock clock apps enforce it on the
+         caller of ACTION_SET_ALARM / ACTION_SET_TIMER. -->
+    <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
 
+    <!-- Package visibility for the "open <app>" voice command. A targeted <queries> filter replaces
+         QUERY_ALL_PACKAGES, which is a restricted permission a keyboard has no case for. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
+    <!-- allowBackup is OFF on purpose: the prefs hold the Groq API key and the clipboard history in
+         plaintext, and Auto Backup would ship both to Drive and restore them onto any device. -->
     <application
         android:name=".KeyoApp"
-        android:allowBackup="true"
+        android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:label="Keyo"
@@ -40,9 +53,12 @@
             </intent-filter>
         </receiver>
 
+        <!-- singleTop so the keyboard's "Edit ›" deep link reaches an already-open Settings task
+             through onNewIntent instead of being dropped when the activity is merely brought forward. -->
         <activity
             android:name=".SettingsActivity"
             android:label="Keyo"
+            android:launchMode="singleTop"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

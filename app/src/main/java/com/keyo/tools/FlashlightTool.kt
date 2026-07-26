@@ -26,8 +26,12 @@ class FlashlightTool : Tool {
         val enabled = args.getBoolean("enabled")
         return try {
             val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-            val cameraId = cameraManager.cameraIdList.firstOrNull()
-                ?: return ToolResult(false, "Camera not found")
+            // Pick a camera that actually HAS a flash unit — on phones whose first-enumerated camera
+            // is the front one, blindly taking the first id made setTorchMode throw every time.
+            val cameraId = cameraManager.cameraIdList.firstOrNull { id ->
+                cameraManager.getCameraCharacteristics(id)
+                    .get(android.hardware.camera2.CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+            } ?: return ToolResult(false, "No flashlight on this device")
             cameraManager.setTorchMode(cameraId, enabled)
             ToolResult(true, if (enabled) "🔦 Flashlight on" else "Flashlight off")
         } catch (e: Exception) {

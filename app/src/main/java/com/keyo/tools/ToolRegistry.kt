@@ -35,6 +35,9 @@ object ToolRegistry {
         }
     }
 
+    // Only tools that DO something the user can't read off the status bar. Brightness, volume,
+    // battery and date/time were dropped: the model answered questions the phone already shows,
+    // and two of them needed special permissions to work at all.
     fun init() {
         register(SetAlarmTool())
         register(SetTimerTool())
@@ -42,9 +45,5 @@ object ToolRegistry {
         register(FlashlightTool())
         register(ClipboardTool())
         register(WebSearchTool())
-        register(VolumeTool())
-        register(BrightnessInfoTool())
-        register(BatteryInfoTool())
-        register(DateTimeTool())
     }
 }
