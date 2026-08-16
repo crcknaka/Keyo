@@ -35,11 +35,15 @@ class FieldTestActivity : Activity() {
      *  [action] is the imeOptions action they declare. Between them these cover what Enter has to
      *  decide: fire the action, or insert a line break. The label reports what actually happened,
      *  so a press can be judged without guessing. */
-    private fun messageField(label: String, action: Int, multi: Boolean): LinearLayout {
+    private fun messageField(label: String, action: Int, multi: Boolean, viewId: Int): LinearLayout {
         val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         val log = android.widget.TextView(this).apply { text = "$label — waiting"; textSize = 12f }
         var fired = 0
         val field = EditText(this).apply {
+            // A STABLE id, so Android saves and restores the text and the focus across a rotation —
+            // without one these fields come back empty and unfocused, which hides every bug that
+            // only shows up after the screen turns.
+            id = viewId
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES or
                     (if (multi) InputType.TYPE_TEXT_FLAG_MULTI_LINE else 0)
             imeOptions = action
@@ -141,13 +145,37 @@ class FieldTestActivity : Activity() {
         }
 
         // Messenger message boxes — the Enter-key decision table.
-        root.addView(messageField("SEND, single line", EditorInfo.IME_ACTION_SEND, multi = false))
-        root.addView(messageField("DONE, single line", EditorInfo.IME_ACTION_DONE, multi = false))
-        root.addView(messageField("SEND, multi-line", EditorInfo.IME_ACTION_SEND, multi = true))
+        root.addView(messageField("SEND, single line", EditorInfo.IME_ACTION_SEND, multi = false, viewId = 1001))
+        root.addView(messageField("DONE, single line", EditorInfo.IME_ACTION_DONE, multi = false, viewId = 1002))
+        root.addView(messageField("SEND, multi-line", EditorInfo.IME_ACTION_SEND, multi = true, viewId = 1003))
         // NO_ENTER_ACTION as well: with a bare UNSPECIFIED the framework substitutes NEXT (there are
         // focusable views below) or DONE, so the field would silently test the opposite of its name.
         root.addView(messageField("no action declared",
-            EditorInfo.IME_ACTION_UNSPECIFIED or EditorInfo.IME_FLAG_NO_ENTER_ACTION, multi = false))
+            EditorInfo.IME_ACTION_UNSPECIFIED or EditorInfo.IME_FLAG_NO_ENTER_ACTION, multi = false, viewId = 1004))
+
+        // A search box that RESTARTS THE INPUT on every keystroke, the way a field showing live
+        // suggestions does (Play Store's search is one). Anything the keyboard does on a restart
+        // runs here on every single character — which is how a fix meant for "once, after the screen
+        // rotates" can silently destroy ordinary typing.
+        val searchLog = android.widget.TextView(this).apply {
+            text = "search — restarts input on every keystroke"; textSize = 12f
+        }
+        val search = EditText(this).apply {
+            id = 1006
+            inputType = InputType.TYPE_CLASS_TEXT
+            imeOptions = EditorInfo.IME_ACTION_SEARCH
+            textSize = 18f
+            addTextChangedListener(object : android.text.TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                override fun afterTextChanged(s: android.text.Editable?) {
+                    searchLog.text = "search — text now \"$s\""
+                    (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager).restartInput(this@apply)
+                }
+            })
+        }
+        root.addView(searchLog)
+        root.addView(search)
 
         // Remote-desktop stand-in: shows exactly what the keyboard sends down the wire.
         val rawLog = android.widget.TextView(this).apply {
@@ -180,9 +208,29 @@ class FieldTestActivity : Activity() {
             }
         })
 
-        // Scrollable: with the keyboard up the later cases (the WhatsApp PIN field and its dialog
-        // button — the reason this activity exists) would otherwise sit off-screen.
-        setContentView(android.widget.ScrollView(this).apply { addView(root) })
+        // A chat-style composer PINNED to the bottom, directly against the keyboard, the way
+        // WhatsApp's message box sits. Everything else here is near the top of the screen, and a
+        // field hard against the keyboard edge is a different case: it is the one that can be
+        // clipped or mispositioned by the insets the keyboard reports.
+        val chat = EditText(this).apply {
+            id = 1005
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES or
+                    InputType.TYPE_TEXT_FLAG_MULTI_LINE
+            imeOptions = EditorInfo.IME_FLAG_NO_ENTER_ACTION
+            textSize = 18f
+            hint = "chat composer (pinned to the bottom, like WhatsApp)"
+        }
+        val screen = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        screen.addView(
+            android.widget.ScrollView(this).apply { addView(root) },
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
+        )
+        screen.addView(
+            chat,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT)
+        )
+        setContentView(screen)
         inline.requestFocus()
         // WhatsApp-style delayed show (their helper posts showSoftInput after focus)
         inline.postDelayed({

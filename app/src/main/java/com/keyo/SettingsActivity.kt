@@ -614,6 +614,7 @@ class SettingsActivity : ComponentActivity() {
 
     @Composable
     private fun AboutScreen(onBack: () -> Unit) {
+        var diag by remember { mutableStateOf(KeyboardPrefs.isFieldDiagnostics(this@SettingsActivity)) }
         SubScreen("About", onBack) {
             Group {
                 Column(Modifier.padding(16.dp)) {
@@ -625,6 +626,15 @@ class SettingsActivity : ComponentActivity() {
                     Text("Long-press the space bar to dictate, hold the ✨ key to run a task.",
                         fontSize = 13.sp, color = textMuted)
                 }
+            }
+            Group {
+                ToggleRow(
+                    "Field diagnostics",
+                    "Shows a line above the keyboard with what the text field reports — the caret " +
+                        "position, whether it exposes its text, how many updates it sent. Turn it " +
+                        "on only to capture a screenshot for a bug report, then turn it back off.",
+                    diag
+                ) { diag = it; KeyboardPrefs.setFieldDiagnostics(this@SettingsActivity, it) }
             }
             Group {
                 Column(Modifier.padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {

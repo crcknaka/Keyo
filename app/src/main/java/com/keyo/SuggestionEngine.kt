@@ -264,13 +264,27 @@ object SuggestionEngine {
             val d = editDistanceAtMost(fw, fold(lw), maxDist)
             if (d in 1..maxDist && seen.add(fold(lw))) scored.add(Triple(lw, d, if (lw in prefer) -2 else -1))
         }
-        val n = minOf(scanLimit, words.size)
-        for (rank in 0 until n) {
-            val w = words[rank]
-            if (kotlin.math.abs(w.length - word.length) > maxDist) continue
-            val d = editDistanceAtMost(fw, fold(w), maxDist)
-            if (d in 1..maxDist && seen.add(fold(w))) scored.add(Triple(w, d, if (w in prefer) -2 else rank))
+        // The list is frequency-ordered, so the fix for a common word is found in the first few
+        // thousand entries and scanning further is wasted work on the typing path. But a word that
+        // is merely uncommon sits far down it — "подсказки" is rank 20214 of 48249 — and stopping at
+        // the limit meant those words simply could not be corrected, however obvious the typo.
+        // So: scan the cheap prefix first, and only if that found no single-edit fix (the thing
+        // autocorrect actually applies) pay for the rest of the dictionary.
+        var bestDist = maxDist + 1
+        fun scan(from: Int, to: Int) {
+            for (rank in from until to) {
+                val w = words[rank]
+                if (kotlin.math.abs(w.length - word.length) > maxDist) continue
+                val d = editDistanceAtMost(fw, fold(w), maxDist)
+                if (d in 1..maxDist && seen.add(fold(w))) {
+                    scored.add(Triple(w, d, if (w in prefer) -2 else rank))
+                    if (d < bestDist) bestDist = d
+                }
+            }
         }
+        val n = minOf(scanLimit, words.size)
+        scan(0, n)
+        if (bestDist > 1 && n < words.size) scan(n, words.size)
         return scored.sortedWith(compareBy({ it.second }, { it.third })).map { it.first }.take(limit)
     }
 
@@ -393,13 +407,19 @@ object SuggestionEngine {
      *  substitutions ([allAdjacentSubs]) — a confident double fat-finger the old single-edit rule missed. */
     internal fun pickAutocorrect(typed: String, cands: List<String>, neighbors: Map<Char, Set<Char>>): String? {
         val ft = fold(typed)
+        val singles = ArrayList<String>()
         for (c in cands) {
             when (editDistanceAtMost(ft, fold(c), 2)) {
-                1 -> return c
-                2 -> if (allAdjacentSubs(typed, c, neighbors)) return c
+                1 -> singles.add(c)
+                2 -> if (singles.isEmpty() && allAdjacentSubs(typed, c, neighbors)) return c
             }
         }
-        return null
+        // Among equally-close candidates, prefer the one whose changed letter sits on a key NEXT TO
+        // the one that was typed — that is what a mistype physically is. "подсказкт" is one edit
+        // from both "подсказку" and "подсказки", but и is the key beside т while у is nowhere near
+        // it, so и is the fix the finger meant. Frequency order decides only when no candidate is a
+        // neighbour (a dropped or doubled letter, a transposition).
+        return singles.firstOrNull { isConfidentSlip(typed, it, neighbors) } ?: singles.firstOrNull()
     }
 
     /** Top next-word predictions for [prev] from the learned bigram table. */

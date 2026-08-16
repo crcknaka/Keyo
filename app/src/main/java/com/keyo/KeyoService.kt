@@ -353,6 +353,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         suggestionsOn = KeyboardPrefs.isSuggestionsEnabled(this)
         autocorrectTypingOn = KeyboardPrefs.isAutocorrectTyping(this)
         swipeTypingOn = KeyboardPrefs.isSwipeTyping(this)
+        fieldDiagOn.value = KeyboardPrefs.isFieldDiagnostics(this)
     }
 
     // Content rows the key area reserves. Fixed within a configuration so the keyboard never jumps
@@ -540,6 +541,18 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         shiftIsAuto = false
         showUndoRewrite.value = false
         composing.clear()   // fresh field: never carry a composing word across inputs
+        // Clear any composing span left in the EDITOR, not just our own buffer. On a rotation the
+        // activity is recreated and restores its text together with the spans it was saved with, so
+        // a word that was mid-composing when the screen turned comes back still marked as composing
+        // — owned by an input session that no longer exists. Harmless to call when there is nothing
+        // to finish, and it costs one IPC per field.
+        try { currentInputConnection?.finishComposingText() } catch (_: Exception) {}
+        // Drain any batch edit a previous session left open. A chat screen that handles rotation
+        // itself (WhatsApp does) keeps the SAME text view across the turn, so an unbalanced depth
+        // survives with it — and an editor inside an open batch suspends its caret blink while
+        // still accepting text, which is exactly "it types but the cursor is invisible until I tap".
+        // endBatchEdit on a balanced editor does nothing, so draining costs nothing when it's fine.
+        try { repeat(4) { currentInputConnection?.endBatchEdit() } } catch (_: Exception) {}
         recentTaps.clear()
         pendingTapPos = null
         autocorrectUndo = null
@@ -552,6 +565,23 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         plainLetterCommitted = false
         previewKey.value = null   // a key held while the field changed must not leave its preview up
         lastSelStart = -1; lastSelEnd = -1   // caret position belongs to the field we just left
+        // Cursor-update subscription — ONLY while the diagnostics switch is on. It was added to find
+        // out whether an editor considers its caret visible, it did not fix anything, and it is an
+        // extra stream of callbacks through every app's InputConnection. Text stopped appearing at
+        // all in the Play Store on the build that introduced it, so it does not run by default:
+        // an unproven addition does not get to sit on the typing path of every app.
+        if (fieldDiagOn.value) {
+            try {
+                currentInputConnection?.requestCursorUpdates(
+                    android.view.inputmethod.InputConnection.CURSOR_UPDATE_MONITOR)
+            } catch (_: Exception) {}
+        }
+        // ONLY after the screen actually turned. Plenty of fields (a search box updating its
+        // suggestions, for one) restart the input on every keystroke, and nudging the selection
+        // there fights the user's own typing — text stops appearing at all.
+        if (restarting && pendingCaretKick) { pendingCaretKick = false; restartCaretBlink() }
+        dbgStarts++; dbgUpdates = 0; dbgAnchors = 0; dbgAnchorInfo = ""
+        handler.post { refreshDebugInfo(if (restarting) "RESTART" else "start") }
         // A message from the previous field would otherwise follow the user into this one — and while
         // it shows, it covers the suggestion strip and every toolbar icon.
         if (!isRecording.value && !isRecordingAI.value && !customRecording) statusText.value = ""
@@ -611,10 +641,13 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
 
     override fun onComputeInsets(outInsets: Insets) {
         super.onComputeInsets(outInsets)
-        // Ensure the visible insets match content insets
-        // This tells apps to resize their content to make room for the keyboard
         if (isInputViewShown) {
+            // Apps resize their content to sit above the keyboard.
             outInsets.contentTopInsets = outInsets.visibleTopInsets
+            // FRAME — the value this keyboard has always shipped with. Switching it to VISIBLE was a
+            // guess at the missing-caret bug, it fixed nothing, and typing stopped working entirely
+            // in the Play Store around the same build. Restored rather than left to be argued about:
+            // a speculative change has no business on the touch path of every app.
             outInsets.touchableInsets = Insets.TOUCHABLE_INSETS_FRAME
         }
     }
@@ -727,6 +760,18 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             // Dynamic top toolbar (Gboard-style). Priority: status > quick-paste chip > icons.
             // It reads statusText itself, so status changes never recompose the key grid below.
             // Hidden in mini mode — the whole point there is minimum height.
+            // Opt-in one-line readout of what the FIELD is telling us (Settings → About). Built to
+            // chase "the caret disappears after rotating in WhatsApp", which cannot be reproduced on
+            // a stock EditText: it shows whether the editor still reports a sane collapsed caret
+            // (then it knows where the cursor is and simply isn't drawing it) or reports nothing /
+            // a range (then the selection state is the problem). It lives in the NORMAL build
+            // deliberately — a separate debug build would mean uninstalling, and with it every
+            // setting, the dictionary and the API key.
+            if (fieldDiagOn.value) {
+                val dbg by debugFieldInfo
+                Text(dbg, color = accentColor, fontSize = 9.sp,
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp))
+            }
             if (mode != "mini") TopToolbar(textColor, accentColor)
 
             // Confirmation bar for consequential AI actions (call / SMS).
@@ -2433,9 +2478,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         return@post
                     }
                     c!!.beginBatchEdit()
-                    if (hadSelection) c.commitText(out, 1)
-                    else { c.deleteSurroundingText(target.length, 0); c.commitText(out, 1) }
-                    c.endBatchEdit()
+                    try {
+                        if (hadSelection) c.commitText(out, 1)
+                        else { c.deleteSurroundingText(target.length, 0); c.commitText(out, 1) }
+                    } finally { c.endBatchEdit() }
                     statusText.value = ""
                     // Offer a quick undo of the rewrite
                     rewriteBackup = target
@@ -3123,16 +3169,17 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 // whole swipe + decode ago) and would immediately wipe glideWord/glideAlts.
                 markSelfEdit()
                 ic.beginBatchEdit()
-                // The start key drops a letter on touch-down. Normally it sits in the composing
-                // region and setComposingText replaces it; when it was committed plainly (glide
-                // started with the caret right before a word) it has to be deleted by hand.
-                if (dropStartLetter) ic.deleteSurroundingText(1, 0)
-                ic.setComposingText(word, 1)
-                ic.finishComposingText()
-                composing.clear()
-                plainLetterCommitted = false
-                ic.commitText(" ", 1)          // auto-space so the next word/glide flows on
-                ic.endBatchEdit()
+                try {
+                    // The start key drops a letter on touch-down. Normally it sits in the composing
+                    // region and setComposingText replaces it; when it was committed plainly (glide
+                    // started with the caret right before a word) it has to be deleted by hand.
+                    if (dropStartLetter) ic.deleteSurroundingText(1, 0)
+                    ic.setComposingText(word, 1)
+                    ic.finishComposingText()
+                    composing.clear()
+                    plainLetterCommitted = false
+                    ic.commitText(" ", 1)      // auto-space so the next word/glide flows on
+                } finally { ic.endBatchEdit() }
                 performKeyFeedback()
                 isShift.value = false; shiftIsAuto = false
                 autocorrectUndo = null
@@ -3569,7 +3616,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         }
         val prev: String?
         // Batch the edits so the editor reports a SINGLE selection update (the skip-flag absorbs it).
+        // ALWAYS closed: an editor left inside an open batch stops blinking its caret while still
+        // accepting text — "it types but the cursor is gone".
         ic.beginBatchEdit()
+        try {
         if (composing.isNotEmpty()) {
             // The active word lives in the composing region: swap it for the suggestion + finalize.
             prev = wordBefore(word)
@@ -3591,7 +3641,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             ic.commitText("$s ", 1)
             pendingAutoSpace = true
         }
-        ic.endBatchEdit()
+        } finally { ic.endBatchEdit() }
         if (pendingAutoSpace) autoSpaceSkipNextSel = true
         learnFromTap(prev?.lowercase(), s.lowercase())
         scheduleUserDictSave()
@@ -3739,6 +3789,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         // by selection there instead of by DPAD key events (see moveCursor).
         lastSelStart = newSelStart
         lastSelEnd = newSelEnd
+        dbgUpdates++; refreshDebugInfo("upd")
         if (composing.isNotEmpty()) {
             // Our own setComposingText(...,1) always leaves the caret collapsed exactly at the end of
             // the composing span, so that state means "this update came from our own keystroke".
@@ -4082,6 +4133,85 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     // Caret position as last reported by the editor (-1 = never reported). Reset per field.
     private var lastSelStart = -1
     private var lastSelEnd = -1
+
+    // ---- Debug-build field diagnostics (see the readout above the toolbar) --------------------
+    private val debugFieldInfo = mutableStateOf("")
+    private val fieldDiagOn = mutableStateOf(false)
+    private var dbgStarts = 0     // how many times this field started/restarted
+    private var dbgUpdates = 0    // how many selection updates the editor has sent
+    private var dbgAnchors = 0    // how many cursor-anchor reports the editor has sent
+    private var dbgAnchorInfo = ""
+
+    /** The editor's own account of its caret: where it is on screen and, in the flags, whether the
+     *  editor considers it VISIBLE. This is the one channel that can distinguish "the caret is
+     *  drawn somewhere I can't see" from "the editor has decided not to draw it at all". */
+    override fun onUpdateCursorAnchorInfo(info: android.view.inputmethod.CursorAnchorInfo?) {
+        super.onUpdateCursorAnchorInfo(info)
+        dbgAnchors++
+        if (info != null) {
+            val f = info.insertionMarkerFlags
+            val vis = if (f and android.view.inputmethod.CursorAnchorInfo.FLAG_HAS_VISIBLE_REGION != 0) "VIS" else "-"
+            val inv = if (f and android.view.inputmethod.CursorAnchorInfo.FLAG_HAS_INVISIBLE_REGION != 0) "INVIS" else "-"
+            val x = info.insertionMarkerHorizontal
+            dbgAnchorInfo = "mark:${if (x.isNaN()) "NaN" else x.toInt().toString()}/$vis/$inv"
+        }
+        refreshDebugInfo("anchor")
+    }
+
+    /** Set by a configuration change (a rotation) and consumed by the next input restart, so the
+     *  caret kick below happens exactly once per turn of the screen and never during ordinary typing. */
+    private var pendingCaretKick = false
+
+    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+        super.onConfigurationChanged(newConfig)
+        pendingCaretKick = true
+    }
+
+    /** Kick a stalled caret back into blinking after the input restarts (a screen rotation restarts
+     *  it twice).
+     *
+     *  Measured in WhatsApp with the diagnostics line: after rotating, the editor reports a perfectly
+     *  sane collapsed caret AND flags it as having a visible region — it knows exactly where the
+     *  cursor is and considers it on screen. It simply never resumes the blink, so nothing is drawn
+     *  while typing keeps working. Tapping the text fixes it, and what a tap does is change the
+     *  selection: that is the documented trigger that restarts an editor's cursor blink.
+     *
+     *  So we do the same thing without moving anything — set the selection to the position the
+     *  editor itself just reported. A no-op as far as the text is concerned, and skipped entirely
+     *  unless the caret is collapsed (never collapse a selection the user is holding) and the editor
+     *  actually told us where it is. Posted, so it lands after the input view is up. */
+    private fun restartCaretBlink() {
+        handler.post {
+            try {
+                val ic = currentInputConnection ?: return@post
+                val et = ic.getExtractedText(android.view.inputmethod.ExtractedTextRequest(), 0)
+                    ?: return@post
+                if (et.selectionStart < 0 || et.selectionStart != et.selectionEnd) return@post
+                val p = et.startOffset + et.selectionStart
+                if (p < 0) return@post
+                ic.setSelection(p, p)
+            } catch (_: Exception) {}
+        }
+    }
+
+    /** One line describing what the focused field is telling us. Debug builds only. */
+    private fun refreshDebugInfo(tag: String) {
+        if (!fieldDiagOn.value) return
+        val ic = currentInputConnection
+        val et = try {
+            ic?.getExtractedText(android.view.inputmethod.ExtractedTextRequest(), 0)
+        } catch (_: Exception) { null }
+        val pkg = currentInputEditorInfo?.packageName?.substringAfterLast('.') ?: "?"
+        val caret = when {
+            lastSelStart < 0 || lastSelEnd < 0 -> "NONE"          // editor never told us
+            lastSelStart != lastSelEnd -> "RANGE ${lastSelStart}-${lastSelEnd}"  // no blink while selecting
+            else -> "at $lastSelStart"
+        }
+        val etTxt = if (et == null) "ET:null" else "ET:${et.selectionStart},${et.selectionEnd}"
+        debugFieldInfo.value =
+            "$tag $pkg caret:$caret $etTxt comp:${composing.length} " +
+            "starts:$dbgStarts upd:$dbgUpdates anch:$dbgAnchors $dbgAnchorInfo"
+    }
 
     /** Move the text cursor one position left/right (space-bar swipe). Operates directly on the
      *  editor's selection instead of sending DPAD key events: at the field's edge DPAD makes apps
@@ -4428,9 +4558,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                             val c = currentInputConnection
                                             if (c?.getTextBeforeCursor(text.length, 0)?.toString() == text) {
                                                 c.beginBatchEdit()
-                                                c.deleteSurroundingText(text.length, 0)
-                                                c.commitText(cleaned, 1)
-                                                c.endBatchEdit()
+                                                try {
+                                                    c.deleteSurroundingText(text.length, 0)
+                                                    c.commitText(cleaned, 1)
+                                                } finally { c.endBatchEdit() }
                                             }
                                         }
                                     } catch (_: Exception) {}

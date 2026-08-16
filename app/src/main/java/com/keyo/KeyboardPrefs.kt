@@ -30,6 +30,7 @@ object KeyboardPrefs {
     private const val KEY_AUTOCORRECT_TYPING = "autocorrect_typing"
     private const val KEY_SWIPE_TYPING = "swipe_typing"
     private const val KEY_INSTANT_DICTATION = "instant_dictation"
+    private const val KEY_FIELD_DIAG = "field_diagnostics"
     private const val KEY_MINI_MODE = "mini_mode"
 
     // Defaults / ranges for the visual size editor. The three size defaults are MEASURED off Gboard
@@ -302,6 +303,12 @@ object KeyboardPrefs {
      *  version a moment later (one round-trip to first text instead of two). On by default. */
     fun isInstantDictation(context: Context) = prefs(context).getBoolean(KEY_INSTANT_DICTATION, true)
     fun setInstantDictation(context: Context, v: Boolean) = prefs(context).edit().putBoolean(KEY_INSTANT_DICTATION, v).apply()
+
+    /** Diagnostics line above the keyboard, for reporting a bug that only happens in one app.
+     *  Off by default; it ships in the normal build on purpose, so turning it on never costs the
+     *  user their settings the way installing a separate debug build would. */
+    fun isFieldDiagnostics(context: Context) = prefs(context).getBoolean(KEY_FIELD_DIAG, false)
+    fun setFieldDiagnostics(context: Context, v: Boolean) = prefs(context).edit().putBoolean(KEY_FIELD_DIAG, v).apply()
 
     /** Mini keyboard mode is STICKY: once entered (by HOLDING the bottom-left mode key, 123/ABC) it
      *  survives field switches and keyboard reopens until the user holds that key again. */

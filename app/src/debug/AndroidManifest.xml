@@ -1,10 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <application>
-        <!-- Debug-only field playground for reproducing IME issues; not in release builds. -->
+        <!-- Debug-only field playground for reproducing IME issues; not in release builds.
+             configChanges mirrors a chat screen (WhatsApp's included): the activity handles rotation
+             ITSELF instead of being recreated, so the field keeps its focus and text and only the
+             layout is redone. That is a different code path from a recreated activity, and bugs that
+             only appear after turning the screen live in it. -->
         <activity
             android:name=".FieldTestActivity"
             android:exported="true"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
             android:windowSoftInputMode="stateVisible|adjustResize" />
     </application>
 </manifest>
