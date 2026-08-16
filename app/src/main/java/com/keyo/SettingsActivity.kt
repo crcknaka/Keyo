@@ -117,6 +117,7 @@ class SettingsActivity : ComponentActivity() {
         LaunchedEffect(deepLink.value) {
             when (deepLink.value) {
                 "phrases" -> screen = "phrases"
+                "languages" -> screen = "languages"   // the globe key when only one language is on
             }
             if (deepLink.value != null) deepLink.value = null
         }

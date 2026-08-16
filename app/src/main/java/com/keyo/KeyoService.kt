@@ -337,10 +337,13 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             recentTaps.clear()
         }
         if (enabledLangs.value != langsBefore) {
-            // A language was just enabled in Settings — load its dictionary in the background
-            // (current language first, same reason as in onCreate).
+            // The language list changed in Settings. Load whatever is newly enabled in the
+            // background (current language first, same reason as in onCreate) and drop whatever is
+            // no longer enabled — a parsed language costs several MB and used to stay for the life
+            // of the process even after the user turned it off.
             val langs = listOf(currentLang.value) + enabledLangs.value
             serviceScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                SuggestionEngine.unloadAllExcept(langs)
                 SuggestionEngine.ensureLoaded(this@KeyoService, langs)
             }
         }
@@ -3505,8 +3508,8 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 val corr = SuggestionEngine.corrections(lower, langs, uni, 2, prefer = prefer)
                 if (corr.isNotEmpty()) {
                     val vocabList = SuggestionEngine.wordList(langs)
-                    val corrRank = vocabList.indexOf(corr[0]).let { if (it < 0) 0 else it }
-                    val compRank = vocabList.indexOf(comp[0]).let { if (it < 0) 0 else it }
+                    val corrRank = SuggestionEngine.rankIn(corr[0], vocabList)
+                    val compRank = SuggestionEngine.rankIn(comp[0], vocabList)
                     if (corrRank < compRank * 4) corrPrimary = corr[0]
                 }
             }
@@ -3953,7 +3956,14 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     // individually instead of treating en+lv as one Latin stop.
     private fun cycleLanguage() {
         val cycle = enabledLangs.value
-        if (cycle.size <= 1) return   // only one language enabled — nothing to switch to
+        if (cycle.size <= 1) {
+            // Only one language enabled, so there is nothing to cycle to — but the key was still
+            // drawn and did nothing at all when pressed, which just reads as broken. Send the user
+            // where they can add a language instead, and say why.
+            showStatus("🌐 Only one language is on — add more in Settings", 2000)
+            openSettings("languages")
+            return
+        }
         finalizeComposing()   // commit the current word before switching
         val idx = cycle.indexOf(currentLang.value)
         val next = if (idx < 0) cycle[0] else cycle[(idx + 1) % cycle.size]

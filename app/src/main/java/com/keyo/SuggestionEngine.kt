@@ -37,6 +37,23 @@ object SuggestionEngine {
      *  keyboard during the first moments after a cold start. */
     fun isLangLoaded(lang: String): Boolean = byLang.containsKey(lang)
 
+    /** Drop everything parsed for languages the user no longer has enabled. Each one holds a word
+     *  list, a folded lookup set, a bigram model and a diacritic index — several MB for Russian —
+     *  and before this they stayed resident for the life of the process, so trying a language once
+     *  and turning it off cost that memory forever. Reloading is a background parse if it ever
+     *  comes back. Never drops the language being typed in. */
+    fun unloadAllExcept(keep: Collection<String>) {
+        val keepSet = keep.toSet()
+        synchronized(this) {
+            val gone = byLang.keys.filter { it !in keepSet }
+            for (lang in gone) {
+                byLang.remove(lang)
+                bundledBigrams.remove(lang)
+                diacriticByLang.remove(lang)
+            }
+        }
+    }
+
     /** Loads the bundled dictionaries + bigram models for [langs] from assets (all languages when
      *  omitted). Call from a background thread; idempotent and cheap once loaded. */
     fun ensureLoaded(context: Context, langs: List<String> = listOf("en", "ru", "lv")) {
@@ -219,10 +236,15 @@ object SuggestionEngine {
         if (prefix.isEmpty() || limit <= 0) return emptyList()
         val fp = fold(prefix)
         val out = LinkedHashSet<String>()
-        learnedUni.entries
-            .filter { it.key.length > prefix.length && fold(it.key).startsWith(fp) }
-            .sortedByDescending { it.value }
-            .forEach { if (out.size < limit) out.add(it.key) }
+        // Collect the learned matches first, THEN sort just those. Sorting the whole personal
+        // dictionary — up to 4000 entries — ran on every keystroke, while the number of words that
+        // actually start with the prefix is nearly always a handful.
+        val hits = ArrayList<Map.Entry<String, Int>>(8)
+        for (e in learnedUni.entries) {
+            if (e.key.length > prefix.length && fold(e.key).startsWith(fp)) hits.add(e)
+        }
+        if (hits.size > 1) hits.sortByDescending { it.value }
+        for (e in hits) { if (out.size >= limit) break; out.add(e.key) }
         if (out.size < limit) {
             for (w in words) {
                 if (w.length > prefix.length && fold(w).startsWith(fp)) {
@@ -232,6 +254,19 @@ object SuggestionEngine {
             }
         }
         return out.toList()
+    }
+
+    /** How deep the rank lookup below is willing to look. Rank is only ever used to compare two
+     *  candidates roughly, so anything past this counts as "rare" and the answer is the same. */
+    internal const val RANK_SCAN = 8000
+
+    /** Frequency rank of [word] in the bundled list; [RANK_SCAN] when it is rarer than that or
+     *  absent. The list is rank-ordered so a common word is found almost immediately, and the bound
+     *  keeps the miss case from walking all 48k entries — this runs on every keystroke. */
+    internal fun rankIn(word: String, words: List<String>): Int {
+        val n = minOf(RANK_SCAN, words.size)
+        for (i in 0 until n) if (words[i] == word) return i
+        return RANK_SCAN
     }
 
     /** Ranked typo corrections for [word]: closest edit distance first, and at equal distance the
@@ -271,10 +306,20 @@ object SuggestionEngine {
         // So: scan the cheap prefix first, and only if that found no single-edit fix (the thing
         // autocorrect actually applies) pay for the rest of the dictionary.
         var bestDist = maxDist + 1
-        fun scan(from: Int, to: Int) {
+        // [endsOnly] restricts the scan to words sharing this one's first or last letter. For a
+        // SINGLE edit that is lossless — one edit cannot change both ends of a word — and it is all
+        // the deep pass is looking for. It cuts that pass by more than an order of magnitude, which
+        // matters because it runs on the main thread at a word boundary.
+        fun scan(from: Int, to: Int, endsOnly: Boolean) {
+            val first = fw.first()
+            val last = fw.last()
             for (rank in from until to) {
                 val w = words[rank]
                 if (kotlin.math.abs(w.length - word.length) > maxDist) continue
+                if (endsOnly) {
+                    val fwd = fold(w)
+                    if (fwd.first() != first && fwd.last() != last) continue
+                }
                 val d = editDistanceAtMost(fw, fold(w), maxDist)
                 if (d in 1..maxDist && seen.add(fold(w))) {
                     scored.add(Triple(w, d, if (w in prefer) -2 else rank))
@@ -283,8 +328,8 @@ object SuggestionEngine {
             }
         }
         val n = minOf(scanLimit, words.size)
-        scan(0, n)
-        if (bestDist > 1 && n < words.size) scan(n, words.size)
+        scan(0, n, endsOnly = false)
+        if (bestDist > 1 && n < words.size) scan(n, words.size, endsOnly = true)
         return scored.sortedWith(compareBy({ it.second }, { it.third })).map { it.first }.take(limit)
     }
 
@@ -339,12 +384,31 @@ object SuggestionEngine {
      *  (nearest first); [strength] scores how well a key continues the word being typed (e.g.
      *  [prefixStrength] of prefix+key). Keeps [tapped] unless the alternative wins clearly on the
      *  combined spatial × language score — dead-centre taps are never second-guessed. */
-    internal fun chooseKey(tapped: Char, cands: List<Pair<Char, Float>>, strength: (Char) -> Float): Char {
+    /** How close the runner-up must be before it is even considered, and how decisively it must win
+     *  to override the key the finger actually landed on.
+     *
+     *  Both were hand-picked (0.55 / 1.3) until SpatialTuningTest swept them. Loosening helps on both
+     *  the toy and the real 8000-word dictionary (+1.3 and +3.7 points respectively) and — the part
+     *  that had to be checked before adopting it — costs nothing on words the dictionary does NOT
+     *  know: names and slang come out mangled 2.1% of the time either way, because a careful finger
+     *  lands deep inside its key and never reaches the gate at all. The curve keeps improving down to
+     *  margin 1.0, but that would mean the tap loses every tie; 1.10 keeps the finger's own choice
+     *  winning unless the language evidence is clearly against it. */
+    internal const val NEAR_GATE = 0.75f
+    internal const val WIN_MARGIN = 1.10f
+
+    internal fun chooseKey(
+        tapped: Char,
+        cands: List<Pair<Char, Float>>,
+        nearGate: Float = NEAR_GATE,
+        winMargin: Float = WIN_MARGIN,
+        strength: (Char) -> Float
+    ): Char {
         if (cands.size < 2) return tapped
         val (a, da) = cands[0]
         val (b, db) = cands[1]
         if (tapped != a && tapped != b) return tapped
-        if (db - da > 0.55f) return tapped          // comfortably inside the nearest key — unambiguous
+        if (db - da > nearGate) return tapped       // comfortably inside the nearest key — unambiguous
         // Spatial confidence falls off with distance from the key centre; the 0.15 floor keeps
         // geometry meaningful even when neither letter continues a known word.
         fun f(c: Char, d: Float) = kotlin.math.exp(-d * d * 1.8f) * (0.15f + strength(c))
@@ -352,7 +416,7 @@ object SuggestionEngine {
         val fb = f(b, db)
         val ft = if (tapped == a) fa else fb
         val fo = if (tapped == a) fb else fa
-        return if (fo > ft * 1.3f) (if (tapped == a) b else a) else tapped
+        return if (fo > ft * winMargin) (if (tapped == a) b else a) else tapped
     }
 
     /** Re-rank completions by sentence context (stable): completions that the bundled/learned
