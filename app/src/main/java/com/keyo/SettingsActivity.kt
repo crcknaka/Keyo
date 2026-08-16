@@ -593,8 +593,11 @@ class SettingsActivity : ComponentActivity() {
             "Caps Lock" to "Double-tap Shift; tap again to release.",
             "Accents & extra symbols" to "Long-press a letter and slide to the variant.",
             "Quick settings" to "Long-press the period and pick the ⚙ icon.",
-            "Switch language" to "Tap the 🌐 key (right of comma) or swipe the space bar.",
-            "Emoji · Clipboard · Phrases" to "Open them from the icons in the top bar."
+            "Switch language" to "Tap the 🌐 key (right of comma).",
+            "Delete" to "Tap backspace for one character, hold to repeat (it speeds up to whole words), or swipe left across it to clear the whole field.",
+            "Emoji · Clipboard" to "Open them from the icons in the top bar.",
+            "Compact keyboard" to "Hold the bottom-left key (123 / ABC) to shrink the keyboard to a single row: 123, Shift, space (hold to dictate), backspace and Enter. It stays on — in every app — until you hold that key again.",
+            "New line without sending" to "Tap Shift (not hold — holding arms text selection), then Enter. Note that Shift also lights up on its own at the start of a sentence; that one still sends."
         )
         SubScreen("Help & gestures", onBack) {
             Group {

@@ -303,8 +303,8 @@ object KeyboardPrefs {
     fun isInstantDictation(context: Context) = prefs(context).getBoolean(KEY_INSTANT_DICTATION, true)
     fun setInstantDictation(context: Context, v: Boolean) = prefs(context).edit().putBoolean(KEY_INSTANT_DICTATION, v).apply()
 
-    /** Mini keyboard mode is STICKY: once entered (long-press Enter) it survives field switches and
-     *  keyboard reopens until the user explicitly leaves it. */
+    /** Mini keyboard mode is STICKY: once entered (by HOLDING the bottom-left mode key, 123/ABC) it
+     *  survives field switches and keyboard reopens until the user holds that key again. */
     fun isMiniMode(context: Context) = prefs(context).getBoolean(KEY_MINI_MODE, false)
     fun setMiniMode(context: Context, v: Boolean) = prefs(context).edit().putBoolean(KEY_MINI_MODE, v).apply()
 

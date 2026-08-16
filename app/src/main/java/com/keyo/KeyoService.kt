@@ -151,6 +151,24 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         handler.postDelayed({ if (statusText.value == expected) statusText.value = "" }, delay)
     }
 
+    /** Mini mode hides the toolbar and is sticky across apps, so the only way out has to announce
+     *  itself — otherwise a user who switched by accident is stuck with a one-row keyboard
+     *  everywhere and no visible way back. Shown in the mini status line, which costs no width. */
+    private fun showMiniExitHint() {
+        val msg = "⌨ Hold 123 for the full keyboard"
+        statusText.value = msg
+        clearStatusLater(msg, 3500)
+    }
+
+    /** Show a message that CLEARS ITSELF. The status line outranks the suggestion strip and the whole
+     *  toolbar, so a message left standing hides the emoji / clipboard / settings icons — and since
+     *  it isn't reset per field, it used to follow the user into every other app. Every error must
+     *  go through here rather than assigning statusText directly. */
+    private fun showStatus(msg: String, holdMs: Long = 3000) {
+        statusText.value = msg
+        clearStatusLater(msg, holdMs)
+    }
+
     /** Say so when a transcription/answer is thrown away because the user moved to another field —
      *  silently blanking the spinner looks like dictation just failed. */
     private fun showDroppedDictation() {
@@ -337,9 +355,14 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         swipeTypingOn = KeyboardPrefs.isSwipeTyping(this)
     }
 
-    // Max content rows any mode shows — keeps the keyboard a fixed height so it never
-    // jumps when switching between abc / 123 / symbols / numpad.
-    private val maxContentRows = 4
+    // Content rows the key area reserves. Fixed within a configuration so the keyboard never jumps
+    // when switching between abc / 123 / symbols — but it drops to 3 when the number row is hidden,
+    // because otherwise that whole row stayed reserved as a DEAD BAND above the letters instead of
+    // being handed back to the app. (The 123 page drops its bonus emoji row to match; the numpad
+    // needs its four rows and only ever appears in numeric fields.)
+    @Composable
+    private fun contentRows(): Int =
+        if (showNumberRow.value || keyboardMode.value == "numpad") 4 else 3
 
     private val vibrator: android.os.Vibrator? by lazy {
         @Suppress("DEPRECATION")
@@ -491,7 +514,6 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             (it0 and (android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE or android.text.InputType.TYPE_TEXT_FLAG_IME_MULTI_LINE)) != 0
         fieldNoEnterAction.value = ((info?.imeOptions ?: 0) and
             android.view.inputmethod.EditorInfo.IME_FLAG_NO_ENTER_ACTION) != 0
-
         // Detect password / incognito fields — disable all network features there.
         val inputType = info?.inputType ?: 0
         val cls = inputType and android.text.InputType.TYPE_MASK_CLASS
@@ -529,6 +551,9 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         pendingSpaceTap = false
         plainLetterCommitted = false
         previewKey.value = null   // a key held while the field changed must not leave its preview up
+        // A message from the previous field would otherwise follow the user into this one — and while
+        // it shows, it covers the suggestion strip and every toolbar icon.
+        if (!isRecording.value && !isRecordingAI.value && !customRecording) statusText.value = ""
         handler.removeCallbacks(updateSuggestionsRunnable)   // drop any debounced compute from the old field
         suggGen++            // invalidate any pass already running for the previous field
         setSuggestions(emptyList(), null)
@@ -611,32 +636,36 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         super.onDestroy()
     }
 
-    /** Row pitch for the CURRENT orientation, in dp.
+    /** True when VERTICAL room is genuinely scarce — a phone lying on its side is only ~411dp tall,
+     *  and a portrait-height keyboard would cover ~86% of it, hiding the text being typed.
      *
-     *  Rotated, the screen is only ~411dp tall, and a portrait-height keyboard would cover ~86% of
-     *  it — the text being typed disappears behind it. Gboard shrinks its rows to about two thirds
-     *  in landscape (measured: 37.3dp row pitch there vs 56dp portrait), leaving the app roughly
-     *  40% of the screen. Whatever height the user picked is scaled by the same factor. */
+     *  Deliberately measured in height, not "is the screen wider than tall". Orientation was the
+     *  wrong proxy: an unfolded foldable is wide AND tall (~700dp), so it was getting the phone's
+     *  squeezed rows on top of very wide keys — flat, stretched keys with plenty of unused space
+     *  below them. */
+    @Composable
+    private fun shortScreen(): Boolean =
+        androidx.compose.ui.platform.LocalConfiguration.current.screenHeightDp < 480
+
+    /** Row pitch for the current screen, in dp. On a short screen Gboard shrinks its rows to about
+     *  two thirds (measured: 37.3dp pitch there vs 56dp portrait), leaving the app roughly 40% of
+     *  the screen. Whatever height the user picked is scaled by the same factor. */
     @Composable
     private fun rowHeightDp(): Int {
-        val cfg = androidx.compose.ui.platform.LocalConfiguration.current
         val h = keyHeightDp.intValue
-        return if (cfg.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE)
-            (h * 2 / 3).coerceAtLeast(28) else h
+        return if (shortScreen()) (h * 2 / 3).coerceAtLeast(28) else h
     }
 
     @Composable
     private fun rowHeight(): androidx.compose.ui.unit.Dp = rowHeightDp().dp
 
-    /** Vertical gap between keys for the current orientation. Gboard shrinks this MORE than it
-     *  shrinks the rows themselves in landscape (measured 2.45dp per side there vs 5.5dp portrait):
-     *  with short rows the gap would otherwise eat most of the key. */
+    /** Vertical gap between keys. Gboard shrinks this MORE than it shrinks the rows themselves on a
+     *  short screen (measured 2.45dp per side there vs 5.5dp portrait): with short rows the gap
+     *  would otherwise eat most of the key. */
     @Composable
     private fun gapV(): androidx.compose.ui.unit.Dp {
-        val cfg = androidx.compose.ui.platform.LocalConfiguration.current
         val g = keyVGapDp.intValue
-        return (if (cfg.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE)
-            (g / 2).coerceAtLeast(2) else g).dp
+        return (if (shortScreen()) (g / 2).coerceAtLeast(2) else g).dp
     }
 
     /** Glyph size that matches the current row height (so landscape keys don't keep portrait text). */
@@ -661,14 +690,16 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         val recordColor = Color(theme.record)
 
         val cfg = androidx.compose.ui.platform.LocalConfiguration.current
-        val landscape = cfg.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
+        val short = shortScreen()
         val keyHeight = rowHeight()
-        // Very wide displays (tablet, unfolded foldable held upright): don't stretch the keys across
-        // the whole panel — cap the key area and center it; the background still fills the width.
-        // NOT applied in landscape: measured on Gboard at 914dp wide, it spans essentially the full
-        // width there (862dp of 914), so capping it left our landscape keyboard a narrow block
-        // floating in the middle of the screen.
-        val wideScreen = cfg.screenWidthDp >= 600 && !landscape
+        // Big displays (tablet, unfolded foldable — in EITHER orientation): don't stretch the keys
+        // across the whole panel, cap the key area and center it; the background still fills the
+        // width. Without the cap a 10-column row over ~840dp gives 84dp-wide keys, which next to a
+        // normal row height is exactly the stretched look this avoids.
+        // A phone lying on its side is excluded by `!short`: it is also >600dp wide, but there
+        // Gboard genuinely does span the full width (measured 862dp of 914), and capping it left the
+        // keyboard a narrow block floating mid-screen.
+        val wideScreen = cfg.screenWidthDp >= 600 && !short
         Box(modifier = Modifier.fillMaxWidth().background(bgColor)) {
         Column(
             modifier = Modifier
@@ -678,11 +709,11 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 // the system navigation area (gesture pill / hide-keyboard & IME-switcher buttons).
                 // The background stays painted behind the bar; only the keys are lifted above it.
                 // On top of the automatic inset, a user-tunable bottom offset (Appearance →
-                // Keyboard size) raises the keys further clear of the system buttons — portrait
-                // only: in landscape vertical space is precious and the extra gap looked wasteful.
+                // Keyboard size) raises the keys further clear of the system buttons — skipped only
+                // on a SHORT screen, where every dp of height counts and the gap looked wasteful.
                 .navigationBarsPadding()
                 .padding(start = 2.dp, end = 2.dp, top = 4.dp,
-                         bottom = (4 + if (landscape) 0 else bottomOffsetDp.intValue).dp)
+                         bottom = (4 + if (short) 0 else bottomOffsetDp.intValue).dp)
         ) {
             // Dynamic top toolbar (Gboard-style). Priority: status > quick-paste chip > icons.
             // It reads statusText itself, so status changes never recompose the key grid below.
@@ -719,15 +750,20 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
 
             if (mode == "mini") {
                 // Mini keyboard: ONE row, minimum screen estate. STICKY: the mode is persisted, so
-                // the keyboard reopens in mini everywhere until explicitly left (long-press Enter —
-                // the only exit, chip shows "ABC"). 123 opens the full pad (symbols one tap further);
-                // its ABC key returns HERE while mini is on (letterMode()). The wide key is the REAL
+                // the keyboard reopens in mini everywhere until explicitly left by HOLDING the
+                // bottom-left mode key (chip shows "ABC"); a tap on it opens the full 123 pad, whose
+                // ABC key returns HERE while mini is on (letterMode()). The wide key is the REAL
                 // space bar — tap = space, hold = dictate, swipe = cursor. Enter is a NORMAL enter
                 // (newline or the field's Send/Search action); Shift+Enter forces a newline, exactly
                 // like Gboard — the Shift key also arms select-by-space-swipe as usual.
                 MiniStatusLine(accentColor)
                 Row(modifier = Modifier.fillMaxWidth()) {
-                    KeyButton("123", keyColor, textColor, Modifier.weight(0.9f), fontSize = modeKeyFont()) {
+                    ModeKey("123", keyColor, textColor, keyHeight, Modifier.weight(1.0f),
+                        miniHint = "ABC",
+                        onToggleMini = {
+                            KeyboardPrefs.setMiniMode(this@KeyoService, false)
+                            keyboardMode.value = "abc"
+                        }) {
                         keyboardMode.value = "123"   // symbols are one more tap away on the 123 page
                     }
                     val caps by isCapsLock
@@ -738,16 +774,13 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         accentColor = accentColor,
                         iconColor = if (shift || caps) Color.Black else textColor,
                         height = keyHeight,
-                        modifier = Modifier.weight(0.9f)
+                        modifier = Modifier.weight(1.0f)
                     ) { onShiftTap() }
-                    SpaceKey(Modifier.weight(2.2f), lang.uppercase(), keyColor, textColor, accentColor, recordColor)
-                    BackspaceKey(keyColor, textColor, Modifier.weight(1.1f))
-                    // Dedicated LINE-BREAK key (gray ⏎, next to the accent send-Enter): in remote
-                    // desktop Shift+Enter proved unreliable (clients drop the meta flag), two
-                    // explicit keys always work — this one never sends, the accent one always does.
-                    EnterKey("return", keyColor, textColor, keyHeight, Modifier.weight(1.0f)) {
-                        insertNewline()
-                    }
+                    SpaceKey(Modifier.weight(2.9f), lang.uppercase(), keyColor, textColor, accentColor, recordColor)
+                    BackspaceKey(keyColor, textColor, Modifier.weight(1.2f))
+                    // ONE Enter. A line break is Shift+Enter, exactly as in the full keyboard and in
+                    // Gboard — the Shift key is right there, so a second dedicated ⏎ was two keys
+                    // doing the same thing in every field that has no Send action.
                     val imeAction by imeActionId
                     val multiline by fieldMultiline
                     val noEnterAction by fieldNoEnterAction
@@ -764,12 +797,8 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                             else -> "return"
                         }
                     }
-                    EnterKey(enterKind, accentColor, Color.Black, keyHeight, Modifier.weight(1.2f),
-                        onMini = {
-                            KeyboardPrefs.setMiniMode(this@KeyoService, false)   // hold Enter = leave mini
-                            keyboardMode.value = "abc"
-                        }, miniHint = "ABC") {
-                        handleEnter(hasImeAction, imeAction)   // Shift+Enter forces a newline
+                    EnterKey(enterKind, accentColor, Color.Black, keyHeight, Modifier.weight(1.3f)) {
+                        handleEnter()   // Shift+Enter forces a newline
                     }
                 }
             } else if (mode == "emoji") {
@@ -808,8 +837,14 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                     // can shadow it.
                                     if (!ch.pressed || ch.previousPressed) continue
                                     val start = ch.position + glideOrigin
-                                    if (mode == "abc" && !secureField && !fieldNoSuggestions &&
-                                        keyAt(start) != null) pendingTapPos = start
+                                    // Recorded for ANY touch on the key grid, not only one landing
+                                    // inside a drawn key: a tap in the gap BETWEEN two keys is
+                                    // exactly the one the hit-grid offset has to rule on, and
+                                    // requiring a hit meant those points were thrown away. This
+                                    // overlay only covers the letter/number grid, so nothing else
+                                    // can leak in, and a non-letter commit clears the point again.
+                                    if (mode == "abc" && !secureField && !fieldNoSuggestions)
+                                        pendingTapPos = start
                                     // Only the FIRST new touch of an event: if two fingers land in
                                     // the same frame, the next commitChar belongs to the first one,
                                     // and letting the second overwrite the point would hand that
@@ -873,7 +908,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(keyHeight * maxContentRows),
+                    .height(keyHeight * contentRows()),
                 verticalArrangement = Arrangement.Bottom
             ) {
             when (mode) {
@@ -970,8 +1005,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                             KeyButton(s, keyColor, textColor, Modifier.weight(1f)) { commitText(s) }
                         }
                     }
-                    // Row 2 — quick emoji (smiles, hearts, animals, euro)
-                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                    // Row 2 — quick emoji (smiles, hearts, animals, euro). A bonus row, so it is the
+                    // one dropped when the number row is off and the key area is three rows tall;
+                    // the full emoji panel is still one tap away in the toolbar.
+                    if (numberRow) Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
                         listOf("😀","😂","🥰","😍","👍","❤️","🔥","🐶","🐱","€").forEach { e ->
                             KeyButton(e, keyColor, textColor, Modifier.weight(1f)) { commitText(e) }
                         }
@@ -994,9 +1031,11 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     }
                 }
                 "symbols" -> {
+                    // % ^ \ had no key ANYWHERE, while · τ ℅ each had one. Percent is everyday text,
+                    // and "℅" (care-of) is both near-unused and easily misread as percent.
                     val symRows = listOf(
-                        listOf("~","`","|","·","√","π","τ","÷","×","="),
-                        listOf("©","®","™","℅","[","]","{","}","<",">")
+                        listOf("~","`","|","^","√","π","\\","÷","×","="),
+                        listOf("©","®","™","%","[","]","{","}","<",">")
                     )
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
                         symRows[0].forEach { s ->
@@ -1111,14 +1150,28 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 // Mode / lang toggle button (bottom-left)
                 when (mode) {
                     "abc" -> {
-                        KeyButton("123", accentColor, Color.Black, Modifier.weight(1.2f), fontSize = modeKeyFont()) {
-                            keyboardMode.value = "123"
-                        }
+                        ModeKey("123", accentColor, Color.Black, keyHeight, Modifier.weight(1.2f),
+                            miniHint = "mini",
+                            onToggleMini = {
+                                KeyboardPrefs.setMiniMode(this@KeyoService, true)   // sticky until left
+                                keyboardMode.value = "mini"
+                                // Mini hides the toolbar, so without this the way back is invisible
+                                // — and the mode persists across apps until it's found.
+                                showMiniExitHint()
+                            }) { keyboardMode.value = "123" }
                     }
                     "123", "symbols", "numpad" -> {
-                        KeyButton("ABC", accentColor, Color.Black, Modifier.weight(1.2f), fontSize = modeKeyFont()) {
-                            keyboardMode.value = letterMode()
-                        }
+                        // Also a ModeKey: holding the bottom-left key must reach mini from EVERY
+                        // page, not just the letters. Number and phone fields open straight into
+                        // numpad/123, so that is exactly where a user follows the "hold 123" hint.
+                        ModeKey("ABC", accentColor, Color.Black, keyHeight, Modifier.weight(1.2f),
+                            miniHint = if (KeyboardPrefs.isMiniMode(this@KeyoService)) "ABC" else "mini",
+                            onToggleMini = {
+                                val on = !KeyboardPrefs.isMiniMode(this@KeyoService)
+                                KeyboardPrefs.setMiniMode(this@KeyoService, on)
+                                keyboardMode.value = if (on) "mini" else "abc"
+                                if (on) showMiniExitHint()
+                            }) { keyboardMode.value = letterMode() }
                     }
                 }
 
@@ -1141,9 +1194,17 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                 aiDragX = 0f
                                 aiPressed = true
                                 var longPressed = false
+                                var aiWasCancelled = false
+                                // uptimeMillis, not wall clock: this measures elapsed time and must
+                                // not be thrown off by an NTP or timezone jump.
+                                val aiPressStartMs = android.os.SystemClock.uptimeMillis()
 
+                                // 500ms, matching Android's own long-press timeout. At 400ms an
+                                // ordinary comma pressed a touch slowly started an AI recording AND
+                                // typed no comma at all — the punctuation key silently did something
+                                // else entirely.
                                 val longPressJob = serviceScope.launch {
-                                    kotlinx.coroutines.delay(400)
+                                    kotlinx.coroutines.delay(500)
                                     longPressed = true
                                     startAIRecording()
                                     performKeyFeedback()
@@ -1163,16 +1224,29 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                         }
                                         change.consume()
                                     }
-                                } catch (_: kotlinx.coroutines.CancellationException) {}
+                                } catch (_: kotlinx.coroutines.CancellationException) { aiWasCancelled = true }
 
                                 longPressJob.cancel()
                                 aiPressed = false
-                                if (longPressed) {
-                                    if (aiCancelled) cancelAIRecording() else stopAIRecording()
-                                    aiDragX = 0f
-                                } else {
-                                    performKeyFeedback()
-                                    commitChar(',')
+                                when {
+                                    // Gesture torn down mid-press (focus moved, layout swapped): stop
+                                    // the mic but type nothing into whatever field is focused now.
+                                    aiWasCancelled -> { if (longPressed) cancelAIRecording(silent = true) }
+                                    // Released almost immediately after the timer fired: the user was
+                                    // typing a comma, not dictating a task. Throw the blip of audio
+                                    // away (Whisper hallucinates a whole sentence out of a 300ms
+                                    // blip) and deliver the comma they actually pressed — silently,
+                                    // since they never knowingly started a recording to cancel.
+                                    longPressed && android.os.SystemClock.uptimeMillis() - aiPressStartMs < 900 -> {
+                                        cancelAIRecording(silent = true)
+                                        performKeyFeedback()
+                                        commitChar(',')
+                                    }
+                                    longPressed -> {
+                                        if (aiCancelled) cancelAIRecording() else stopAIRecording()
+                                        aiDragX = 0f
+                                    }
+                                    else -> { performKeyFeedback(); commitChar(',') }
                                 }
                             }
                         }
@@ -1258,17 +1332,32 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     }
                 }
 
-                EnterKey(enterKind, accentColor, Color.Black, keyHeight, Modifier.weight(1.0f),
-                    onMini = {
-                        KeyboardPrefs.setMiniMode(this@KeyoService, true)   // sticky until explicitly left
-                        keyboardMode.value = "mini"
-                    }) {
-                    handleEnter(hasImeAction, imeAction)   // Shift+Enter forces a newline (Gboard)
+                EnterKey(enterKind, accentColor, Color.Black, keyHeight, Modifier.weight(1.0f)) {
+                    handleEnter()   // Shift+Enter forces a newline (Gboard)
                 }
             }
             } // end else (normal keyboard layout)
         }
         } // end full-width background Box
+    }
+
+    @Composable
+    private fun UndoRewriteBar(textColor: Color, accentColor: Color) {
+        Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                modifier = Modifier.weight(1f).fillMaxHeight()
+                    .semantics { contentDescription = "Undo rewrite" }
+                    .clickable { performKeyFeedback(); performUndoRewrite() },
+                contentAlignment = Alignment.CenterStart
+            ) {
+                Text("↩  Undo rewrite", color = accentColor, fontSize = 13.sp,
+                    modifier = Modifier.padding(start = 8.dp))
+            }
+            Box(
+                modifier = Modifier.size(36.dp).clickable { showUndoRewrite.value = false },
+                contentAlignment = Alignment.Center
+            ) { Text("✕", color = textColor.copy(alpha = 0.6f), fontSize = 14.sp) }
+        }
     }
 
     // Dynamic top toolbar (Gboard-style): status text, a quick-paste chip, or action icons.
@@ -1292,6 +1381,11 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     status, color = accentColor, fontSize = 12.sp,
                     modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center
                 )
+                // Undo outranks suggestions: a rewrite just replaced up to 4000 characters of the
+                // user's text, and the rewritten text itself triggers a suggestion pass — so ranking
+                // suggestions first hid the undo about 30ms after it appeared, whenever the result
+                // happened to end in a letter. The one truly destructive action needs its way back.
+                undo -> UndoRewriteBar(textColor, accentColor)
                 // While typing (and the menu isn't pinned open) the row shows live suggestions.
                 sugg.isNotEmpty() && !pinned -> Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -1324,24 +1418,6 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                             .clickable { toolbarPinned.value = true },
                         contentAlignment = Alignment.Center
                     ) { Text("⋯", color = textColor.copy(alpha = 0.6f), fontSize = 18.sp) }
-                }
-                undo -> Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Box(
-                        modifier = Modifier.weight(1f).fillMaxHeight()
-                            .semantics { contentDescription = "Undo rewrite" }
-                            .clickable { performKeyFeedback(); performUndoRewrite() },
-                        contentAlignment = Alignment.CenterStart
-                    ) {
-                        Text("↩  Undo rewrite", color = accentColor, fontSize = 13.sp,
-                            modifier = Modifier.padding(start = 8.dp))
-                    }
-                    Box(
-                        modifier = Modifier.size(36.dp).clickable { showUndoRewrite.value = false },
-                        contentAlignment = Alignment.Center
-                    ) { Text("✕", color = textColor.copy(alpha = 0.6f), fontSize = 14.sp) }
                 }
                 chip && clip.isNotEmpty() -> Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -1437,7 +1513,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     ) {
         val category by emojiCategory
         val recent by recentEmoji
-        Column(modifier = Modifier.fillMaxWidth().height(keyHeight * (maxContentRows + 1))) {
+        Column(modifier = Modifier.fillMaxWidth().height(keyHeight * (contentRows() + 1))) {
             Row(
                 modifier = Modifier.fillMaxWidth().height(36.dp),
                 verticalAlignment = Alignment.CenterVertically
@@ -1496,7 +1572,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         val pins by pinnedClips
         // Pinned items first, then recent history (excluding any that are pinned).
         val combined = pins.map { it to true } + clips.filter { it !in pins }.map { it to false }
-        Column(modifier = Modifier.fillMaxWidth().height(keyHeight * (maxContentRows + 1))) {
+        Column(modifier = Modifier.fillMaxWidth().height(keyHeight * (contentRows() + 1))) {
             // Header: pin the current text (replaces "save quick phrase"), manage pins in settings,
             // and clear the unpinned history.
             Row(
@@ -1770,7 +1846,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         }
         val listState = androidx.compose.foundation.lazy.rememberLazyListState()
         LaunchedEffect(sub) { listState.scrollToItem(0) }  // always start a submenu from the top
-        Column(modifier = Modifier.fillMaxWidth().height(keyHeight * (maxContentRows + 1))) {
+        Column(modifier = Modifier.fillMaxWidth().height(keyHeight * (contentRows() + 1))) {
             androidx.compose.foundation.lazy.LazyColumn(state = listState, modifier = Modifier.fillMaxWidth().weight(1f)) {
                 if (sub.isNotEmpty()) {
                     item {
@@ -1833,42 +1909,36 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         iconColor: Color,
         height: androidx.compose.ui.unit.Dp,
         modifier: Modifier,
-        onMini: (() -> Unit)? = null,   // long-press → hint chip → toggle compact keyboard mode
-        miniHint: String = "мини",      // chip text: "мини" entering, "ABC" leaving (from the mini row)
         onClick: () -> Unit
     ) {
         var pressed by remember { mutableStateOf(false) }
-        var showMini by remember { mutableStateOf(false) }
+        // The gesture coroutine is keyed on Unit, so it keeps running across recompositions and
+        // would otherwise hold the lambda from the FIRST composition — see KeyButton for the same
+        // guard. Everything per-field must be read when the key is pressed, not when it is drawn.
+        val curOnClick by androidx.compose.runtime.rememberUpdatedState(onClick)
         Box(
             modifier = modifier
                 .height(height)
-                .semantics { contentDescription = if (onMini != null) "Enter. Hold for mini keyboard" else "Enter" }
+                .semantics { contentDescription = "Enter" }
                 .pointerInput(Unit) {
                     awaitEachGesture {
                         awaitFirstDown()
                         pressed = true
-                        var longPressed = false
-                        val job = serviceScope.launch {
-                            kotlinx.coroutines.delay(400)
-                            if (onMini != null && pressed) {
-                                longPressed = true
-                                showMini = true
-                                performKeyFeedback()
-                            }
-                        }
+                        var cancelled = false
                         try {
                             while (true) {
                                 val c = awaitPointerEvent().changes.firstOrNull() ?: break
                                 if (!c.pressed) { c.consume(); break }
                                 c.consume()
                             }
-                        } catch (_: kotlinx.coroutines.CancellationException) {}
-                        job.cancel()
+                        } catch (_: kotlinx.coroutines.CancellationException) { cancelled = true }
                         pressed = false
-                        val enterMini = showMini
-                        showMini = false
-                        if (enterMini) { performKeyFeedback(); onMini?.invoke() }
-                        else if (!longPressed) { performKeyFeedback(); onClick() }
+                        // Only on a real finger-up. The catch swallows cancellation, so without this
+                        // a key disposed mid-press — the app moves focus and the layout changes under
+                        // the finger — still fired, SENDING the message into whatever field is
+                        // focused now. Enter is the most destructive key to get this wrong on.
+                        if (cancelled) return@awaitEachGesture
+                        performKeyFeedback(); curOnClick()
                     }
                 }
                 .padding(horizontal = keyHGapDp.intValue.dp, vertical = gapV())
@@ -1876,8 +1946,74 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             contentAlignment = Alignment.Center
         ) {
             EnterGlyph(kind, iconColor, Modifier.size(22.dp))
-            // "мини" hint while holding — release to switch to the compact keyboard.
-            if (showMini) {
+        }
+    }
+
+    /** The bottom-left mode key (123 / ABC). Tap switches layer; HOLDING it toggles the compact
+     *  one-row keyboard, showing a hint chip first so the gesture announces itself before it fires.
+     *
+     *  This lives here and not on Enter on purpose: mini mode is sticky and persists across apps, so
+     *  an accidental hold used to change the keyboard everywhere — and Enter is the key you hold by
+     *  accident while sending a message. The mode key carries no such risk.
+     *  Unlike [KeyButton] the tap fires on RELEASE, so a long press can suppress it. */
+    @Composable
+    private fun ModeKey(
+        label: String,
+        bgColor: Color,
+        textColor: Color,
+        height: androidx.compose.ui.unit.Dp,
+        modifier: Modifier,
+        miniHint: String,               // chip text: "mini" entering, "ABC" leaving
+        onToggleMini: () -> Unit,
+        onClick: () -> Unit
+    ) {
+        var pressed by remember { mutableStateOf(false) }
+        var showHint by remember { mutableStateOf(false) }
+        val curOnClick by androidx.compose.runtime.rememberUpdatedState(onClick)
+        val curToggle by androidx.compose.runtime.rememberUpdatedState(onToggleMini)
+        Box(
+            modifier = modifier
+                .height(height)
+                .semantics {
+                    contentDescription =
+                        "${keyDescription(label)}. Hold to switch between the full and compact keyboard"
+                }
+                .pointerInput(Unit) {
+                    awaitEachGesture {
+                        awaitFirstDown()
+                        pressed = true
+                        val job = serviceScope.launch {
+                            kotlinx.coroutines.delay(400)
+                            if (pressed) { showHint = true; performKeyFeedback() }
+                        }
+                        var cancelled = false
+                        try {
+                            while (true) {
+                                val c = awaitPointerEvent().changes.firstOrNull() ?: break
+                                if (!c.pressed) { c.consume(); break }
+                                c.consume()
+                            }
+                        } catch (_: kotlinx.coroutines.CancellationException) { cancelled = true }
+                        job.cancel()
+                        pressed = false
+                        val toggle = showHint
+                        showHint = false
+                        // Only act on a real finger-up. The catch above swallows cancellation, so
+                        // without this a key disposed mid-press (the field switches to a numeric one
+                        // and the layout changes under the finger) would still fire — silently
+                        // overriding the layout the field asked for, or dropping the user into
+                        // sticky mini mode without them ever lifting a finger.
+                        if (cancelled) return@awaitEachGesture
+                        performKeyFeedback()
+                        if (toggle) curToggle() else curOnClick()
+                    }
+                }
+                .padding(horizontal = keyHGapDp.intValue.dp, vertical = gapV())
+                .background(if (pressed) lerp(bgColor, Color.Black, 0.22f) else bgColor, RoundedCornerShape(6.dp)),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(label, color = textColor, fontSize = modeKeyFont(), textAlign = TextAlign.Center)
+            if (showHint) {
                 androidx.compose.ui.window.Popup(
                     alignment = Alignment.TopCenter,
                     offset = with(androidx.compose.ui.platform.LocalDensity.current) {
@@ -1976,9 +2112,12 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         awaitFirstDown()
                         pressed = true
                         var longPressed = false
-                        // Hold Shift to arm text-selection mode (with a haptic cue).
+                        // Hold Shift to arm text-selection mode (with a haptic cue). 400ms like every
+                        // other hold in the keyboard: at 250ms a slightly lingering tap never
+                        // reached the tap handler, so trying to switch Shift OFF force-armed it ON
+                        // instead — the one key where a hold does the opposite of the tap.
                         val job = serviceScope.launch {
-                            kotlinx.coroutines.delay(250)
+                            kotlinx.coroutines.delay(400)
                             longPressed = true
                             armSelection()
                         }
@@ -2035,8 +2174,13 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         Box(
             modifier = modifier
                 .height(bsHeight)
-                .semantics { contentDescription = "Delete" }
+                .semantics { contentDescription = "Delete. Hold to repeat, swipe left to clear the field" }
                 .pointerInput(Unit) {
+                    // Swipe-left-to-clear wipes the WHOLE field, so it must take a deliberate drag.
+                    // This used to be 80 raw pixels — about 27dp on a normal phone, i.e. less than a
+                    // key width — on the key a thumb naturally drifts off toward the letters, with no
+                    // confirmation and no keyboard-level undo. Now a real, screen-independent swipe.
+                    val clearThreshold = 72.dp.toPx()
                     awaitEachGesture {
                         val down = awaitFirstDown()
                         isPressed = true
@@ -2073,10 +2217,11 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                     break
                                 }
                                 val dragX = change.position.x - down.position.x
-                                if (dragX < -80f) { // swipe left threshold
-                                    didSwipeClear = true
-                                    swipedClear = true
-                                }
+                                // Latches on once armed, but a drag back to the right disarms it, so
+                                // the red key is a warning the user can still back out of.
+                                val armed = dragX < -clearThreshold
+                                didSwipeClear = armed
+                                swipedClear = armed
                                 change.consume()
                             }
                         } catch (_: kotlinx.coroutines.CancellationException) {}
@@ -2408,11 +2553,20 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         curOnClick()
                         performKeyFeedback()
 
-                        // Long press timer
+                        // Long press timer. NOT in raw key-event fields (remote desktop): picking an
+                        // accent replaces the letter already committed on key-down, and that
+                        // delete-and-retype is replayed on the remote machine as a real Backspace
+                        // plus whatever key combination produces the accent — on a US Mac layout "ñ"
+                        // is literally Option+N. So an ordinary letter held a beat too long fired a
+                        // hotkey over there — the worst case, because it happens while plainly
+                        // typing. Deliberate actions can still send non-ASCII or rewrite text in
+                        // these fields (the ✨ rewrite, the emoji and symbol pages, pasting): those
+                        // are the user's explicit choice, not a slip of the thumb.
                         val longPressJob = serviceScope.launch {
                             kotlinx.coroutines.delay(400)
                             val a = pressAlts
-                            if (pressed && pressHasAlts && a != null && a.isNotEmpty() && !glideActive.value) {
+                            if (pressed && pressHasAlts && a != null && a.isNotEmpty() &&
+                                !glideActive.value && !rawKeyField()) {
                                 longPressed = true
                                 showAlts = true
                                 previewKey.value = null    // the alt row replaces the plain preview
@@ -2647,6 +2801,36 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         if (keyBounds.isEmpty()) return 1f
         var s = 0f; for (r in keyBounds.values) s += r.height
         return (s / keyBounds.size).coerceAtLeast(1f)
+    }
+
+    /** How far the letter hit-grid sits BELOW the keys as drawn, as a fraction of a key's height. */
+    private val hitBiasY = 0.15f
+
+    /** The letter a touch was aiming at, correcting for the fact that a finger lands lower than the
+     *  point it is aiming at (the contact patch sits behind the fingertip).
+     *
+     *  Measured on the same screen: Gboard's rows own **23dp above** their visual centre but **35dp
+     *  below** — its hit rectangles are deliberately offset downward from the keys it draws. Ours
+     *  were symmetric (28/28), so a tap 30dp low — well inside what Gboard forgives — fell into the
+     *  row beneath. Horizontally the two are identical (both split exactly at the midpoint), so this
+     *  is the one place the touch grids genuinely differed.
+     *
+     *  Implemented by testing the touch point shifted UP, which is the same thing as shifting every
+     *  hit rectangle down. The two axes are decided SEPARATELY — nearest row first, then nearest key
+     *  within it — so the boundary between rows is a straight line, exactly like Gboard's
+     *  rectangles. Picking the nearest key centre instead would make that boundary sag and bulge
+     *  across the row, because our rows are offset from each other by half a key. */
+    private fun biasedKey(tapped: Char, p: Offset): Char {
+        if (keyBounds.size < 2) return tapped
+        val kh = avgKeyHeight()
+        if (kh <= 1f) return tapped
+        val y = p.y - kh * hitBiasY
+        val rowY = keyBounds.values.minByOrNull { kotlin.math.abs(it.center.y - y) }?.center?.y
+            ?: return tapped
+        val best = keyBounds.entries
+            .filter { kotlin.math.abs(it.value.center.y - rowY) < kh * 0.5f }
+            .minByOrNull { kotlin.math.abs(it.value.center.x - p.x) }?.key ?: return tapped
+        return if (tapped.isUpperCase()) best.uppercaseChar() else best
     }
 
     // Physical key-adjacency map (each letter -> the keys touching it, including diagonals), used by
@@ -3038,7 +3222,12 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             // continues the current word (needs the touch point captured by the glide overlay).
             var ch = char
             pendingTapPos?.let { p ->
-                if (char.isLetter() && keyboardMode.value == "abc") ch = disambiguateTap(char, p)
+                if (char.isLetter() && keyboardMode.value == "abc") {
+                    // Geometry first (the downward hit-grid offset), then the language-aware
+                    // tie-break for taps that land near a vertical boundary between two keys.
+                    ch = biasedKey(char, p)
+                    ch = disambiguateTap(ch, p)
+                }
             }
             // NOTE: we deliberately do NOT "re-adopt" an already-committed word back into the
             // composing region here. That used to delete the word with deleteSurroundingText and
@@ -3780,41 +3969,37 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         }
     }
 
-    /** Insert a LINE BREAK, never firing the field's action. Backs the mini row's dedicated ⏎ key.
-     *  Plain fields: the normal typing path. Raw key-event fields (remote desktop): committed text
-     *  ("\n") never reaches the host and a meta flag on an Enter event gets dropped, so we simulate a
-     *  PHYSICAL Shift+Enter chord — press the Shift KEY, press/release Enter while it's held, release
-     *  Shift — which forwards as a real held modifier the remote chat app maps to "newline". */
-    private fun insertNewline() {
-        markSelfEdit()
-        if (rawKeyField()) {
-            finalizeComposing()
-            val ic = currentInputConnection ?: return
-            val meta = android.view.KeyEvent.META_SHIFT_ON or android.view.KeyEvent.META_SHIFT_LEFT_ON
-            val t = android.os.SystemClock.uptimeMillis()
-            ic.sendKeyEvent(android.view.KeyEvent(t, t, android.view.KeyEvent.ACTION_DOWN,
-                android.view.KeyEvent.KEYCODE_SHIFT_LEFT, 0, android.view.KeyEvent.META_SHIFT_LEFT_ON))
-            ic.sendKeyEvent(android.view.KeyEvent(t, t, android.view.KeyEvent.ACTION_DOWN,
-                android.view.KeyEvent.KEYCODE_ENTER, 0, meta))
-            ic.sendKeyEvent(android.view.KeyEvent(t, t, android.view.KeyEvent.ACTION_UP,
-                android.view.KeyEvent.KEYCODE_ENTER, 0, meta))
-            ic.sendKeyEvent(android.view.KeyEvent(t, t, android.view.KeyEvent.ACTION_UP,
-                android.view.KeyEvent.KEYCODE_SHIFT_LEFT, 0, 0))
-        } else {
-            commitChar('\n')
-        }
-    }
-
     // Enter behaviour shared by the main and mini layouts (Gboard semantics): a plain field gets a
     // newline; a field with an IME action fires it — UNLESS Shift is on, which forces a line break
     // instead (Shift+Enter). The forced break is sent as a real Shift+Enter key event, the combo
     // chat editors map to "new line, don't send" (a committed "\n" gets swallowed by such fields).
-    private fun handleEnter(hasImeAction: Boolean, imeAction: Int) {
+    /** True when Enter should fire the field's action (Send/Search/Go/Next) rather than break a line.
+     *  Read from live state at PRESS time, never captured when the key was drawn: the key's gesture
+     *  handler outlives recomposition, so a value baked in at composition kept applying the PREVIOUS
+     *  field's rule — in a messenger that meant Enter fired the old field's action (which usually
+     *  just closes the keyboard) instead of sending. */
+    private fun enterFiresAction(): Boolean {
+        val a = imeActionId.intValue
+        val plain = fieldMultiline.value || fieldNoEnterAction.value ||
+            keyboardMode.value == "123" || keyboardMode.value == "symbols" || keyboardMode.value == "numpad"
+        return !plain &&
+            a != android.view.inputmethod.EditorInfo.IME_ACTION_NONE &&
+            a != android.view.inputmethod.EditorInfo.IME_ACTION_UNSPECIFIED
+    }
+
+    private fun handleEnter() {
+        val hasImeAction = enterFiresAction()
+        val imeAction = imeActionId.intValue
         markSelfEdit()
         // A space tapped just before Enter commits on finger-UP; flush it first so it can't land
         // AFTER the action fired (a stray leading space in the next message).
         flushPendingSpace()
-        val shifted = isShift.value || isCapsLock.value
+        // Only a DELIBERATE Shift turns Enter into a line break. Auto-capitalize arms Shift by
+        // itself — at the start of an empty field and again after every sentence-ending "." "!" "?"
+        // — so counting it here meant Enter silently stopped sending: type "Привет." in a messenger,
+        // press Enter, and you got a newline instead of a sent message. Same rule the space-bar
+        // selection swipe already uses.
+        val shifted = (isShift.value && !shiftIsAuto) || isCapsLock.value
         when {
             // Remote desktop / terminal (raw key-event field). Two DIFFERENT channels, matching how
             // these clients treat them: a REAL Enter key event is forwarded as the Enter KEY on the
@@ -3860,7 +4045,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     }
 
     // Send a Ctrl(+Shift)+key combo (used for undo/redo). Works in editors that support it.
+    // NOT in raw key-event fields: there the combo is forwarded verbatim to the remote machine,
+    // where Ctrl+Z isn't undo anyway (a Mac wants Cmd+Z) — it just fires an arbitrary hotkey.
     private fun sendCtrlKey(keyCode: Int, withShift: Boolean = false) {
+        if (rawKeyField()) { showStatus("Undo isn't available here", 1500); return }
         val ic = currentInputConnection ?: return
         var meta = android.view.KeyEvent.META_CTRL_ON or android.view.KeyEvent.META_CTRL_LEFT_ON
         if (withShift) meta = meta or android.view.KeyEvent.META_SHIFT_ON or android.view.KeyEvent.META_SHIFT_LEFT_ON
@@ -4065,7 +4253,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             }
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
                 != PackageManager.PERMISSION_GRANTED) {
-                statusText.value = "⚠ Mic permission needed — open app settings"
+                showStatus("⚠ Mic permission needed — open app settings")
                 return
             }
 
@@ -4117,10 +4305,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 isRecording.value = true
                 statusText.value = "🎤 Recording..."
             } else {
-                statusText.value = "⚠ Failed to start recording"
+                showStatus("⚠ Failed to start recording")
             }
         } catch (e: Exception) {
-            statusText.value = "⚠ Error: ${e.message}"
+            showStatus("⚠ Error: ${e.message}")
             android.util.Log.e("Keyo", "startVoiceRecording failed", e)
         }
     }
@@ -4215,7 +4403,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                             statusText.value = ""
                                         } else showDroppedDictation()
                                     } catch (e: Exception) {
-                                        statusText.value = "⚠ ${e.message}"
+                                        showStatus("⚠ ${e.message}")
                                     }
                                 }
                             }
@@ -4228,7 +4416,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                         statusText.value = ""
                                     } else showDroppedDictation()
                                 } catch (e: Exception) {
-                                    statusText.value = "⚠ ${e.message}"
+                                    showStatus("⚠ ${e.message}")
                                 }
                             }
                         }
@@ -4244,12 +4432,12 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             } else {
                 try { currentInputConnection?.finishComposingText() } catch (_: Exception) {}
                 isRecording.value = false
-                statusText.value = "⚠ Recording too short"
+                showStatus("⚠ Recording too short")
                 clearStatusLater("⚠ Recording too short", 2000)
             }
         } catch (e: Exception) {
             isRecording.value = false
-            statusText.value = "⚠ Error: ${e.message}"
+            showStatus("⚠ Error: ${e.message}")
             android.util.Log.e("Keyo", "stopVoiceRecording failed", e)
         }
     }
@@ -4268,7 +4456,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             return
         }
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            statusText.value = "⚠ Mic permission needed"
+            showStatus("⚠ Mic permission needed")
             return
         }
         if (currentTargetText().isBlank()) {
@@ -4280,7 +4468,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             customRecording = true
             statusText.value = "🎤 Say how to change the text…"
         } else {
-            statusText.value = "⚠ Failed to start recording"
+            showStatus("⚠ Failed to start recording")
             clearStatusLater("⚠ Failed to start recording", 2000)
         }
     }
@@ -4303,7 +4491,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             }
         } else {
             // Too short to transcribe — don't leave "🎤 Say how to change the text…" hanging.
-            statusText.value = "⚠ Recording too short"
+            showStatus("⚠ Recording too short")
             clearStatusLater("⚠ Recording too short", 2000)
         }
     }
@@ -4317,27 +4505,29 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             }
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
                 != PackageManager.PERMISSION_GRANTED) {
-                statusText.value = "⚠ Mic permission needed"
+                showStatus("⚠ Mic permission needed")
                 return
             }
             if (aiAudioRecorder.start()) {
                 isRecordingAI.value = true
                 statusText.value = "🤖 Listening for task..."
             } else {
-                statusText.value = "⚠ Failed to start recording"
+                showStatus("⚠ Failed to start recording")
             }
         } catch (e: Exception) {
-            statusText.value = "⚠ Error: ${e.message}"
+            showStatus("⚠ Error: ${e.message}")
         }
     }
 
-    private fun cancelAIRecording() {
+    /** [silent] for a recording the user never knowingly started (a comma pressed a shade too long):
+     *  announcing "Cancelled" would report an action they didn't take, and cover the toolbar. */
+    private fun cancelAIRecording(silent: Boolean = false) {
         try {
             aiAudioRecorder.discard()
         } catch (_: Exception) {}
         isRecordingAI.value = false
-        statusText.value = "✕ Cancelled"
-        handler.postDelayed({ if (statusText.value == "✕ Cancelled") statusText.value = "" }, 1500)
+        if (silent) { if (statusText.value.startsWith("🤖")) statusText.value = "" }
+        else showStatus("✕ Cancelled", 1500)
     }
 
     private fun stopAIRecording() {
@@ -4373,7 +4563,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                         clearStatusLater(taskError ?: "Task failed", 3000)
                                     }
                                 } catch (e: Exception) {
-                                    statusText.value = "⚠ ${e.message}"
+                                    showStatus("⚠ ${e.message}")
                                 }
                             }
                         }
@@ -4386,12 +4576,11 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 }
             } else {
                 isRecordingAI.value = false
-                statusText.value = "⚠ Recording too short"
-                handler.postDelayed({ statusText.value = "" }, 2000)
+                showStatus("⚠ Recording too short", 2000)
             }
         } catch (e: Exception) {
             isRecordingAI.value = false
-            statusText.value = "⚠ Error: ${e.message}"
+            showStatus("⚠ Error: ${e.message}")
         }
     }
 }
