@@ -177,6 +177,27 @@ class FieldTestActivity : Activity() {
         root.addView(searchLog)
         root.addView(search)
 
+        // The platform SearchView — what the Play Store's search box is built on. It brings its own
+        // AutoCompleteTextView, its own InputConnection handling and a suggestions dropdown, so it
+        // exercises a different path from a plain EditText.
+        val svLog = android.widget.TextView(this).apply {
+            text = "SearchView — nothing typed yet"; textSize = 12f
+        }
+        val sv = android.widget.SearchView(this).apply {
+            id = 1007
+            isIconified = false
+            queryHint = "SearchView (like Play Store)"
+            setOnQueryTextListener(object : android.widget.SearchView.OnQueryTextListener {
+                override fun onQueryTextSubmit(q: String?) = true
+                override fun onQueryTextChange(q: String?): Boolean {
+                    svLog.text = "SearchView — query \"$q\""
+                    return true
+                }
+            })
+        }
+        root.addView(svLog)
+        root.addView(sv)
+
         // Remote-desktop stand-in: shows exactly what the keyboard sends down the wire.
         val rawLog = android.widget.TextView(this).apply {
             text = "RAW (TYPE_NULL, like remote desktop) — tap it, then type"

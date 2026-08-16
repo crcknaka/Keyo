@@ -9,6 +9,10 @@
          caller of ACTION_SET_ALARM / ACTION_SET_TIMER. -->
     <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
 
+    <!-- Keyo is installed by hand, not from a store, so it offers its own updates from the
+         project's GitHub releases. The system still shows its own install confirmation. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
     <!-- Package visibility for the "open <app>" voice command. A targeted <queries> filter replaces
          QUERY_ALL_PACKAGES, which is a restricted permission a keyboard has no case for. -->
     <queries>
@@ -65,6 +69,18 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Hands the downloaded APK to the system installer. A file:// URI is rejected outright on
+             modern Android, so the update has to be shared through a content:// URI. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.updates"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
 
     </application>
 </manifest>

@@ -612,10 +612,91 @@ class SettingsActivity : ComponentActivity() {
         }
     }
 
+    /** Checks GitHub for a newer release and, if the user wants it, downloads and installs it.
+     *  Keyo is side-loaded, so without this there is nothing to tell anyone an update exists. */
+    @Composable
+    private fun UpdateGroup() {
+        var state by remember { mutableStateOf("idle") }   // idle | checking | found | none | downloading | error
+        var release by remember { mutableStateOf<UpdateChecker.Release?>(null) }
+        var progress by remember { mutableIntStateOf(-1) }
+        var message by remember { mutableStateOf("") }
+
+        Group {
+            Column(Modifier.padding(16.dp)) {
+                Text("Updates", fontSize = 15.sp, fontWeight = FontWeight.Medium, color = textPrimary)
+                Spacer(Modifier.height(4.dp))
+                val sub = when (state) {
+                    "checking" -> "Checking…"
+                    "none" -> "You're on the latest version (${BuildConfig.VERSION_NAME})"
+                    "found" -> "Version ${release?.version} is available — you have ${BuildConfig.VERSION_NAME}"
+                    "downloading" -> if (progress >= 0) "Downloading… $progress%" else "Downloading…"
+                    "error" -> message
+                    else -> "Installed: ${BuildConfig.VERSION_NAME}"
+                }
+                Text(sub, fontSize = 13.sp, color = if (state == "error") Color(0xFFE57373) else textMuted)
+                Spacer(Modifier.height(12.dp))
+
+                if (state == "found") {
+                    PrimaryButton("Download and install") {
+                        val r = release ?: return@PrimaryButton
+                        state = "downloading"; progress = -1
+                        val dest = java.io.File(cacheDir, "updates/Keyo-${r.version}.apk")
+                        UpdateChecker.download(r.apkUrl, dest, onProgress = { p ->
+                            runOnUiThread { progress = p }
+                        }) { file, err ->
+                            runOnUiThread {
+                                if (file == null) { state = "error"; message = err ?: "Download failed" }
+                                else installApk(file) { e -> state = "error"; message = e }
+                            }
+                        }
+                    }
+                } else if (state != "checking" && state != "downloading") {
+                    PrimaryButton("Check for updates") {
+                        state = "checking"
+                        UpdateChecker.check(BuildConfig.VERSION_NAME) { r, err ->
+                            runOnUiThread {
+                                when {
+                                    err != null -> { state = "error"; message = err }
+                                    r == null -> state = "none"
+                                    else -> { release = r; state = "found" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /** Hand the downloaded APK to the system installer (which asks the user to confirm). */
+    private fun installApk(file: java.io.File, onError: (String) -> Unit) {
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O &&
+                !packageManager.canRequestPackageInstalls()) {
+                // One-time permission, granted on a system screen; come back and press again.
+                startActivity(android.content.Intent(
+                    android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                    android.net.Uri.parse("package:$packageName")))
+                onError("Allow Keyo to install apps, then press Download again")
+                return
+            }
+            val uri = androidx.core.content.FileProvider.getUriForFile(
+                this, "$packageName.updates", file)
+            startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, "application/vnd.android.package-archive")
+                addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                         android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            })
+        } catch (e: Exception) {
+            onError(e.message ?: "Couldn't start the installer")
+        }
+    }
+
     @Composable
     private fun AboutScreen(onBack: () -> Unit) {
         var diag by remember { mutableStateOf(KeyboardPrefs.isFieldDiagnostics(this@SettingsActivity)) }
         SubScreen("About", onBack) {
+            UpdateGroup()
             Group {
                 Column(Modifier.padding(16.dp)) {
                     Text("Keyo", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = textPrimary)

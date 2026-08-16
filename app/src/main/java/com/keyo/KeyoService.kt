@@ -541,18 +541,11 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         shiftIsAuto = false
         showUndoRewrite.value = false
         composing.clear()   // fresh field: never carry a composing word across inputs
-        // Clear any composing span left in the EDITOR, not just our own buffer. On a rotation the
-        // activity is recreated and restores its text together with the spans it was saved with, so
-        // a word that was mid-composing when the screen turned comes back still marked as composing
-        // — owned by an input session that no longer exists. Harmless to call when there is nothing
-        // to finish, and it costs one IPC per field.
-        try { currentInputConnection?.finishComposingText() } catch (_: Exception) {}
-        // Drain any batch edit a previous session left open. A chat screen that handles rotation
-        // itself (WhatsApp does) keeps the SAME text view across the turn, so an unbalanced depth
-        // survives with it — and an editor inside an open batch suspends its caret blink while
-        // still accepting text, which is exactly "it types but the cursor is invisible until I tap".
-        // endBatchEdit on a balanced editor does nothing, so draining costs nothing when it's fine.
-        try { repeat(4) { currentInputConnection?.endBatchEdit() } } catch (_: Exception) {}
+        // NOTE: two extra InputConnection calls used to run here on every field start — a
+        // finishComposingText() and a drain of stray batch edits. Both were guesses at the missing
+        // caret, neither fixed it, and both poked every app's editor on every focus change. Removed:
+        // typing stopped working entirely in the Play Store around the builds that added this kind
+        // of thing, and an unproven call has no business on the path every app goes through.
         recentTaps.clear()
         pendingTapPos = null
         autocorrectUndo = null
