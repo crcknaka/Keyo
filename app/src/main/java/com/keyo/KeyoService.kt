@@ -362,7 +362,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     // needs its four rows and only ever appears in numeric fields.)
     @Composable
     private fun contentRows(): Int =
-        if (showNumberRow.value || keyboardMode.value == "numpad") 4 else 3
+        if (numberRowShown() || keyboardMode.value == "numpad") 4 else 3
 
     private val vibrator: android.os.Vibrator? by lazy {
         @Suppress("DEPRECATION")
@@ -551,6 +551,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         pendingSpaceTap = false
         plainLetterCommitted = false
         previewKey.value = null   // a key held while the field changed must not leave its preview up
+        lastSelStart = -1; lastSelEnd = -1   // caret position belongs to the field we just left
         // A message from the previous field would otherwise follow the user into this one — and while
         // it shows, it covers the suggestion strip and every toolbar icon.
         if (!isRecording.value && !isRecordingAI.value && !customRecording) statusText.value = ""
@@ -647,13 +648,21 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private fun shortScreen(): Boolean =
         androidx.compose.ui.platform.LocalConfiguration.current.screenHeightDp < 480
 
-    /** Row pitch for the current screen, in dp. On a short screen Gboard shrinks its rows to about
-     *  two thirds (measured: 37.3dp pitch there vs 56dp portrait), leaving the app roughly 40% of
-     *  the screen. Whatever height the user picked is scaled by the same factor. */
+    /** The number row is hidden on a short screen even when the user has it on. Gboard doesn't show
+     *  one in landscape either, and the reason is visible the moment you rotate: five rows squeezed
+     *  into ~411dp leaves keys far wider than they are tall — the stretched look. Dropping it gives
+     *  the letters that height back. The digits stay reachable, since hiding the row is exactly what
+     *  turns on the long-press digit hints along the top letter row. */
+    @Composable
+    private fun numberRowShown(): Boolean = showNumberRow.value && !shortScreen()
+
+    /** Row pitch for the current screen, in dp. On a short screen the rows shrink to three quarters,
+     *  which together with dropping the number row keeps the key shape close to Gboard's landscape
+     *  proportions (measured there: ~85dp wide x ~41dp tall) instead of long flat slabs. */
     @Composable
     private fun rowHeightDp(): Int {
         val h = keyHeightDp.intValue
-        return if (shortScreen()) (h * 2 / 3).coerceAtLeast(28) else h
+        return if (shortScreen()) (h * 3 / 4).coerceAtLeast(28) else h
     }
 
     @Composable
@@ -678,7 +687,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         val lang by currentLang
         val shift by isShift
         val mode by keyboardMode
-        val numberRow by showNumberRow
+        val numberRow = numberRowShown()
 
         // Read the theme reactively so changing it in settings applies on the next keyboard open
         val theme = KeyboardPrefs.THEMES.find { it.id == themeId.value } ?: KeyboardPrefs.THEMES[0]
@@ -2508,7 +2517,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         var keyCenterX by remember { mutableFloatStateOf(0f) }
         var keyRect by remember { mutableStateOf(Rect.Zero) }
         // Long-press digit when the number row is hidden; it becomes the primary alternate.
-        val digitHint = if (!showNumberRow.value) topRowDigits[label.lowercase()] else null
+        val digitHint = if (!numberRowShown()) topRowDigits[label.lowercase()] else null
         val alts = if (digitHint != null) listOf(digitHint) + (altChars[label] ?: emptyList())
                    else altChars[label]
         val hasAlts = alts != null && alts.isNotEmpty()
@@ -3725,6 +3734,11 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         candidatesStart: Int, candidatesEnd: Int
     ) {
         super.onUpdateSelection(oldSelStart, oldSelEnd, newSelStart, newSelEnd, candidatesStart, candidatesEnd)
+        // Remember where the caret is. The framework reports this for every field, including the
+        // ones that refuse getExtractedText — which is what lets the cursor swipe move the caret
+        // by selection there instead of by DPAD key events (see moveCursor).
+        lastSelStart = newSelStart
+        lastSelEnd = newSelEnd
         if (composing.isNotEmpty()) {
             // Our own setComposingText(...,1) always leaves the caret collapsed exactly at the end of
             // the composing span, so that state means "this update came from our own keystroke".
@@ -4065,6 +4079,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     // reset when a new cursor swipe begins so each swipe selects like a fresh shift+arrow run.
     private var cursorSelAnchor: Int? = null
 
+    // Caret position as last reported by the editor (-1 = never reported). Reset per field.
+    private var lastSelStart = -1
+    private var lastSelEnd = -1
+
     /** Move the text cursor one position left/right (space-bar swipe). Operates directly on the
      *  editor's selection instead of sending DPAD key events: at the field's edge DPAD makes apps
      *  move the FOCUS to neighbouring UI elements (buttons, links, other fields) — the swipe must
@@ -4079,7 +4097,34 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         } catch (_: Exception) { null }
         val text = et?.text
         if (text == null || et.selectionStart < 0 || et.selectionEnd < 0) {
-            // Rare: the editor won't report its text — old key-event path (clamping impossible).
+            // The editor won't expose its text (WebViews and a lot of custom fields don't).
+            //
+            // Never step past the edge here. A DPAD event at the end of the text makes the app move
+            // FOCUS to the next view — the field loses the caret and typing goes nowhere, which
+            // looks exactly like "the cursor vanished". One character of context is enough to know
+            // whether there is anywhere to go, and every editor answers that.
+            val room = if (left) ic.getTextBeforeCursor(1, 0) else ic.getTextAfterCursor(1, 0)
+            if (room.isNullOrEmpty()) return
+            // Prefer the caret position the framework reported to us: setSelection keeps the caret
+            // inside the field no matter what, while DPAD is the thing that can escape it.
+            val s = lastSelStart
+            val e = lastSelEnd
+            if (s >= 0 && e >= 0) {
+                if (!select) {
+                    cursorSelAnchor = null
+                    val pos = if (s != e) (if (left) s else e)
+                              else (s + if (left) -1 else 1).coerceAtLeast(0)
+                    ic.setSelection(pos, pos)
+                } else {
+                    val anchor = cursorSelAnchor ?: (if (s != e) (if (left) e else s) else s)
+                        .also { cursorSelAnchor = it }
+                    val moving = if (anchor == s) e else s
+                    val m = (moving + if (left) -1 else 1).coerceAtLeast(0)
+                    ic.setSelection(minOf(anchor, m), maxOf(anchor, m))
+                }
+                return
+            }
+            // Only if we have never been told where the caret is: the old key-event path.
             val code = if (left) android.view.KeyEvent.KEYCODE_DPAD_LEFT else android.view.KeyEvent.KEYCODE_DPAD_RIGHT
             val meta = if (select) android.view.KeyEvent.META_SHIFT_ON or android.view.KeyEvent.META_SHIFT_LEFT_ON else 0
             ic.sendKeyEvent(android.view.KeyEvent(0, 0, android.view.KeyEvent.ACTION_DOWN, code, 0, meta))
