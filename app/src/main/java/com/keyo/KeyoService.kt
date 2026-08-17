@@ -4422,6 +4422,43 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         "ru" -> "ru-RU"; "lv" -> "lv-LV"; else -> "en-US"
     }
 
+    /** ISO-639-1 code for Whisper, i.e. the language dictation should transcribe AS. The on-device
+     *  recognizer has always been told the language (it cannot work without one); the cloud path was
+     *  left to guess from the audio, which is why it sometimes answered in Chinese. */
+    private fun whisperLangOf(lang: String) = when (lang) {
+        "ru" -> "ru"; "lv" -> "lv"; else -> "en"
+    }
+
+    /** Languages dictation may produce: the ones the user has enabled for typing. Someone who has
+     *  turned a language on is someone who might speak it, and anything else — the Chinese and
+     *  Spanish that dictated Russian used to come back as — is refused by [GroqApi.transcribe].
+     *  No separate setting: a second language list would only ever be a copy of this one that
+     *  drifts out of date. */
+    private fun dictationLangs(): List<String> =
+        enabledLangs.value.map { whisperLangOf(it) }.distinct()
+            .ifEmpty { listOf(whisperLangOf(currentLang.value)) }
+
+    /**
+     * A few of the user's own Latin-script words, to keep them in Latin script inside non-Latin
+     * speech: dictating Russian around "GitHub" or "Docker" otherwise tends to come back
+     * transliterated ("Гитхаб"). Taken from what they have actually typed, so the bias is towards
+     * their vocabulary rather than a guess at what a person might say.
+     *
+     * Deliberately a bare word list and deliberately short — Whisper treats this as preceding text
+     * and can echo it back when the audio holds no speech, so there must be little to echo. Null on
+     * a Latin keyboard, where there is nothing to protect.
+     */
+    private fun dictationVocabulary(): String? {
+        if (currentLang.value !in setOf("ru")) return null
+        val latin = UserDictionary.unigrams().asSequence()
+            .filter { (w, _) -> w.length in 3..20 && w.any { it in 'a'..'z' || it in 'A'..'Z' } }
+            .sortedByDescending { it.value }
+            .map { it.key }
+            .take(12)
+            .toList()
+        return if (latin.size < 2) null else latin.joinToString(", ")
+    }
+
     private fun startVoiceRecording() {
         try {
             if (secureField) {
@@ -4530,7 +4567,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 statusText.value = "⏳ Transcribing..."
                 val token = fieldToken()
 
-                GroqApi.transcribe(audioFile) { text, error ->
+                GroqApi.transcribe(audioFile, dictationLangs(), whisperLangOf(currentLang.value), dictationVocabulary()) { text, error ->
                     audioFile.delete()   // don't leave the recorded speech sitting in the cache
                     if (text != null) {
                         val cleanup = KeyboardPrefs.isAutocorrectEnabled(this@KeyoService)
@@ -4658,7 +4695,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         val f = File(cacheDir, "rewrite_voice.wav")
         if (rewriteRecorder.stop(f)) {
             statusText.value = "⏳ Transcribing…"
-            GroqApi.transcribe(f) { instr, err ->
+            GroqApi.transcribe(f, dictationLangs(), whisperLangOf(currentLang.value), dictationVocabulary()) { instr, err ->
                 f.delete()
                 handler.post {
                     if (!instr.isNullOrBlank()) runRewrite(instr.trim())
@@ -4720,7 +4757,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 statusText.value = "🤖 Transcribing task..."
                 val token = fieldToken()
 
-                GroqApi.transcribe(audioFile) { text, error ->
+                GroqApi.transcribe(audioFile, dictationLangs(), whisperLangOf(currentLang.value), dictationVocabulary()) { text, error ->
                     audioFile.delete()
                     if (text != null) {
                         handler.post { statusText.value = "🤖 Executing: $text" }

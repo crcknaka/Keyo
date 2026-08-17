@@ -81,13 +81,95 @@ object GroqApi {
         })
     }
 
-    fun transcribe(audioFile: File, callback: (String?, String?) -> Unit) {
+    /**
+     * Transcribe [audioFile].
+     *
+     * [allowed] is the set of ISO-639-1 codes dictation may produce, and [fallback] is the one to
+     * use when the model's own answer is not in that set. Two very different modes come out of it:
+     *
+     *  - exactly one allowed language -> it is imposed outright. Cheapest and most reliable, and the
+     *    right choice for someone who only ever dictates in one language.
+     *  - several -> the model detects the language and we check its answer. Speaking either language
+     *    without touching the keyboard works, while a detection outside the list — the failure that
+     *    turned dictated Russian into Chinese or Spanish — is refused and the clip re-sent with
+     *    [fallback] imposed. That second round-trip only ever happens on a clip that was going to
+     *    come back wrong anyway.
+     *
+     * An empty [allowed] set means "impose [fallback]", i.e. follow the keyboard language.
+     *
+     * [vocabulary] biases spelling without constraining content: a handful of words the user
+     * actually types, so their own Latin-script terms ("GitHub", "Docker") survive inside Russian
+     * speech instead of being transliterated. Whisper can echo this text back when it hears nothing,
+     * so it stays a short word list rather than a sentence.
+     *
+     * temperature=0 throughout: the sampling fallback is what turns a bad second of audio into a
+     * fluently invented sentence rather than nothing.
+     */
+    fun transcribe(
+        audioFile: File,
+        allowed: List<String> = emptyList(),
+        fallback: String? = null,
+        vocabulary: String? = null,
+        callback: (String?, String?) -> Unit
+    ) {
+        val detect = allowed.size > 1
+        val forced = if (detect) null else (allowed.firstOrNull() ?: fallback)
+        // The vocabulary is withheld while the model is choosing the language. Whisper reads the
+        // prompt as preceding text, so a list of Latin-script words is evidence for a Latin-script
+        // language — it could push Russian speech into being detected as English, which is a worse
+        // failure than the transliteration it was meant to prevent. Once a language is settled
+        // (imposed here, or imposed on the retry below) the prompt can only affect spelling.
+        post(audioFile, forced, if (detect) null else vocabulary, verbose = detect) { text, lang, err ->
+            when {
+                err != null -> callback(null, err)
+                // The model answered in a language the user never dictates in — that is the bug this
+                // whole path exists for. Ask again, this time not leaving it a choice.
+                detect && lang != null && lang !in allowed -> {
+                    val second = fallback?.takeIf { it in allowed } ?: allowed.first()
+                    post(audioFile, second, vocabulary, verbose = false) { t2, _, e2 ->
+                        callback(t2, e2)
+                    }
+                }
+                else -> callback(text, null)
+            }
+        }
+    }
+
+    /** verbose_json reports the detected language as an English NAME ("russian"), not the ISO code
+     *  the request takes — so the allow-list check has to normalise it, or nothing would ever match
+     *  and every dictation would pay a second round-trip. Only the languages Keyo supports need a
+     *  mapping; anything else stays as-is and is therefore correctly rejected. Already-short values
+     *  are passed through in case the API ever returns codes directly. */
+    private fun langCode(raw: String?): String? {
+        val v = raw?.trim()?.lowercase()?.ifBlank { null } ?: return null
+        return when (v) {
+            "russian" -> "ru"
+            "english" -> "en"
+            "latvian" -> "lv"
+            else -> v          // an unsupported language, or already a code — either way, not ours
+        }
+    }
+
+    /** One transcription request. [onDone] gets (text, detectedLanguage, error) — the language is
+     *  only present when [verbose] asked the API for it. */
+    private fun post(
+        audioFile: File,
+        language: String?,
+        vocabulary: String?,
+        verbose: Boolean,
+        onDone: (String?, String?, String?) -> Unit
+    ) {
         val body = MultipartBody.Builder()
             .setType(MultipartBody.FORM)
             .addFormDataPart("file", audioFile.name,
                 audioFile.asRequestBody("audio/wav".toMediaType()))
             .addFormDataPart("model", "whisper-large-v3")
-            .addFormDataPart("response_format", "json")
+            .addFormDataPart("response_format", if (verbose) "verbose_json" else "json")
+            .addFormDataPart("temperature", "0")
+            .apply {
+                if (!language.isNullOrBlank()) addFormDataPart("language", language)
+                if (!vocabulary.isNullOrBlank()) addFormDataPart("prompt", vocabulary)
+            }
             .build()
 
         val request = Request.Builder()
@@ -98,19 +180,19 @@ object GroqApi {
 
         client.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
-                callback(null, "Network error: ${e.message}")
+                onDone(null, null, "Network error: ${e.message}")
             }
             override fun onResponse(call: Call, response: Response) {
                 val responseBody = response.body?.string()
                 if (response.isSuccessful && responseBody != null) {
                     try {
-                        val text = JSONObject(responseBody).getString("text")
-                        callback(text, null)
+                        val obj = JSONObject(responseBody)
+                        onDone(obj.getString("text"), langCode(obj.optString("language")), null)
                     } catch (e: Exception) {
-                        callback(null, "Parse error: ${e.message}")
+                        onDone(null, null, "Parse error: ${e.message}")
                     }
                 } else {
-                    callback(null, friendlyError(response.code, responseBody))
+                    onDone(null, null, friendlyError(response.code, responseBody))
                 }
             }
         })

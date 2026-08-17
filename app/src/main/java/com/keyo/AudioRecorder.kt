@@ -20,6 +20,14 @@ class AudioRecorder {
     // PCM is collected on a background thread while recording, then written as a WAV file.
     private var pcmData = ByteArrayOutputStream()
 
+    private companion object {
+        /** Shortest clip worth sending: 0.25s of 16kHz 16-bit mono. A brush against the mic button
+         *  used to be uploaded like any other recording, and a fraction of a second of room noise is
+         *  exactly what makes a speech model invent a sentence — in whatever language it guessed.
+         *  Short real words ("да", "ok") run past this comfortably. */
+        const val MIN_BYTES = 16000 * 2 / 4
+    }
+
     fun start(): Boolean {
         val bufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
         if (bufferSize <= 0) return false
@@ -72,9 +80,11 @@ class AudioRecorder {
         }
     }
 
+    /** Writes the captured audio as a WAV. False when there is nothing worth transcribing — the
+     *  caller shows "Recording too short" and skips the upload. */
     fun stop(outputFile: File): Boolean {
         val pcmBytes = stopAndDrain() ?: return false
-        if (pcmBytes.isEmpty()) return false
+        if (pcmBytes.size < MIN_BYTES) return false
         return try { writeWav(outputFile, pcmBytes); true } catch (e: Exception) { false }
     }
 
