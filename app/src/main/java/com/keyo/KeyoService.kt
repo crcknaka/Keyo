@@ -84,10 +84,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private var statusText = mutableStateOf("")
     private var isShift = mutableStateOf(false)
     private var keyboardMode = mutableStateOf("abc") // "abc", "123", "symbols", "numpad"
-    private var imeActionId = mutableIntStateOf(android.view.inputmethod.EditorInfo.IME_ACTION_NONE)
-    // Multi-line fields (and fields that ask for no enter action) get a real newline Enter, like Gboard.
-    private var fieldMultiline = mutableStateOf(false)
-    private var fieldNoEnterAction = mutableStateOf(false)
+    // The focused field's raw imeOptions. Stored whole rather than pre-digested into separate flags:
+    // the Enter key's meaning is one decision made from all of them together ([EnterBehavior]), and
+    // splitting it up is how the label and the behaviour drifted apart in the first place.
+    private var fieldImeOptions = mutableIntStateOf(0)
     private var showNumberRow = mutableStateOf(true)
     // Visual sizing (tunable live via the Settings sliders)
     private var keyHeightDp = mutableIntStateOf(KeyboardPrefs.DEFAULT_KEY_HEIGHT)
@@ -509,15 +509,9 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         // Load user preferences
         reloadPrefs()
         currentLang.value = KeyboardPrefs.getCurrentLanguage(this)
-        // Store IME action for enter key behavior
-        imeActionId.intValue = info?.imeOptions?.and(android.view.inputmethod.EditorInfo.IME_MASK_ACTION)
-            ?: android.view.inputmethod.EditorInfo.IME_ACTION_NONE
-        // Multi-line text fields should insert a newline on Enter (Gboard behavior), not fire an action.
-        val it0 = info?.inputType ?: 0
-        fieldMultiline.value = (it0 and android.text.InputType.TYPE_MASK_CLASS) == android.text.InputType.TYPE_CLASS_TEXT &&
-            (it0 and (android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE or android.text.InputType.TYPE_TEXT_FLAG_IME_MULTI_LINE)) != 0
-        fieldNoEnterAction.value = ((info?.imeOptions ?: 0) and
-            android.view.inputmethod.EditorInfo.IME_FLAG_NO_ENTER_ACTION) != 0
+        // Everything the Enter key needs, kept raw — the action, the opt-out flag and anything else
+        // the field declared. [EnterBehavior] is the single place that interprets it.
+        fieldImeOptions.intValue = info?.imeOptions ?: 0
         // Detect password / incognito fields — disable all network features there.
         val inputType = info?.inputType ?: 0
         val cls = inputType and android.text.InputType.TYPE_MASK_CLASS
@@ -831,22 +825,8 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     // ONE Enter. A line break is Shift+Enter, exactly as in the full keyboard and in
                     // Gboard — the Shift key is right there, so a second dedicated ⏎ was two keys
                     // doing the same thing in every field that has no Send action.
-                    val imeAction by imeActionId
-                    val multiline by fieldMultiline
-                    val noEnterAction by fieldNoEnterAction
-                    val hasImeAction = !(multiline || noEnterAction) &&
-                            imeAction != android.view.inputmethod.EditorInfo.IME_ACTION_NONE &&
-                            imeAction != android.view.inputmethod.EditorInfo.IME_ACTION_UNSPECIFIED
-                    val enterKind = when {
-                        !hasImeAction -> "return"
-                        else -> when (imeAction) {
-                            android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH -> "search"
-                            android.view.inputmethod.EditorInfo.IME_ACTION_SEND -> "send"
-                            android.view.inputmethod.EditorInfo.IME_ACTION_GO -> "send"
-                            android.view.inputmethod.EditorInfo.IME_ACTION_NEXT -> "next"
-                            else -> "return"
-                        }
-                    }
+                    val imeOptions by fieldImeOptions
+                    val enterKind = EnterBehavior.labelKind(imeOptions, symbolMode = false)
                     EnterKey(enterKind, accentColor, Color.Black, keyHeight, Modifier.weight(1.3f)) {
                         handleEnter()   // Shift+Enter forces a newline
                     }
@@ -1359,28 +1339,9 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
 
                 // Enter / Submit — Gboard-style: a real Enter (newline) by default, an action
                 // icon only when the field explicitly asks for one (search/send/go/next).
-                val imeAction by imeActionId
-                val multiline by fieldMultiline
-                val noEnterAction by fieldNoEnterAction
+                val imeOptions by fieldImeOptions
                 val isTextMode = mode == "123" || mode == "symbols" || mode == "numpad"
-                // Treat the key as a plain newline Enter in text/symbol modes, multi-line fields,
-                // or when the field opts out of the enter action.
-                val plainEnter = isTextMode || multiline || noEnterAction
-                val hasImeAction = !plainEnter &&
-                        imeAction != android.view.inputmethod.EditorInfo.IME_ACTION_NONE &&
-                        imeAction != android.view.inputmethod.EditorInfo.IME_ACTION_UNSPECIFIED
-
-                val enterKind = when {
-                    !hasImeAction -> "return"
-                    else -> when (imeAction) {
-                        android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH -> "search"
-                        android.view.inputmethod.EditorInfo.IME_ACTION_SEND -> "send"
-                        android.view.inputmethod.EditorInfo.IME_ACTION_GO -> "send"
-                        android.view.inputmethod.EditorInfo.IME_ACTION_NEXT -> "next"
-                        // IME_ACTION_DONE and anything else fall back to the familiar Enter arrow.
-                        else -> "return"
-                    }
-                }
+                val enterKind = EnterBehavior.labelKind(imeOptions, symbolMode = isTextMode)
 
                 EnterKey(enterKind, accentColor, Color.Black, keyHeight, Modifier.weight(1.0f)) {
                     handleEnter()   // Shift+Enter forces a newline (Gboard)
@@ -4046,18 +4007,17 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
      *  handler outlives recomposition, so a value baked in at composition kept applying the PREVIOUS
      *  field's rule — in a messenger that meant Enter fired the old field's action (which usually
      *  just closes the keyboard) instead of sending. */
-    private fun enterFiresAction(): Boolean {
-        val a = imeActionId.intValue
-        val plain = fieldMultiline.value || fieldNoEnterAction.value ||
-            keyboardMode.value == "123" || keyboardMode.value == "symbols" || keyboardMode.value == "numpad"
-        return !plain &&
-            a != android.view.inputmethod.EditorInfo.IME_ACTION_NONE &&
-            a != android.view.inputmethod.EditorInfo.IME_ACTION_UNSPECIFIED
+    private fun symbolMode(): Boolean = keyboardMode.value.let {
+        // The mini row is a letter layout, so Enter keeps the field's action there.
+        it == "123" || it == "symbols" || it == "numpad"
     }
+
+    private fun enterFiresAction(): Boolean =
+        EnterBehavior.firesAction(fieldImeOptions.intValue, symbolMode())
 
     private fun handleEnter() {
         val hasImeAction = enterFiresAction()
-        val imeAction = imeActionId.intValue
+        val imeAction = EnterBehavior.actionOf(fieldImeOptions.intValue, symbolMode())
         markSelfEdit()
         // A space tapped just before Enter commits on finger-UP; flush it first so it can't land
         // AFTER the action fired (a stray leading space in the next message).
@@ -4211,8 +4171,18 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             else -> "at $lastSelStart"
         }
         val etTxt = if (et == null) "ET:null" else "ET:${et.selectionStart},${et.selectionEnd}"
+        // What the field asked of the Enter key, and what we decided. Enter doing the wrong thing in
+        // one particular app is not reproducible from here, so the two numbers that settle it — the
+        // field's own imeOptions and whether it calls itself multi-line — have to be readable on the
+        // phone: "declares Search but we type a newline" and "declares nothing" need opposite fixes.
+        val it0 = fieldInputType
+        val multi = (it0 and android.text.InputType.TYPE_MASK_CLASS) == android.text.InputType.TYPE_CLASS_TEXT &&
+            (it0 and (android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                android.text.InputType.TYPE_TEXT_FLAG_IME_MULTI_LINE)) != 0
+        val enter = "ent:${EnterBehavior.labelKind(fieldImeOptions.intValue, symbolMode())}" +
+            " opt:0x${Integer.toHexString(fieldImeOptions.intValue)}${if (multi) " multi" else ""}"
         debugFieldInfo.value =
-            "$tag $pkg caret:$caret $etTxt comp:${composing.length} " +
+            "$tag $pkg caret:$caret $etTxt comp:${composing.length} $enter " +
             "starts:$dbgStarts upd:$dbgUpdates anch:$dbgAnchors $dbgAnchorInfo"
     }
 
