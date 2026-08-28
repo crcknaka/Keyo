@@ -46,6 +46,8 @@ class SettingsActivity : ComponentActivity() {
     private val resumeTick = mutableStateOf(0)
     // Deep-link target (e.g. "phrases") so we can open straight to that screen.
     private val deepLink = mutableStateOf<String?>(null)
+    // Newer release found by the launch check: drives the home banner and pre-fills About.
+    private val pendingUpdate = mutableStateOf<UpdateChecker.Release?>(null)
 
     private val requestPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -95,6 +97,32 @@ class SettingsActivity : ComponentActivity() {
         try { startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url))) } catch (_: Exception) {}
     }
 
+    // ---- Update check on launch ----
+
+    /** How long a check that found nothing keeps us off the network. */
+    private val updateRecheckMs = 6L * 60 * 60 * 1000
+
+    /**
+     * Asks GitHub for a newer release as soon as the app opens, so a side-loaded build announces
+     * itself instead of waiting for someone to go digging in About.
+     *
+     * The throttle deliberately covers only the quiet answers: a check that found nothing is not
+     * repeated for [updateRecheckMs], but once a release is out every launch checks again (one
+     * request) so the banner keeps offering it until it is installed or dismissed. A failed check
+     * stamps nothing either, so being offline at launch just means trying again next time.
+     */
+    private fun checkForUpdateOnLaunch() {
+        val now = System.currentTimeMillis()
+        if (now - KeyboardPrefs.getLastUpdateCheck(this) < updateRecheckMs) return
+        UpdateChecker.check(BuildConfig.VERSION_NAME) { release, err ->
+            if (err != null) return@check
+            val offer = release != null &&
+                release.version != KeyboardPrefs.getDismissedUpdate(this@SettingsActivity)
+            if (!offer) KeyboardPrefs.setLastUpdateCheck(this@SettingsActivity, now)
+            else runOnUiThread { pendingUpdate.value = release }
+        }
+    }
+
     // ---- Linear / Vercel inspired palette: strict, mostly monochrome, single accent ----
     private val bg = Color(0xFF0B0B0E)
     private val groupBg = Color(0xFF141417)
@@ -121,6 +149,8 @@ class SettingsActivity : ComponentActivity() {
             }
             if (deepLink.value != null) deepLink.value = null
         }
+        // Once per process: the state lives on the activity, so it survives configuration changes.
+        LaunchedEffect(Unit) { if (pendingUpdate.value == null) checkForUpdateOnLaunch() }
         Surface(modifier = Modifier.fillMaxSize(), color = bg) {
             // targetSdk 35 enforces edge-to-edge: keep content clear of the status/navigation bars
             // and the on-screen keyboard (e.g. while typing the API key) — the Surface still paints
@@ -174,6 +204,13 @@ class SettingsActivity : ComponentActivity() {
             Spacer(Modifier.height(12.dp))
 
             SetupBanner(done, 3) { onOpen("setup") }
+            pendingUpdate.value?.let { r ->
+                Spacer(Modifier.height(8.dp))
+                UpdateBanner(r, onOpen = { onOpen("about") }, onDismiss = {
+                    KeyboardPrefs.setDismissedUpdate(this@SettingsActivity, r.version)
+                    pendingUpdate.value = null
+                })
+            }
             Spacer(Modifier.height(8.dp))
 
             Group {
@@ -617,8 +654,12 @@ class SettingsActivity : ComponentActivity() {
      *  Keyo is side-loaded, so without this there is nothing to tell anyone an update exists. */
     @Composable
     private fun UpdateGroup() {
-        var state by remember { mutableStateOf("idle") }   // idle | checking | found | none | downloading | error
-        var release by remember { mutableStateOf<UpdateChecker.Release?>(null) }
+        // Seeded from the launch check so arriving via the home banner lands straight on the
+        // install button rather than making the user check for the same release twice.
+        val found = pendingUpdate.value
+        // idle | checking | found | none | downloading | error
+        var state by remember { mutableStateOf(if (found != null) "found" else "idle") }
+        var release by remember { mutableStateOf(found) }
         var progress by remember { mutableIntStateOf(-1) }
         var message by remember { mutableStateOf("") }
 
@@ -893,6 +934,34 @@ class SettingsActivity : ComponentActivity() {
             Spacer(Modifier.width(12.dp))
             if (complete) Text("✓", color = accent, fontSize = 18.sp, fontWeight = FontWeight.Bold)
             else Text("›", color = textPrimary, fontSize = 20.sp)
+        }
+    }
+
+    /** Home-screen offer for a release the launch check found. Tapping opens About, where the
+     *  update card is already sitting on "Download and install"; "Later" hides this version. */
+    @Composable
+    private fun UpdateBanner(
+        release: UpdateChecker.Release,
+        onOpen: () -> Unit,
+        onDismiss: () -> Unit
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth()
+                .background(accentSoft, RoundedCornerShape(14.dp))
+                .border(1.dp, accent.copy(alpha = 0.45f), RoundedCornerShape(14.dp))
+                .clickable { onOpen() }
+                .padding(start = 16.dp, top = 14.dp, bottom = 14.dp, end = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("Update available", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = textPrimary)
+                Text("Version ${release.version} — you have ${BuildConfig.VERSION_NAME}",
+                    fontSize = 12.sp, color = textPrimary.copy(alpha = 0.85f))
+            }
+            Text("Later", fontSize = 13.sp, color = textMuted,
+                modifier = Modifier.clip(RoundedCornerShape(8.dp)).clickable { onDismiss() }
+                    .padding(horizontal = 10.dp, vertical = 6.dp))
+            Text("›", color = textPrimary, fontSize = 20.sp, modifier = Modifier.padding(end = 8.dp))
         }
     }
 

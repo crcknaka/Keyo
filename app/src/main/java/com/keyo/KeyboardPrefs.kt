@@ -32,6 +32,8 @@ object KeyboardPrefs {
     private const val KEY_INSTANT_DICTATION = "instant_dictation"
     private const val KEY_FIELD_DIAG = "field_diagnostics"
     private const val KEY_MINI_MODE = "mini_mode"
+    private const val KEY_UPDATE_CHECKED = "update_last_check"
+    private const val KEY_UPDATE_DISMISSED = "update_dismissed"
 
     // Defaults / ranges for the visual size editor. The three size defaults are MEASURED off Gboard
     // on a 411dp-wide screen, because the row pitch is the vertical touch target and ours used to be
@@ -314,6 +316,18 @@ object KeyboardPrefs {
      *  survives field switches and keyboard reopens until the user holds that key again. */
     fun isMiniMode(context: Context) = prefs(context).getBoolean(KEY_MINI_MODE, false)
     fun setMiniMode(context: Context, v: Boolean) = prefs(context).edit().putBoolean(KEY_MINI_MODE, v).apply()
+
+    /** When the launch update check last came back with nothing to offer (epoch ms). Only quiet
+     *  results are stamped: once a release is out, every launch re-checks so the banner reappears. */
+    fun getLastUpdateCheck(context: Context) = prefs(context).getLong(KEY_UPDATE_CHECKED, 0L)
+    fun setLastUpdateCheck(context: Context, at: Long) =
+        prefs(context).edit().putLong(KEY_UPDATE_CHECKED, at).apply()
+
+    /** Version the user waved away with "Later" — hidden until a newer one appears. */
+    fun getDismissedUpdate(context: Context): String =
+        prefs(context).getString(KEY_UPDATE_DISMISSED, "") ?: ""
+    fun setDismissedUpdate(context: Context, version: String) =
+        prefs(context).edit().putString(KEY_UPDATE_DISMISSED, version).apply()
 
     private fun saveClips(context: Context, list: List<String>) {
         val arr = JSONArray()
