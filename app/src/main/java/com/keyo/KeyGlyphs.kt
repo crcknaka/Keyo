@@ -1,14 +1,21 @@
 package com.keyo
 
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.graphics.Color
 
 // ---- Hand-drawn vector key & toolbar icons ----
 // One cohesive monochrome line style, no emoji. These are pure drawing functions: they take only a
 // color/modifier (and a small variant flag) and render onto a Canvas, with no dependency on the
 // keyboard's state — so they live here as top-level composables instead of inside KeyoService.
+//
+// The glyphs that need a Path build it in drawWithCache: no key has its own layer, so any key
+// press re-records the whole keyboard's drawing, and a Path is a native object with a cleaner —
+// nine of them were allocated per key-down and again per key-up. Cached, they are rebuilt only
+// when the size (or colour) changes.
 
 @Composable
 internal fun MicGlyph(color: Color, modifier: Modifier) {
@@ -41,7 +48,7 @@ internal fun MicGlyph(color: Color, modifier: Modifier) {
 // Modern "AI" sparkle (4-point star), filled.
 @Composable
 internal fun SparkleGlyph(color: Color, modifier: Modifier) {
-    Canvas(modifier) {
+    Spacer(modifier.drawWithCache {
         val cx = size.width / 2f; val cy = size.height / 2f
         val rOut = size.minDimension / 2f * 0.96f
         val rIn = rOut * 0.34f
@@ -58,8 +65,8 @@ internal fun SparkleGlyph(color: Color, modifier: Modifier) {
             path.lineTo(ix, iy)
         }
         path.close()
-        drawPath(path, color)
-    }
+        onDrawBehind { drawPath(path, color) }
+    })
 }
 
 // ---- Toolbar vector icons (same monochrome line style) ----
@@ -98,7 +105,7 @@ internal fun ClipboardGlyph(color: Color, modifier: Modifier) {
 
 @Composable
 internal fun GearGlyph(color: Color, modifier: Modifier) {
-    Canvas(modifier) {
+    Spacer(modifier.drawWithCache {
         val cx = size.width / 2f; val cy = size.height / 2f
         val r = size.minDimension / 2f
         val sw = r * 0.13f
@@ -124,11 +131,15 @@ internal fun GearGlyph(color: Color, modifier: Modifier) {
             }
         }
         path.close()
-        drawPath(path, color, style = androidx.compose.ui.graphics.drawscope.Stroke(
-            width = sw, join = androidx.compose.ui.graphics.StrokeJoin.Round))
-        drawCircle(color, radius = r * 0.30f, center = androidx.compose.ui.geometry.Offset(cx, cy),
-            style = androidx.compose.ui.graphics.drawscope.Stroke(width = sw))
-    }
+        val outline = androidx.compose.ui.graphics.drawscope.Stroke(
+            width = sw, join = androidx.compose.ui.graphics.StrokeJoin.Round)
+        val hub = androidx.compose.ui.graphics.drawscope.Stroke(width = sw)
+        val centre = androidx.compose.ui.geometry.Offset(cx, cy)
+        onDrawBehind {
+            drawPath(path, color, style = outline)
+            drawCircle(color, radius = r * 0.30f, center = centre, style = hub)
+        }
+    })
 }
 
 @Composable
@@ -149,7 +160,7 @@ internal fun SelectAllGlyph(color: Color, modifier: Modifier) {
 // Circular undo/redo arrow (≈300° arc + a solid triangular arrowhead). mirror=true → redo.
 @Composable
 internal fun CurvedArrowGlyph(color: Color, mirror: Boolean, modifier: Modifier) {
-    Canvas(modifier) {
+    Spacer(modifier.drawWithCache {
         val w = size.width; val h = size.height
         val cx = w / 2f; val cy = h / 2f
         val r = size.minDimension / 2f * 0.56f
@@ -157,10 +168,9 @@ internal fun CurvedArrowGlyph(color: Color, mirror: Boolean, modifier: Modifier)
         fun rad(d: Double) = Math.toRadians(d)
         val startDeg = if (!mirror) 70.0 else 110.0
         val sweepDeg = if (!mirror) -300.0 else 300.0
-        drawArc(color, startDeg.toFloat(), sweepDeg.toFloat(), false,
-            topLeft = androidx.compose.ui.geometry.Offset(cx - r, cy - r),
-            size = androidx.compose.ui.geometry.Size(2 * r, 2 * r),
-            style = androidx.compose.ui.graphics.drawscope.Stroke(width = sw, cap = androidx.compose.ui.graphics.StrokeCap.Round))
+        val arcTopLeft = androidx.compose.ui.geometry.Offset(cx - r, cy - r)
+        val arcSize = androidx.compose.ui.geometry.Size(2 * r, 2 * r)
+        val arcStroke = androidx.compose.ui.graphics.drawscope.Stroke(width = sw, cap = androidx.compose.ui.graphics.StrokeCap.Round)
         // Solid triangular arrowhead at the arc's end, aligned with the tangent
         val endDeg = startDeg + sweepDeg
         val ex = cx + (r * kotlin.math.cos(rad(endDeg))).toFloat()
@@ -179,13 +189,17 @@ internal fun CurvedArrowGlyph(color: Color, mirror: Boolean, modifier: Modifier)
             lineTo(bx - px, by - py)
             close()
         }
-        drawPath(tri, color)
-    }
+        onDrawBehind {
+            drawArc(color, startDeg.toFloat(), sweepDeg.toFloat(), false,
+                topLeft = arcTopLeft, size = arcSize, style = arcStroke)
+            drawPath(tri, color)
+        }
+    })
 }
 
 @Composable
 internal fun BackspaceGlyph(color: Color, modifier: Modifier) {
-    Canvas(modifier) {
+    Spacer(modifier.drawWithCache {
         val w = size.width; val h = size.height
         val sw = h * 0.085f
         val stroke = androidx.compose.ui.graphics.drawscope.Stroke(
@@ -200,16 +214,19 @@ internal fun BackspaceGlyph(color: Color, modifier: Modifier) {
             lineTo(w * 0.33f, h * 0.77f)
             close()
         }
-        drawPath(body, color, style = stroke)
-        drawLine(color, o(0.50f, 0.40f), o(0.74f, 0.60f), sw, androidx.compose.ui.graphics.StrokeCap.Round)
-        drawLine(color, o(0.74f, 0.40f), o(0.50f, 0.60f), sw, androidx.compose.ui.graphics.StrokeCap.Round)
-    }
+        val x1 = o(0.50f, 0.40f); val x2 = o(0.74f, 0.60f); val x3 = o(0.74f, 0.40f); val x4 = o(0.50f, 0.60f)
+        onDrawBehind {
+            drawPath(body, color, style = stroke)
+            drawLine(color, x1, x2, sw, androidx.compose.ui.graphics.StrokeCap.Round)
+            drawLine(color, x3, x4, sw, androidx.compose.ui.graphics.StrokeCap.Round)
+        }
+    })
 }
 
 // Enter / action glyph. kind: "return" | "search" | "send" | "next"
 @Composable
 internal fun EnterGlyph(kind: String, color: Color, modifier: Modifier) {
-    Canvas(modifier) {
+    Spacer(modifier.drawWithCache {
         val w = size.width; val h = size.height
         val sw = h * 0.10f
         val cap = androidx.compose.ui.graphics.StrokeCap.Round
@@ -219,26 +236,29 @@ internal fun EnterGlyph(kind: String, color: Color, modifier: Modifier) {
         fun o(x: Float, y: Float) = androidx.compose.ui.geometry.Offset(x * w, y * h)
         when (kind) {
             "search" -> {
-                drawCircle(color, radius = w * 0.22f, center = o(0.44f, 0.44f), style = stroke)
-                drawLine(color, o(0.60f, 0.60f), o(0.80f, 0.80f), sw, cap)
+                val c = o(0.44f, 0.44f); val a = o(0.60f, 0.60f); val b = o(0.80f, 0.80f)
+                onDrawBehind {
+                    drawCircle(color, radius = w * 0.22f, center = c, style = stroke)
+                    drawLine(color, a, b, sw, cap)
+                }
             }
             "send", "next" -> {
-                drawLine(color, o(0.20f, 0.5f), o(0.78f, 0.5f), sw, cap)
+                val a = o(0.20f, 0.5f); val b = o(0.78f, 0.5f)
                 val p = androidx.compose.ui.graphics.Path().apply {
                     moveTo(w * 0.60f, h * 0.32f); lineTo(w * 0.80f, h * 0.5f); lineTo(w * 0.60f, h * 0.68f)
                 }
-                drawPath(p, color, style = stroke)
+                onDrawBehind {
+                    drawLine(color, a, b, sw, cap)
+                    drawPath(p, color, style = stroke)
+                }
             }
             else -> { // return arrow ⏎
                 val p = androidx.compose.ui.graphics.Path().apply {
                     moveTo(w * 0.78f, h * 0.28f); lineTo(w * 0.78f, h * 0.58f); lineTo(w * 0.28f, h * 0.58f)
-                }
-                drawPath(p, color, style = stroke)
-                val head = androidx.compose.ui.graphics.Path().apply {
                     moveTo(w * 0.42f, h * 0.46f); lineTo(w * 0.28f, h * 0.58f); lineTo(w * 0.42f, h * 0.70f)
                 }
-                drawPath(head, color, style = stroke)
+                onDrawBehind { drawPath(p, color, style = stroke) }
             }
         }
-    }
+    })
 }

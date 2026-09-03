@@ -41,6 +41,8 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.graphics.graphicsLayer
+import kotlin.math.roundToInt
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
@@ -264,7 +266,11 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private var suggestions = mutableStateOf<List<String>>(emptyList())
     private var primarySuggestion = mutableStateOf<String?>(null)
     private var toolbarPinned = mutableStateOf(false)
-    private val saveUserDict = Runnable { UserDictionary.save(this) }
+    // The save builds a JSON document of up to 4000 words and 30000 pairs; that is I/O-thread
+    // work, and it used to run on the main handler exactly when the user paused and resumed typing.
+    private val saveUserDict = Runnable {
+        serviceScope.launch(kotlinx.coroutines.Dispatchers.IO) { UserDictionary.save(this@KeyoService) }
+    }
     // Suggestions are debounced: the heavy dictionary work runs ~one frame after the last keystroke,
     // not on every keypress. Coalesces the commitChar + onUpdateSelection double-call and fast bursts.
     private val updateSuggestionsRunnable = Runnable { runUpdateSuggestions() }
@@ -372,6 +378,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         @Suppress("DEPRECATION")
         getSystemService(android.content.Context.VIBRATOR_SERVICE) as? android.os.Vibrator
     }
+    // hasVibrator()/hasAmplitudeControl() are binder round-trips; the answer never changes.
+    private val vibratorUsable by lazy { vibrator?.hasVibrator() == true }
+    private val vibratorAmplitude by lazy { vibrator?.hasAmplitudeControl() == true }
+    private val audioManager by lazy { getSystemService(android.content.Context.AUDIO_SERVICE) as? android.media.AudioManager }
 
     override fun onCreate() {
         super.onCreate()
@@ -621,6 +631,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         handler.removeCallbacks(updateSuggestionsRunnable)
         suggGen++            // no suggestion pass from this field may publish into the next one
         setSuggestions(emptyList(), null)
+        // Flush what this field taught before the process can be killed: the trailing 4s debounce
+        // is never reached by someone who types until they leave, and nothing else saved here.
+        handler.removeCallbacks(saveUserDict)
+        saveUserDict.run()
     }
 
     override fun onEvaluateFullscreenMode(): Boolean {
@@ -931,7 +945,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                 }
                                 if (glide && !aborted) commitGlide(points)
                                 glideActive.value = false
-                                glideTrail.clear()
+                                if (glideTrail.isNotEmpty()) glideTrail.clear()   // a snapshot write, skip it when nothing is drawn
                                 glidePreview.value = null
                                 glidePreviewAt = 0
                             }
@@ -958,13 +972,11 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     // ъ is deliberately NOT a key: Gboard's ЙЦУКЕН is 11 wide and reaches ъ through
                     // a long-press of ь. Giving it its own key makes all 12 columns narrower, which
                     // costs more accuracy than the long-press costs convenience.
-                    val ruRows = listOf("йцукенгшщзх", "фывапролджэ", "ячсмитьбю")
-                    val enRows = listOf("qwertyuiop", "asdfghjkl", "zxcvbnm")
                     val cyrillic = lang == "ru"
-                    val rows = if (cyrillic) ruRows else enRows
+                    val rows = if (cyrillic) RU_ROWS else EN_ROWS
                     // Leftover units on each side of a row: an indent on a letter row, the width of
                     // Shift/Backspace on the last one.
-                    val sides = if (cyrillic) listOf(0f, 0f, 1.3f) else listOf(0f, 0.5f, 1.5f)
+                    val sides = if (cyrillic) RU_SIDES else EN_SIDES
 
                     BoxWithConstraints(Modifier.fillMaxWidth()) {
                         val rowWidth = maxWidth
@@ -1142,26 +1154,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             // window, and creating + destroying one on every keystroke (5-8 per second) is a
             // needless source of jank right on the typing path. Nothing between here and the
             // keyboard root clips, so it can overhang the toolbar above the top row.
-            previewKey.value?.let { (glyph, rect) ->
-                val density = androidx.compose.ui.platform.LocalDensity.current
-                with(density) {
-                    val x = (rect.center.x - glideOrigin.x).toDp() - 24.dp
-                    // Clamped to the space that actually exists above the key grid (the 40dp toolbar
-                    // plus the root's 4dp padding). For a key in the TOP row the unclamped -52dp
-                    // would push the preview past the keyboard window, which clips it — the very
-                    // thing the old Popup was there to avoid.
-                    val y = maxOf((rect.top - glideOrigin.y).toDp() - 52.dp, (-44).dp)
-                    Box(
-                        modifier = Modifier.offset(x = x, y = y).size(48.dp)
-                            .background(Color(currentTheme.text), RoundedCornerShape(8.dp)),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(glyph, color = Color(currentTheme.bg), fontSize = 28.sp,
-                            fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
-                            textAlign = TextAlign.Center)
-                    }
-                }
-            }
+            KeyPreviewOverlay(Color(currentTheme.text), Color(currentTheme.bg))
             // Live glide preview — the current best guess floats above the keys while swiping.
             if (glideActive.value) glidePreview.value?.let { guess ->
                 Box(
@@ -1209,110 +1202,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 }
 
                 // Comma — long press starts AI assistant (🤖)
-                val recordingAI by isRecordingAI
-                var aiCancelled by remember { mutableStateOf(false) }
-                var aiDragX by remember { mutableFloatStateOf(0f) }
-                var aiPressed by remember { mutableStateOf(false) }
-                val cancelThreshold = 100f
-
-                Box(
-                    modifier = Modifier
-                        .weight(0.9f)
-                        .height(keyHeight)
-                        .semantics { contentDescription = "AI assistant. Long press and speak a task" }
-                        .pointerInput(Unit) {
-                            awaitEachGesture {
-                                val down = awaitFirstDown()
-                                aiCancelled = false
-                                aiDragX = 0f
-                                aiPressed = true
-                                var longPressed = false
-                                var aiWasCancelled = false
-                                // The comma lands NOW, on finger-down, exactly like a letter. It
-                                // used to wait for finger-up, and with fast typing the next key's
-                                // down arrives first: "hi" comma-down space-down comma-up gave
-                                // "hi ,how", and a rolled-over letter got glued to the word before
-                                // the comma and autocorrected as one. A long press takes it back.
-                                performKeyFeedback()
-                                commitChar(',')
-                                // uptimeMillis, not wall clock: this measures elapsed time and must
-                                // not be thrown off by an NTP or timezone jump.
-                                val aiPressStartMs = android.os.SystemClock.uptimeMillis()
-
-                                // 500ms, matching Android's own long-press timeout. At 400ms an
-                                // ordinary comma pressed a touch slowly started an AI recording AND
-                                // typed no comma at all — the punctuation key silently did something
-                                // else entirely.
-                                val longPressJob = serviceScope.launch {
-                                    kotlinx.coroutines.delay(500)
-                                    longPressed = true
-                                    retractComma()
-                                    startAIRecording()
-                                    performKeyFeedback()
-                                }
-
-                                try {
-                                    while (true) {
-                                        val event = awaitPointerEvent()
-                                        val change = event.changes.firstOrNull() ?: break
-                                        if (!change.pressed) {
-                                            change.consume()
-                                            break
-                                        }
-                                        if (longPressed) {
-                                            aiDragX = change.position.x - down.position.x
-                                            if (aiDragX < -cancelThreshold) aiCancelled = true
-                                        }
-                                        change.consume()
-                                    }
-                                } catch (_: kotlinx.coroutines.CancellationException) { aiWasCancelled = true }
-
-                                longPressJob.cancel()
-                                aiPressed = false
-                                when {
-                                    // Gesture torn down mid-press (focus moved, layout swapped): stop
-                                    // the mic but type nothing into whatever field is focused now.
-                                    aiWasCancelled -> { if (longPressed) cancelAIRecording(silent = true) }
-                                    // Released almost immediately after the timer fired: the user was
-                                    // typing a comma, not dictating a task. Throw the blip of audio
-                                    // away (Whisper hallucinates a whole sentence out of a 300ms
-                                    // blip) and deliver the comma they actually pressed — silently,
-                                    // since they never knowingly started a recording to cancel.
-                                    longPressed && android.os.SystemClock.uptimeMillis() - aiPressStartMs < 900 -> {
-                                        cancelAIRecording(silent = true)
-                                        commitChar(',')   // put back what the long press retracted
-                                    }
-                                    longPressed -> {
-                                        if (aiCancelled) cancelAIRecording() else stopAIRecording()
-                                        aiDragX = 0f
-                                    }
-                                    else -> {}   // the comma was typed on finger-down
-                                }
-                            }
-                        }
-                        .padding(horizontal = keyHGapDp.intValue.dp, vertical = gapV())
-                        .background(
-                            when {
-                                recordingAI && aiDragX < -cancelThreshold -> Color(0xFF666666)
-                                recordingAI -> Color(0xFF50FA7B)
-                                aiPressed -> lerp(keyColor, Color.Black, 0.22f)
-                                else -> keyColor
-                            },
-                            RoundedCornerShape(6.dp)
-                        ),
-                    contentAlignment = Alignment.Center
-                ) {
-                    when {
-                        recordingAI && aiDragX < -cancelThreshold ->
-                            Text("✕", fontSize = 16.sp, color = Color.Black)
-                        recordingAI ->
-                            SparkleGlyph(Color.Black, Modifier.size(20.dp))
-                        else -> {
-                            Text(",", fontSize = 18.sp, color = textColor)
-                            SparkleGlyph(textColor, Modifier.align(Alignment.TopEnd).padding(2.dp).size(13.dp))
-                        }
-                    }
-                }
+                CommaAiKey(keyColor, textColor, keyHeight, Modifier.weight(0.9f))
 
                 // Right of the comma: globe = switch language (abc); mode hint otherwise
                 when (mode) {
@@ -2688,9 +2578,14 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         // The DRAWN key is what the user aims at, so that is the rect reported for
                         // the spatial model and used to place the press preview — not the touch
                         // cell, which includes the gaps and any edge inset.
-                        keyRect = it.boundsInWindow()
-                        keyCenterX = keyRect.center.x
-                        onBounds?.invoke(keyRect)
+                        // Only on an actual change: this callback runs for every key on any
+                        // layout pass of the grid, and the bounds almost never differ from last time.
+                        val b = it.boundsInWindow()
+                        if (b != keyRect) {
+                            keyRect = b
+                            keyCenterX = b.center.x
+                            onBounds?.invoke(b)
+                        }
                     }
                     .background(if (pressed) lerp(bgColor, Color.Black, 0.22f) else bgColor, RoundedCornerShape(6.dp)),
                 contentAlignment = Alignment.Center
@@ -2814,6 +2709,160 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private var autocorrectUndo: AutocorrectUndo? = null
     private val revertedWords = HashSet<String>()
 
+    /**
+     * The comma key that doubles as the AI button on a long press. Its own composable for the same
+     * reason as [KeyPreviewOverlay]: it holds per-press state (pressed, drag offset, cancel flag)
+     * and reads [isRecordingAI], and inlined in the keyboard root every one of those changes — a
+     * comma press and release, every frame of a cancel drag — recomposed the whole keyboard.
+     */
+    @Composable
+    private fun CommaAiKey(keyColor: Color, textColor: Color, keyHeight: androidx.compose.ui.unit.Dp, modifier: Modifier) {
+        val recordingAI by isRecordingAI
+        var aiCancelled by remember { mutableStateOf(false) }
+        var aiDragX by remember { mutableFloatStateOf(0f) }
+        var aiPressed by remember { mutableStateOf(false) }
+        val cancelThreshold = 100f
+
+        Box(
+            modifier = modifier
+                .height(keyHeight)
+                .semantics { contentDescription = "AI assistant. Long press and speak a task" }
+                .pointerInput(Unit) {
+                    awaitEachGesture {
+                        val down = awaitFirstDown()
+                        aiCancelled = false
+                        aiDragX = 0f
+                        aiPressed = true
+                        var longPressed = false
+                        var aiWasCancelled = false
+                        // The comma lands NOW, on finger-down, exactly like a letter. It
+                        // used to wait for finger-up, and with fast typing the next key's
+                        // down arrives first: "hi" comma-down space-down comma-up gave
+                        // "hi ,how", and a rolled-over letter got glued to the word before
+                        // the comma and autocorrected as one. A long press takes it back.
+                        performKeyFeedback()
+                        commitChar(',')
+                        // uptimeMillis, not wall clock: this measures elapsed time and must
+                        // not be thrown off by an NTP or timezone jump.
+                        val aiPressStartMs = android.os.SystemClock.uptimeMillis()
+
+                        // 500ms, matching Android's own long-press timeout. At 400ms an
+                        // ordinary comma pressed a touch slowly started an AI recording AND
+                        // typed no comma at all — the punctuation key silently did something
+                        // else entirely.
+                        val longPressJob = serviceScope.launch {
+                            kotlinx.coroutines.delay(500)
+                            longPressed = true
+                            retractComma()
+                            startAIRecording()
+                            performKeyFeedback()
+                        }
+
+                        try {
+                            while (true) {
+                                val event = awaitPointerEvent()
+                                val change = event.changes.firstOrNull() ?: break
+                                if (!change.pressed) {
+                                    change.consume()
+                                    break
+                                }
+                                if (longPressed) {
+                                    aiDragX = change.position.x - down.position.x
+                                    if (aiDragX < -cancelThreshold) aiCancelled = true
+                                }
+                                change.consume()
+                            }
+                        } catch (_: kotlinx.coroutines.CancellationException) { aiWasCancelled = true }
+
+                        longPressJob.cancel()
+                        aiPressed = false
+                        when {
+                            // Gesture torn down mid-press (focus moved, layout swapped): stop
+                            // the mic but type nothing into whatever field is focused now.
+                            aiWasCancelled -> { if (longPressed) cancelAIRecording(silent = true) }
+                            // Released almost immediately after the timer fired: the user was
+                            // typing a comma, not dictating a task. Throw the blip of audio
+                            // away (Whisper hallucinates a whole sentence out of a 300ms
+                            // blip) and deliver the comma they actually pressed — silently,
+                            // since they never knowingly started a recording to cancel.
+                            longPressed && android.os.SystemClock.uptimeMillis() - aiPressStartMs < 900 -> {
+                                cancelAIRecording(silent = true)
+                                commitChar(',')   // put back what the long press retracted
+                            }
+                            longPressed -> {
+                                if (aiCancelled) cancelAIRecording() else stopAIRecording()
+                                aiDragX = 0f
+                            }
+                            else -> {}   // the comma was typed on finger-down
+                        }
+                    }
+                }
+                .padding(horizontal = keyHGapDp.intValue.dp, vertical = gapV())
+                .background(
+                    when {
+                        recordingAI && aiDragX < -cancelThreshold -> Color(0xFF666666)
+                        recordingAI -> Color(0xFF50FA7B)
+                        aiPressed -> lerp(keyColor, Color.Black, 0.22f)
+                        else -> keyColor
+                    },
+                    RoundedCornerShape(6.dp)
+                ),
+            contentAlignment = Alignment.Center
+        ) {
+            when {
+                recordingAI && aiDragX < -cancelThreshold ->
+                    Text("✕", fontSize = 16.sp, color = Color.Black)
+                recordingAI ->
+                    SparkleGlyph(Color.Black, Modifier.size(20.dp))
+                else -> {
+                    Text(",", fontSize = 18.sp, color = textColor)
+                    SparkleGlyph(textColor, Modifier.align(Alignment.TopEnd).padding(2.dp).size(13.dp))
+                }
+            }
+        }
+    }
+
+    /**
+     * The enlarged glyph above the pressed key. Three things about how it is built are deliberate,
+     * and each one was a measurable cost on every keystroke before:
+     *  - it reads [previewKey] ITSELF, in its own recompose scope. Read in the keyboard root, every
+     *    key-down and key-up recomposed the entire keyboard — 45 keys parameter-compared twice per
+     *    letter — for a 48dp box that only it cares about;
+     *  - it is always in the tree, hidden through alpha, rather than inserted and removed. A node
+     *    appearing under the key grid re-laid out the grid, and that re-fired onGloballyPositioned
+     *    on all 45 keys (a coordinator walk and a Rect each) twice per keystroke;
+     *  - it moves through the placement-time [offset] lambda, so a new position is a placement, not
+     *    a measure — nothing above it is touched.
+     */
+    @Composable
+    private fun KeyPreviewOverlay(bg: Color, fg: Color) {
+        val preview by previewKey
+        val density = androidx.compose.ui.platform.LocalDensity.current
+        Box(
+            modifier = Modifier
+                .offset {
+                    val rect = preview?.second ?: return@offset androidx.compose.ui.unit.IntOffset.Zero
+                    with(density) {
+                        // Clamped to the space that actually exists above the key grid (the 40dp
+                        // toolbar plus the root's 4dp padding). For a key in the TOP row the
+                        // unclamped -52dp would push the preview past the keyboard window, which
+                        // clips it — the very thing the old Popup was there to avoid.
+                        val x = rect.center.x - glideOrigin.x - 24.dp.toPx()
+                        val y = maxOf(rect.top - glideOrigin.y - 52.dp.toPx(), -44.dp.toPx())
+                        androidx.compose.ui.unit.IntOffset(x.roundToInt(), y.roundToInt())
+                    }
+                }
+                .graphicsLayer { alpha = if (preview != null) 1f else 0f }
+                .size(48.dp)
+                .background(bg, RoundedCornerShape(8.dp)),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(preview?.first ?: "", color = fg, fontSize = 28.sp,
+                fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
+                textAlign = TextAlign.Center)
+        }
+    }
+
     // ---- Glide (swipe) typing -------------------------------------------------------------------
 
     /** The letter key whose cell contains window-point [p], or null. */
@@ -2838,6 +2887,17 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     /** How far the letter hit-grid sits BELOW the keys as drawn, as a fraction of a key's height. */
     private val hitBiasY = 0.15f
 
+    // The letter rows and their side allowances, as constants: built with listOf() inside the
+    // layout they were fresh (unstable) instances on every pass, which defeated the memoization
+    // of the BoxWithConstraints content lambda and re-ran all three letter rows on every root
+    // recomposition.
+    private companion object {
+        val RU_ROWS = listOf("йцукенгшщзх", "фывапролджэ", "ячсмитьбю")
+        val EN_ROWS = listOf("qwertyuiop", "asdfghjkl", "zxcvbnm")
+        val RU_SIDES = listOf(0f, 0f, 1.3f)
+        val EN_SIDES = listOf(0f, 0.5f, 1.5f)
+    }
+
     /** The letter a touch was aiming at, correcting for the fact that a finger lands lower than the
      *  point it is aiming at (the contact patch sits behind the fingertip).
      *
@@ -2857,11 +2917,23 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         val kh = avgKeyHeight()
         if (kh <= 1f) return tapped
         val y = p.y - kh * hitBiasY
-        val rowY = keyBounds.values.minByOrNull { kotlin.math.abs(it.center.y - y) }?.center?.y
-            ?: return tapped
-        val best = keyBounds.entries
-            .filter { kotlin.math.abs(it.value.center.y - rowY) < kh * 0.5f }
-            .minByOrNull { kotlin.math.abs(it.value.center.x - p.x) }?.key ?: return tapped
+        // Two plain scans. minByOrNull/filter here boxed a Float per key and built a list on
+        // every letter, on the path between finger-down and the letter appearing.
+        var rowY = 0f
+        var rowD = Float.MAX_VALUE
+        for (r in keyBounds.values) {
+            val d = kotlin.math.abs(r.center.y - y)
+            if (d < rowD) { rowD = d; rowY = r.center.y }
+        }
+        if (rowD == Float.MAX_VALUE) return tapped
+        var best = tapped
+        var bestD = Float.MAX_VALUE
+        for ((c, r) in keyBounds) {
+            if (kotlin.math.abs(r.center.y - rowY) >= kh * 0.5f) continue
+            val d = kotlin.math.abs(r.center.x - p.x)
+            if (d < bestD) { bestD = d; best = c }
+        }
+        if (bestD == Float.MAX_VALUE) return tapped
         return if (tapped.isUpperCase()) best.uppercaseChar() else best
     }
 
@@ -2917,9 +2989,17 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         if (kw <= 1f || kh <= 1f) return tapped
         val lower = tapped.lowercaseChar()
         fun cell(r: Rect) = SuggestionEngine.cellDistance(point.x, point.y, r.center.x, r.center.y, kw, kh)
-        val near = keyBounds.entries.sortedBy { cell(it.value) }.take(2)
-        if (near.size < 2 || near.none { it.key == lower }) return tapped
-        val cands = near.map { it.key to cell(it.value) }
+        // The two nearest keys by one pass — sorting all 33 entries allocated a list and boxed
+        // every distance on the critical path of each letter.
+        var k1 = ' '; var d1 = Float.MAX_VALUE
+        var k2 = ' '; var d2 = Float.MAX_VALUE
+        for ((c, r) in keyBounds) {
+            val d = cell(r)
+            if (d < d1) { k2 = k1; d2 = d1; k1 = c; d1 = d }
+            else if (d < d2) { k2 = c; d2 = d }
+        }
+        if (d2 == Float.MAX_VALUE || (k1 != lower && k2 != lower)) return tapped
+        val cands = listOf(k1 to d1, k2 to d2)
         val prefix = composing.toString().lowercase()
         val langs = dictLangs()
         // Runs on the critical path (before the letter appears). Use ONLY the frequency-sorted bundled
@@ -3443,7 +3523,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         }
         // Snapshot everything the background pass needs: the learned maps are mutated on the main
         // thread, and the tap points / key bounds change with the layout — copies keep it race-free.
-        val uni = HashMap(UserDictionary.unigrams())
+        val uni = UserDictionary.unigrams()   // an immutable snapshot — see UserDictionary.unigrams
         val prevW = wordBefore(word)
         val prefer = if (prevW != null)
             SuggestionEngine.followerWeights(prevW.lowercase(), langs, UserDictionary.bigrams()).keys.toSet()
@@ -3935,8 +4015,8 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             if (durationMs > 0L) {
                 try {
                     vibrator?.let { v ->
-                        if (v.hasVibrator()) {
-                            val amplitude = if (v.hasAmplitudeControl())
+                        if (vibratorUsable) {
+                            val amplitude = if (vibratorAmplitude)
                                 KeyboardPrefs.hapticAmplitude(level).coerceIn(1, 255)
                             else
                                 android.os.VibrationEffect.DEFAULT_AMPLITUDE
@@ -3947,8 +4027,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             }
             if (sound) {
                 try {
-                    val am = getSystemService(android.content.Context.AUDIO_SERVICE) as? android.media.AudioManager
-                    am?.playSoundEffect(android.media.AudioManager.FX_KEYPRESS_STANDARD, -1f)
+                    audioManager?.playSoundEffect(android.media.AudioManager.FX_KEYPRESS_STANDARD, -1f)
                 } catch (_: Exception) {}
             }
         }

@@ -69,7 +69,13 @@ object UserDictionary {
         }
     }
 
-    fun unigrams(): Map<String, Int> = unigram
+    /** The personal vocabulary as an IMMUTABLE snapshot, rebuilt lazily after the next mutation.
+     *  Suggestion passes run on a background thread and used to take a defensive HashMap copy of
+     *  all 4000 entries on every keystroke; this way a copy is made once per learned word instead,
+     *  and readers can hold the map across threads without a lock. */
+    fun unigrams(): Map<String, Int> =
+        uniSnapshot ?: synchronized(this) { uniSnapshot ?: java.util.Collections.unmodifiableMap(HashMap(unigram)).also { uniSnapshot = it } }
+    @Volatile private var uniSnapshot: Map<String, Int>? = null
     fun bigrams(): Map<String, Map<String, Int>> = bigram
 
     // --- Management API (used by the Settings screen) ---
@@ -85,6 +91,7 @@ object UserDictionary {
         val w = word.trim().lowercase()
         if (!isValidWord(w)) return false
         unigram[w] = maxOf(unigram[w] ?: 0, 5) // seed a count so it ranks among learned words
+        uniSnapshot = null
         if (unigram.size > MAX_UNIGRAMS) pruneSmallest(unigram, MAX_UNIGRAMS, keep = w)
         dirty = true
         return true
@@ -99,7 +106,7 @@ object UserDictionary {
     /** Remove a word and any bigrams that reference it. */
     fun removeWord(word: String): Unit = synchronized(this) {
         val w = word.lowercase()
-        if (unigram.remove(w) != null) dirty = true
+        if (unigram.remove(w) != null) { dirty = true; uniSnapshot = null }
         if (bigram.remove(w) != null) dirty = true
         bigram.values.forEach { if (it.remove(w) != null) dirty = true }
     }
@@ -120,6 +127,7 @@ object UserDictionary {
             // evict the very word just learned (HashMap order decides the tie) — silently doing nothing.
             if (unigram.size > MAX_UNIGRAMS) pruneSmallest(unigram, MAX_UNIGRAMS, keep = word)
             dirty = true
+            uniSnapshot = null
         }
         if (!prev.isNullOrEmpty()) {
             val followers = bigram.getOrPut(prev) { HashMap() }
@@ -160,7 +168,7 @@ object UserDictionary {
     }
 
     fun clear(context: Context): Unit = synchronized(this) {
-        unigram.clear(); bigram.clear(); dirty = false
+        unigram.clear(); bigram.clear(); dirty = false; uniSnapshot = null
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(KEY_DATA).apply()
     }
 
@@ -200,7 +208,7 @@ object UserDictionary {
                     val v = uj.optInt(k, 0)
                     if (v <= 0 || !isValidWord(k)) continue
                     if (!unigram.containsKey(k)) newWords++
-                    unigram[k] = maxOf(unigram[k] ?: 0, v)
+                    unigram[k] = maxOf(unigram[k] ?: 0, v); uniSnapshot = null
                 }
             }
             root.optJSONObject("b")?.let { bj ->
