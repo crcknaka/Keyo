@@ -9321,7 +9321,6 @@ innovate
 smells
 customization
 resistant
-im
 maker's
 referee
 davies
@@ -9818,7 +9817,6 @@ mo
 mesh
 beacon
 notch
-dont
 penguin
 imprisonment
 finland
@@ -18465,7 +18463,6 @@ vue
 ul
 eaters
 gingerbread
-alot
 indexing
 parse
 selenium
@@ -19417,7 +19414,6 @@ dill
 fellows
 rhubarb
 sunscreens
-thats
 asynchronous
 nested
 parsing
@@ -21317,7 +21313,6 @@ customizing
 patties
 shampoos
 gcp
-ive
 vive
 artichoke
 mueller's
@@ -24634,7 +24629,6 @@ roadster
 jw
 chromium
 cornstarch
-didnt
 redirects
 tarte
 rightwards
@@ -24872,7 +24866,6 @@ s'mores
 huawei's
 comma
 polenta
-doesnt
 webrtc
 hypervisor
 softcat
@@ -26319,7 +26312,6 @@ spritz
 cleansers
 filet
 printable
-whats
 dx
 sop
 sprites
@@ -31535,7 +31527,6 @@ crepes
 endoscopy
 gush
 integrative
-isnt
 laude
 maximizes
 papaya
@@ -33809,7 +33800,6 @@ rigidity
 riveted
 screenwriting
 soldier's
-teh
 epsilon
 galaxy's
 peking
@@ -37463,7 +37453,6 @@ mints
 pancetta
 spunky
 tarragon
-theres
 touristy
 waxes
 zing
@@ -38302,7 +38291,6 @@ myocardial
 ooze
 pips
 romanticism
-seperate
 silvery
 spunk
 taffy
@@ -39933,7 +39921,6 @@ lymphatic
 monitor's
 mountainside
 obscures
-occured
 ominously
 outsize
 proclivity
@@ -41298,7 +41285,6 @@ architecting
 extrusion
 pagination
 webserver
-definately
 interop
 kidlitosphere
 multivariate
@@ -42178,7 +42164,6 @@ snagging
 subscribes
 surly
 tellers
-thier
 transfixed
 unreachable
 virtuoso
@@ -43553,7 +43538,6 @@ tungsten
 vid
 vino
 vulgarity
-wasnt
 wily
 wiper
 allo
@@ -45131,7 +45115,6 @@ donato
 ewers
 fgcu
 fnb
-grammer
 hallett
 haniyeh
 healesville
@@ -46365,7 +46348,6 @@ insolent
 firemen
 alimony
 snarls
-youre
 kono
 pussycat
 fags
@@ -46521,4 +46503,14 @@ hottie
 lyla
 broads
 extraterrestrials
-sory
+idk
+brb
+thx
+np
+lmao
+afk
+tbf
+ikr
+nvm
+smh
+tysm

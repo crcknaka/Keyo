@@ -92,7 +92,7 @@ object UserDictionary {
 
     /** A word the dictionary will accept: letters (any script) plus apostrophe/hyphen. Rejects the
      *  spaces, newlines and control characters an imported file could otherwise smuggle in. */
-    private fun isValidWord(w: String): Boolean =
+    internal fun isValidWord(w: String): Boolean =
         w.length in 2..32 && w.any { it.isLetter() } &&
             w.all { it.isLetter() || it == '\'' || it == '-' }
 
@@ -128,6 +128,17 @@ object UserDictionary {
             if (bigram.size > MAX_BIGRAM_KEYS) pruneBigramKeys()
             dirty = true
         }
+    }
+
+    /** Take back one next-word observation — the pair an autocorrect recorded before the user
+     *  reverted it. Left in place, every wrong guess made the same wrong guess likelier. */
+    fun unlearnBigram(prev: String?, word: String): Unit = synchronized(this) {
+        if (prev.isNullOrEmpty()) return
+        val followers = bigram[prev] ?: return
+        val c = followers[word] ?: return
+        if (c <= 1) followers.remove(word) else followers[word] = c - 1
+        if (followers.isEmpty()) bigram.remove(prev)
+        dirty = true
     }
 
     /** Persist if there are unsaved changes. Cheap to call repeatedly. */

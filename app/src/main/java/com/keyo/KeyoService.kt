@@ -546,7 +546,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         recentTaps.clear()
         pendingTapPos = null
         autocorrectUndo = null
-        revertedWords.clear()
+        // revertedWords deliberately NOT cleared here: "never re-correct what I reverted" must
+        // outlive the field. Some apps restart input on every keystroke, and even a plain tap into
+        // the next field turned the promise into "until you look away" — "Riga" → "Rita", revert,
+        // switch field, "Riga" → "Rita" again. Reset only on a language switch (cycleLanguage).
         glideWord = null
         glideAlts = emptyList()
         pendingAutoSpace = false
@@ -1225,6 +1228,13 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                 aiPressed = true
                                 var longPressed = false
                                 var aiWasCancelled = false
+                                // The comma lands NOW, on finger-down, exactly like a letter. It
+                                // used to wait for finger-up, and with fast typing the next key's
+                                // down arrives first: "hi" comma-down space-down comma-up gave
+                                // "hi ,how", and a rolled-over letter got glued to the word before
+                                // the comma and autocorrected as one. A long press takes it back.
+                                performKeyFeedback()
+                                commitChar(',')
                                 // uptimeMillis, not wall clock: this measures elapsed time and must
                                 // not be thrown off by an NTP or timezone jump.
                                 val aiPressStartMs = android.os.SystemClock.uptimeMillis()
@@ -1236,6 +1246,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                 val longPressJob = serviceScope.launch {
                                     kotlinx.coroutines.delay(500)
                                     longPressed = true
+                                    retractComma()
                                     startAIRecording()
                                     performKeyFeedback()
                                 }
@@ -1269,14 +1280,13 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                     // since they never knowingly started a recording to cancel.
                                     longPressed && android.os.SystemClock.uptimeMillis() - aiPressStartMs < 900 -> {
                                         cancelAIRecording(silent = true)
-                                        performKeyFeedback()
-                                        commitChar(',')
+                                        commitChar(',')   // put back what the long press retracted
                                     }
                                     longPressed -> {
                                         if (aiCancelled) cancelAIRecording() else stopAIRecording()
                                         aiDragX = 0f
                                     }
-                                    else -> { performKeyFeedback(); commitChar(',') }
+                                    else -> {}   // the comma was typed on finger-down
                                 }
                             }
                         }
@@ -1702,6 +1712,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         var cursorMode = false
                         var lastStepX = 0f
                         var selectedDuringSwipe = false
+                        var micWasCancelled = false
                         micCancelled = false
                         micDragX = 0f
                         spacePressed = true
@@ -1746,14 +1757,20 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                 }
                                 change.consume()
                             }
-                        } catch (_: kotlinx.coroutines.CancellationException) {}
+                        } catch (_: kotlinx.coroutines.CancellationException) { micWasCancelled = true }
 
                         longPressJob.cancel()
                         spacePressed = false
                         cursorVisual = false
                         dragXVisual = 0f
                         if (longPressed) {
-                            if (micCancelled) cancelVoiceRecording() else stopVoiceRecording()
+                            // Gesture torn down mid-hold (focus moved, layout swapped): the same
+                            // rule the AI key already follows — stop the mic, type nothing. Going
+                            // through stopVoiceRecording() here captured the field token AFTER
+                            // focus had moved, so the transcript passed the check and landed in
+                            // whatever field was focused now.
+                            if (micWasCancelled) cancelVoiceRecording(silent = true)
+                            else if (micCancelled) cancelVoiceRecording() else stopVoiceRecording()
                             micDragX = 0f
                         } else if (!cursorMode && pendingSpaceTap) {
                             // Normal tap, and no fast next-letter already flushed it: commit the space.
@@ -2482,6 +2499,9 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     val out = formatEmphasis(res)
                     val sep = if (before.isNotEmpty() && !before.last().isWhitespace() &&
                         out.isNotEmpty() && !out.first().isWhitespace()) " " else ""
+                    // The user may have kept typing while the model wrote: commitText replaces a
+                    // composing region, so close theirs first or their half-word vanishes.
+                    finalizeComposing()
                     currentInputConnection?.commitText(sep + out, 1)
                     statusText.value = ""
                 } else {
@@ -2790,7 +2810,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     // actually typed. [autocorrectUndo] holds the committed corrected word + the original; it is
     // armed in finishWord and consumed/cleared in deleteSmart, on the next keystroke, or on any
     // cursor/edit action. Words the user reverts go in [revertedWords] and are never re-corrected.
-    private class AutocorrectUndo(val corrected: String, val original: String)
+    private class AutocorrectUndo(val corrected: String, val original: String, val prev: String?)
     private var autocorrectUndo: AutocorrectUndo? = null
     private val revertedWords = HashSet<String>()
 
@@ -3181,10 +3201,24 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private fun commitChar(char: Char) {
         val ic = currentInputConnection
         markSelfEdit()
+        if (showUndoRewrite.value) showUndoRewrite.value = false   // typing on accepts the rewrite
         plainLetterCommitted = false   // re-armed below only by the mid-word plain-insert branch
         // Flush a still-pending space tap BEFORE this character, so a fast next-key press lands
         // after the space instead of gluing onto the previous word.
+        val flushedSpace = pendingSpaceTap
         flushPendingSpace()
+        // Space→letter rollover after a sentence end: the flush just committed ". " but the letter
+        // was cased when its key was drawn, before any auto-capitalize ran — "end. n" instead of
+        // "end. N". Decide now that the boundary is in place, and consume the one-shot Shift the
+        // way the key's own handler would have.
+        if (flushedSpace && char.isLowerCase()) {
+            maybeAutoCapitalize()
+            if (isShift.value && shiftIsAuto) {
+                isShift.value = false; shiftIsAuto = false
+                commitChar(char.uppercaseChar())
+                return
+            }
+        }
         autocorrectUndo = null   // typing past a just-corrected word accepts the correction
         val hadAutoSpace = pendingAutoSpace
         pendingAutoSpace = false
@@ -3471,7 +3505,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     val vocabList = SuggestionEngine.wordList(langs)
                     val corrRank = SuggestionEngine.rankIn(corr[0], vocabList)
                     val compRank = SuggestionEngine.rankIn(comp[0], vocabList)
-                    if (corrRank < compRank * 4) corrPrimary = corr[0]
+                    // …but not while the letters so far are simply the start of a common word: at
+                    // "sor" the user is typing "sorry", not misspelling "for". Only a RARE best
+                    // completion ("teh" → "Tehran") makes the typo reading the likelier one.
+                    if (corrRank < compRank * 4 && compRank >= 2000) corrPrimary = corr[0]
                 }
             }
             if (corrPrimary != null) {
@@ -3528,12 +3565,23 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             revertedWords.add(SuggestionEngine.fold(undo.original.lowercase()))
             ic.deleteSurroundingText(n, 0)
             ic.commitText(undo.original + before.last(), 1)
-            if (!noLearn) {
-                learnFromTap(null, undo.original.lowercase())
-                scheduleUserDictSave()
-            }
+            unlearnCorrection(undo)
         }
         updateSuggestions()
+    }
+
+    /** A reverted autocorrect was a wrong guess, and finishWord had already recorded it as a
+     *  next-word pair — every wrong guess made the same wrong guess likelier next time. Take that
+     *  back and record the pair the user actually meant. The typed word is whitelisted for the
+     *  session (revertedWords), NOT added to the dictionary: "I did not mean that correction" is
+     *  not "add this to my words" — the ↩ chip used to do the latter, so one revert of "helo"
+     *  offered "helo" as a completion forever. */
+    private fun unlearnCorrection(undo: AutocorrectUndo) {
+        if (noLearn) return
+        UserDictionary.unlearnBigram(undo.prev, undo.corrected.lowercase())
+        if (UserDictionary.isValidWord(undo.original))
+            UserDictionary.learn(undo.prev, undo.original.lowercase(), bumpUnigram = false)
+        scheduleUserDictSave()
     }
 
     /** Replace the in-progress word (or insert a predicted next word) with [s] and learn it. */
@@ -3655,7 +3703,16 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 val prefer = if (prev != null)
                     SuggestionEngine.followerWeights(prev.lowercase(), dictLangs(), UserDictionary.bigrams()).keys else emptySet()
                 val cands = SuggestionEngine.corrections(learned, dictLangs(), UserDictionary.unigrams(), 12, maxEdits = 2, prefer = prefer)
-                var corr = SuggestionEngine.pickAutocorrect(learned, cands, neighbors())
+                // How much evidence a candidate brings: none needed for a personal word or one the
+                // sentence expects; otherwise its frequency rank, which gates short words (see
+                // SuggestionEngine.SHORT_WORD_RANK_CAP — "riga" must not become "rita").
+                val uniNow = UserDictionary.unigrams()
+                val wordListNow = SuggestionEngine.wordList(dictLangs())
+                val rankOf: (String) -> Int = { c ->
+                    if (uniNow.containsKey(c) || prefer.contains(c) || prefer.contains(SuggestionEngine.fold(c))) 0
+                    else SuggestionEngine.rankIn(c, wordListNow)
+                }
+                var corr = SuggestionEngine.pickAutocorrect(learned, cands, neighbors(), rankOf)
                 // (v3) Coordinate refinement: only when v1 already decided to correct AND the taps for
                 // this word were fully captured. Re-pick among the SAME candidate set the word whose
                 // keys the finger was physically closest to — but only if that's clearly confident
@@ -3666,7 +3723,11 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         // Substitution slips only, judged on the worst differing position: a
                         // candidate overrides the rank-best fix ONLY when the finger physically
                         // landed near its key at EVERY position where they differ.
+                        val shortWord = learned.length <= SuggestionEngine.SHORT_WORD_MAX_LEN
                         val best = cands.filter { it.length == learned.length }
+                            // The same frequency floor as the pick above — the re-pick must not
+                            // smuggle in a rare word the first pass was right to refuse.
+                            .filter { !shortWord || rankOf(it) < SuggestionEngine.SHORT_WORD_RANK_CAP }
                             .mapNotNull { c -> spatialSlipCost(learned, c, pts, keyBounds)?.let { c to it } }
                             .minByOrNull { it.second }
                         if (best != null && best.second <= 0.65f) corr = best.first
@@ -3690,13 +3751,13 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 if (corr == null && prev != null &&
                     SuggestionEngine.isKnown(learned, dictLangs(), UserDictionary.unigrams())) {
                     val fw = SuggestionEngine.followerWeights(prev.lowercase(), dictLangs(), UserDictionary.bigrams())
-                    if (fw.isNotEmpty() && (fw[learned] ?: 0) == 0) {
-                        // Strongest follower first — iterating the map's hash order could otherwise
-                        // apply a weaker candidate than the one the context actually expects.
-                        corr = fw.entries.asSequence()
-                            .filter { it.value >= 7 }
-                            .sortedByDescending { it.value }
-                            .map { it.key }
+                    if (fw.isNotEmpty() && (fw[learned] ?: 0) == 0 && (fw[SuggestionEngine.fold(learned)] ?: 0) == 0) {
+                        // Only what the context expects STRONGLY: the top bundled followers and
+                        // well-established personal pairs. The old "weight >= 7" test let a pair
+                        // typed twice qualify, so two "я сто процентов" turned "я что" into "я сто".
+                        // Strongest first — hash order could otherwise apply a weaker candidate.
+                        corr = SuggestionEngine.strongFollowers(prev.lowercase(), dictLangs(), UserDictionary.bigrams())
+                            .sortedByDescending { fw[it] ?: 0 }
                             .firstOrNull { SuggestionEngine.isConfidentSlip(learned, it, neighbors()) }
                     }
                 }
@@ -3721,11 +3782,13 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         // "<finalWord><boundary>" in the field; the next Backspace restores [word].
         // Any change (autocorrect, i->I, contraction) is one-tap revertable: the strip shows
         // "↩ <original>" and the first Backspace restores it (and won't be re-fixed this session).
-        autocorrectUndo = if (corrected) AutocorrectUndo(finalWord, word) else null
+        autocorrectUndo = if (corrected) AutocorrectUndo(finalWord, word, prev?.lowercase()) else null
         // Plain typing must NOT add the word to the dictionary — only an explicit suggestion tap
         // (applySuggestion) does. We still record the next-word pattern for prediction (unless the
         // field forbids personalization, e.g. incognito).
-        if (!noLearn) {
+        // Only a word-shaped word: "--", "''" and digit runs survive autocorrect too, and used to
+        // become next-word predictions at full weight.
+        if (!noLearn && UserDictionary.isValidWord(learned)) {
             UserDictionary.learn(prev?.lowercase(), learned, bumpUnigram = false)
             scheduleUserDictSave()
         }
@@ -4282,10 +4345,30 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
 
     private fun performUndoRewrite() {
         finalizeComposing()
-        val ic = currentInputConnection ?: return
-        if (rewriteResult.isNotEmpty()) ic.deleteSurroundingText(rewriteResult.length, 0)
-        ic.commitText(rewriteBackup, 1)
         showUndoRewrite.value = false
+        val ic = currentInputConnection ?: return
+        if (rewriteResult.isNotEmpty()) {
+            // Only undo what is actually still there. Deleting rewriteResult.length characters
+            // blindly ate whatever the user typed after the rewrite plus the tail of the rewrite,
+            // and glued the original onto the remains.
+            if (ic.getTextBeforeCursor(rewriteResult.length, 0)?.toString() != rewriteResult) {
+                showStatus("↩ Text changed since the rewrite — nothing undone", 2000)
+                return
+            }
+            ic.deleteSurroundingText(rewriteResult.length, 0)
+        }
+        ic.commitText(rewriteBackup, 1)
+    }
+
+    /** The comma typed on finger-down, taken back because the press turned into an AI recording.
+     *  Only when it is really the character before the caret — a rolled-over letter may have
+     *  landed after it, and that letter is the user's. */
+    private fun retractComma() {
+        val ic = currentInputConnection ?: return
+        if (ic.getTextBeforeCursor(1, 0)?.toString() != ",") return
+        markSelfEdit()
+        finalizeComposing()
+        ic.deleteSurroundingText(1, 0)
     }
 
     // Open Keyo settings directly from the keyboard, optionally deep-linked to a section.
@@ -4314,6 +4397,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private fun deleteSmart(byWord: Boolean) {
         performKeyFeedback()
         markSelfEdit()
+        if (showUndoRewrite.value) showUndoRewrite.value = false
         flushPendingSpace()   // keep real key order: a space tapped before this backspace lands first
         pendingAutoSpace = false
         plainLetterCommitted = false   // that letter is gone / no longer the one a glide would replace
@@ -4344,6 +4428,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 revertedWords.add(SuggestionEngine.fold(undo.original.lowercase()))
                 ic.deleteSurroundingText(n, 0)
                 ic.commitText(undo.original, 1)
+                unlearnCorrection(undo)
                 updateSuggestions()
                 return
             }
@@ -4465,7 +4550,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                             isRecording.value = false
                             val ok = canCommitTo(token)
                             try {
-                                if (!ok) currentInputConnection?.finishComposingText()
+                                // !ok: the field changed under the session. The new field is not
+                                // ours to touch — not even to "tidy up" a composing region, which
+                                // there would be the user's own word.
+                                if (!ok) { /* nothing */ }
                                 else if (rawKeyField()) {
                                     if (!t.isNullOrBlank()) currentInputConnection?.commitText(t, 1)
                                 } else {
@@ -4498,17 +4586,19 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         }
     }
 
-    private fun cancelVoiceRecording() {
+    private fun cancelVoiceRecording(silent: Boolean = false) {
         if (offlineSession) {
             offlineSession = false
             offlineDictation.cancel()
-            try {
+            if (!silent) try {
                 currentInputConnection?.setComposingText("", 1)
                 currentInputConnection?.finishComposingText()
             } catch (_: Exception) {}
             isRecording.value = false
-            statusText.value = "✕ Cancelled"
-            handler.postDelayed({ if (statusText.value == "✕ Cancelled") statusText.value = "" }, 1500)
+            if (!silent) {
+                statusText.value = "✕ Cancelled"
+                handler.postDelayed({ if (statusText.value == "✕ Cancelled") statusText.value = "" }, 1500)
+            }
             return
         }
         try {
@@ -4555,6 +4645,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                             handler.post {
                                 try {
                                     if (canCommitTo(token)) {
+                                        finalizeComposing()   // never over the word being typed
                                         markSelfEdit()
                                         currentInputConnection?.commitText(text, 1)
                                         statusText.value = "🧹 Cleaning up…"
@@ -4584,6 +4675,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                 handler.post {
                                     try {
                                         if (canCommitTo(token)) {
+                                            finalizeComposing()   // never over the word being typed
                                             markSelfEdit()
                                             currentInputConnection?.commitText(cleaned ?: text, 1)
                                             statusText.value = ""
@@ -4597,6 +4689,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                             handler.post {
                                 try {
                                     if (canCommitTo(token)) {
+                                        finalizeComposing()   // never over the word being typed
                                         markSelfEdit()
                                         currentInputConnection?.commitText(text, 1)
                                         statusText.value = ""
@@ -4608,8 +4701,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         }
                     } else {
                         handler.post {
-                            // Nothing to commit — just release any composing region we might hold.
-                            try { currentInputConnection?.finishComposingText() } catch (_: Exception) {}
+                            // Nothing to commit, and nothing to release either: this path never
+                            // opened a composing region, so a finishComposingText() here could only
+                            // ever close the USER's — the word they were typing while the request
+                            // ran — after which the next letter re-inserted it ("helhell").
                             statusText.value = error ?: "Transcription failed"
                             clearStatusLater(error ?: "Transcription failed", 3000)
                         }
@@ -4738,6 +4833,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                         // The tool loop can run for minutes — never let the answer
                                         // land in whatever field the user has moved on to.
                                         if (canCommitTo(token)) {
+                                            finalizeComposing()   // minutes may have passed — don't eat a half-typed word
                                             currentInputConnection?.commitText(formatEmphasis(result), 1)
                                             statusText.value = ""
                                         } else {

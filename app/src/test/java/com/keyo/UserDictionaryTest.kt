@@ -3,6 +3,7 @@ package com.keyo
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -181,5 +182,26 @@ class UserDictionaryTest {
         assertFalse(UserDictionary.unigrams().containsKey("target"))
         assertEquals(null, UserDictionary.bigrams()["target"])
         assertEquals(null, UserDictionary.bigrams()["other"]?.get("target"))
+    }
+
+    @Test fun unlearnBigram_takesBackOneSighting() {
+        reset()
+        UserDictionary.learn("in", "rita", bumpUnigram = false)
+        UserDictionary.learn("in", "rita", bumpUnigram = false)
+        assertEquals(2, UserDictionary.bigrams()["in"]?.get("rita"))
+        UserDictionary.unlearnBigram("in", "rita")
+        assertEquals(1, UserDictionary.bigrams()["in"]?.get("rita"))
+        UserDictionary.unlearnBigram("in", "rita")
+        assertNull("the last sighting removes the pair", UserDictionary.bigrams()["in"]?.get("rita"))
+        UserDictionary.unlearnBigram("in", "rita")   // nothing left: must be a no-op, not a crash
+        UserDictionary.unlearnBigram(null, "rita")
+    }
+
+    @Test fun isValidWord_rejectsPunctuationRuns() {
+        assertTrue(UserDictionary.isValidWord("don't"))
+        assertTrue(UserDictionary.isValidWord("wi-fi"))
+        assertFalse(UserDictionary.isValidWord("--"))
+        assertFalse(UserDictionary.isValidWord("''"))
+        assertFalse(UserDictionary.isValidWord("2024"))
     }
 }

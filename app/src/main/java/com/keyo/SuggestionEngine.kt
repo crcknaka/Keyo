@@ -115,6 +115,31 @@ object SuggestionEngine {
         return correctionsFrom(wordLower, v.words, v.set, learnedUni, limit, maxEdits = maxEdits, prefer = prefer)
     }
 
+    /** The followers of [prevLower] that the sentence context expects STRONGLY enough to override
+     *  a word that is itself valid: the top two of the bundled model, plus personal pairs seen at
+     *  least [minLearned] times. [followerWeights] cannot be used for this — there a personal pair
+     *  weighs count × 4, so a pair typed TWICE already matched the bundled rank-0 follower, and
+     *  "я что" became "я сто" after two "я сто процентов". */
+    fun strongFollowers(prevLower: String, langs: List<String>, learnedBi: Map<String, Map<String, Int>>): Set<String> {
+        val p = fold(prevLower)
+        val bundled = ArrayList<String>(4)
+        for (lang in langs) bundledBigrams[lang]?.get(p)?.let { bundled.addAll(it) }
+        val learned = HashMap<String, Int>()
+        for (key in if (p == prevLower) listOf(p) else listOf(prevLower, p)) {
+            learnedBi[key]?.forEach { (w, c) -> learned[w] = maxOf(learned[w] ?: 0, c) }
+        }
+        return strongFollowersFrom(bundled, learned)
+    }
+
+    internal const val STRONG_LEARNED_MIN = 4
+
+    internal fun strongFollowersFrom(bundled: List<String>, learned: Map<String, Int>, minLearned: Int = STRONG_LEARNED_MIN): Set<String> {
+        val out = HashSet<String>()
+        for (i in 0 until minOf(2, bundled.size)) out.add(bundled[i])
+        for ((w, c) in learned) if (c >= minLearned) out.add(w)
+        return out
+    }
+
     /** Merged "what tends to follow [prevLower]" with weights, combining the bundled bigram model
      *  ([langs]) with the user's learned bigrams (weighted heavily, since personal). Empty when
      *  nothing is known. Drives next-word prediction, glide context and context-aware correction. */
@@ -235,7 +260,10 @@ object SuggestionEngine {
     ): List<String> {
         if (prefix.isEmpty() || limit <= 0) return emptyList()
         val fp = fold(prefix)
-        val out = LinkedHashSet<String>()
+        // Deduplicated on the FOLDED form: a word learned as "ещё" and the bundled "еще" are one
+        // word, and showing both spent two of the three chips on it.
+        val seen = HashSet<String>()
+        val out = ArrayList<String>(limit)
         // Collect the learned matches first, THEN sort just those. Sorting the whole personal
         // dictionary — up to 4000 entries — ran on every keystroke, while the number of words that
         // actually start with the prefix is nearly always a handful.
@@ -244,16 +272,19 @@ object SuggestionEngine {
             if (e.key.length > prefix.length && fold(e.key).startsWith(fp)) hits.add(e)
         }
         if (hits.size > 1) hits.sortByDescending { it.value }
-        for (e in hits) { if (out.size >= limit) break; out.add(e.key) }
+        for (e in hits) { if (out.size >= limit) break; if (seen.add(fold(e.key))) out.add(e.key) }
         if (out.size < limit) {
             for (w in words) {
-                if (w.length > prefix.length && fold(w).startsWith(fp)) {
-                    out.add(w)
-                    if (out.size >= limit) break
+                if (w.length > prefix.length) {
+                    val fwd = fold(w)
+                    if (fwd.startsWith(fp) && seen.add(fwd)) {
+                        out.add(w)
+                        if (out.size >= limit) break
+                    }
                 }
             }
         }
-        return out.toList()
+        return out
     }
 
     /** How deep the rank lookup below is willing to look. Rank is only ever used to compare two
@@ -285,7 +316,15 @@ object SuggestionEngine {
     ): List<String> {
         if (word.length < 3 || limit <= 0) return emptyList()
         val fw = fold(word)
-        if (vocabSet.contains(fw) || learnedUni.containsKey(word)) return emptyList()
+        if (vocabSet.contains(fw) || learnedUni.containsKey(word) || learnedUni.containsKey(fw)) return emptyList()
+        // Personal words protect their ё/е twin exactly as [isKnown] says they do. Without this a
+        // name learned as "артём" left "артем" unknown here — and since the learned form itself is
+        // skipped (it is the word, distance 0), the typed one was "corrected" into "прием".
+        if ((word.indexOf('е') >= 0 || word.indexOf('ё') >= 0) &&
+            learnedUni.keys.any { fold(it) == fw }) return emptyList()
+        // Context is matched folded too: the bundled bigram model spells followers the corpus way
+        // ("еще"), the cleaned word list spells them the dictionary way ("ещё").
+        val preferF = if (prefer.isEmpty()) prefer else prefer.mapTo(HashSet(prefer.size * 2)) { fold(it) }
         // Default: 1 edit for short words, 2 for longer. [maxEdits] > 0 overrides — the spatial
         // autocorrect path asks for 2 even on short words, then filters to adjacent-key subs only.
         val maxDist = if (maxEdits > 0) maxEdits else if (word.length <= 4) 1 else 2
@@ -297,7 +336,7 @@ object SuggestionEngine {
         for (lw in learnedUni.keys) {
             if (lw == word || kotlin.math.abs(lw.length - word.length) > maxDist) continue
             val d = editDistanceAtMost(fw, fold(lw), maxDist)
-            if (d in 1..maxDist && seen.add(fold(lw))) scored.add(Triple(lw, d, if (lw in prefer) -2 else -1))
+            if (d in 1..maxDist && seen.add(fold(lw))) scored.add(Triple(lw, d, if (fold(lw) in preferF) -2 else -1))
         }
         // The list is frequency-ordered, so the fix for a common word is found in the first few
         // thousand entries and scanning further is wasted work on the typing path. But a word that
@@ -316,13 +355,11 @@ object SuggestionEngine {
             for (rank in from until to) {
                 val w = words[rank]
                 if (kotlin.math.abs(w.length - word.length) > maxDist) continue
-                if (endsOnly) {
-                    val fwd = fold(w)
-                    if (fwd.first() != first && fwd.last() != last) continue
-                }
-                val d = editDistanceAtMost(fw, fold(w), maxDist)
-                if (d in 1..maxDist && seen.add(fold(w))) {
-                    scored.add(Triple(w, d, if (w in prefer) -2 else rank))
+                val fwd = fold(w)
+                if (endsOnly && fwd.first() != first && fwd.last() != last) continue
+                val d = editDistanceAtMost(fw, fwd, maxDist)
+                if (d in 1..maxDist && seen.add(fwd)) {
+                    scored.add(Triple(w, d, if (fwd in preferF) -2 else rank))
                     if (d < bestDist) bestDist = d
                 }
             }
@@ -427,14 +464,21 @@ object SuggestionEngine {
     internal fun rankCompletions(comps: List<String>, prevLower: String?, prefer: Set<String>): List<String> {
         if (comps.size < 2) return comps
         val p = prevLower ?: ""
-        val plural = p.length >= 2 && (
-            p.endsWith("ие") || p.endsWith("ые") || p == "все" || p == "эти" || p == "те" ||
-            p == "мои" || p == "твои" || p == "наши" || p == "ваши" || p == "свои")
+        // A closed list of plural determiners and pronouns. It used to be "anything ending in -ие",
+        // which is also the ending of hundreds of singular neuter nouns — "здание", "решение",
+        // "мнение" — so after "здание" the strip pushed "стояли" above "стоять".
+        val plural = p in PLURAL_DETERMINERS || (p.length >= 4 && p.endsWith("ые"))
+        val preferF = if (prefer.isEmpty()) prefer else prefer.mapTo(HashSet(prefer.size * 2)) { fold(it) }
         return comps.sortedWith(
-            compareByDescending<String> { it in prefer }
+            compareByDescending<String> { fold(it) in preferF }
                 .thenByDescending { plural && (it.endsWith("и") || it.endsWith("ы")) }
         )
     }
+
+    private val PLURAL_DETERMINERS = hashSetOf(
+        "все", "эти", "те", "какие", "такие", "другие", "многие", "некоторые", "любые", "сами",
+        "мои", "твои", "наши", "ваши", "свои", "его", "её", "их", "оба", "обе", "несколько", "много"
+    )
 
     /** True when [b] is a single ADJACENT-KEY substitution or a single transposition of [a] — the
      *  only slips confident enough to let context override a word that is itself valid. */
@@ -465,17 +509,49 @@ object SuggestionEngine {
         return subs in 1..2
     }
 
+    /** For a word this short or shorter, a single-edit candidate is only applied when it is at least
+     *  this common (or personal / expected by context). Short words are where autocorrect does its
+     *  damage: "riga" is one edit from "rita" (rank 12756), "figma" from "sigma", "keyo" from "key"
+     *  — and a 3-5 letter word simply does not carry enough evidence to override the finger with a
+     *  word the user has plausibly never seen. A longer word is different: one edit away from a
+     *  9-letter dictionary word IS strong evidence, however rare the word ("подсказкт"). */
+    internal const val SHORT_WORD_MAX_LEN = 5
+    internal const val SHORT_WORD_RANK_CAP = 4000
+    private const val VOWELS = "aeiouyаеёиоуыэюяāēīūàáâäèéêëìíîïòóôöùúûü"
+
     /** Choose a correction to auto-apply for [typed] on a word boundary, or null to leave it as-is.
      *  [cands] is ranked best-first (as from [corrections]). Accepts the top single-edit candidate
-     *  (any edit kind — unchanged behaviour), OR a two-edit candidate when both edits are adjacent-key
-     *  substitutions ([allAdjacentSubs]) — a confident double fat-finger the old single-edit rule missed. */
-    internal fun pickAutocorrect(typed: String, cands: List<String>, neighbors: Map<Char, Set<Char>>): String? {
+     *  (any edit kind), OR a two-edit candidate when both edits are adjacent-key substitutions
+     *  ([allAdjacentSubs]) — a confident double fat-finger the old single-edit rule missed.
+     *  [rankOf] is the candidate's frequency rank, 0 for words that need no such evidence (learned,
+     *  or expected by the sentence context); it gates short words, see [SHORT_WORD_RANK_CAP]. */
+    internal fun pickAutocorrect(
+        typed: String,
+        cands: List<String>,
+        neighbors: Map<Char, Set<Char>>,
+        rankOf: (String) -> Int = { 0 }
+    ): String? {
         val ft = fold(typed)
+        // "Wi-Fi" → "wifi", "co-op" → "coop", "rock'n'roll" → "rocknroll": a candidate that is the
+        // typed word with its hyphens/apostrophes stripped is not a correction of anything — the
+        // punctuation was typed on purpose, and the edit distance only sees it as a deletion.
+        val hasPunct = typed.indexOf('-') >= 0 || typed.indexOf('\'') >= 0
+        val stripped = if (hasPunct) ft.filter { it != '-' && it != '\'' } else ft
+        val short = typed.length <= SHORT_WORD_MAX_LEN
+        // A short string with a vowel in it could be a word the dictionary lacks ("figma", "riga");
+        // one without ("rwst") could not, and may be repaired more boldly.
+        val wordLike = typed.any { it.lowercaseChar() in VOWELS }
         val singles = ArrayList<String>()
         for (c in cands) {
-            when (editDistanceAtMost(ft, fold(c), 2)) {
+            val fc = fold(c)
+            if (hasPunct && fc == stripped) continue
+            if (short && rankOf(c) >= SHORT_WORD_RANK_CAP) continue
+            when (editDistanceAtMost(ft, fc, 2)) {
                 1 -> singles.add(c)
-                2 -> if (singles.isEmpty() && allAdjacentSubs(typed, c, neighbors)) return c
+                // Two edits need more letters of evidence than a short WORD-LIKE string has: in a
+                // 5-letter word that is 40% of it changed, and "figma" is two adjacent slips from
+                // "firms". "rwst" is not a word in any reading, so it may still become "test".
+                2 -> if ((!short || !wordLike) && singles.isEmpty() && allAdjacentSubs(typed, c, neighbors)) return c
             }
         }
         // Among equally-close candidates, prefer the one whose changed letter sits on a key NEXT TO
