@@ -3,4 +3,7 @@
     <!-- Shown by the system under "Keyo" in the keyboard list / IME picker. A resource reference is
          required for the system to display it instead of the subtype locale ("English (United States)"). -->
     <string name="subtype_multilingual">Multilingual</string>
+    <!-- Same rule: a literal label here is silently ignored and the locale name shown instead. -->
+    <string name="subtype_russian">Russian</string>
+    <string name="subtype_latvian">Latvian</string>
 </resources>

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- keyo_prefs holds the user's Groq API key and clipboard history; keyo_userdict their personal
+     vocabulary. None of it may leave the device by cloud backup OR device-to-device transfer. -->
+<data-extraction-rules xmlns:android="http://schemas.android.com/apk/res/android">
+    <cloud-backup>
+        <exclude domain="sharedpref" path="keyo_prefs.xml" />
+        <exclude domain="sharedpref" path="keyo_userdict.xml" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="keyo_prefs.xml" />
+        <exclude domain="sharedpref" path="keyo_userdict.xml" />
+    </device-transfer>
+</data-extraction-rules>

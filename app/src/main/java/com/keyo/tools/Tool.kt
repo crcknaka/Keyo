@@ -24,6 +24,10 @@ interface Tool {
      */
     val sensitive: Boolean get() = false
 
+    /** Per-call refinement of [sensitive]: a tool whose safe and consequential actions share one
+     *  entry point (clipboard read vs write) decides from the arguments. */
+    fun needsConfirm(args: JSONObject): Boolean = sensitive
+
     /** Human-readable description of what is about to happen, shown in the confirmation prompt. */
     fun confirmSummary(args: JSONObject): String = name
 

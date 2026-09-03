@@ -7,6 +7,10 @@ import org.json.JSONObject
 
 class SetTimerTool : Tool {
     override val name = "set_timer"
+    // Skips the clock app's own UI (EXTRA_SKIP_UI), so the keyboard asks instead: the model can
+    // call this on its own initiative, or under a prompt injected through the clipboard.
+    override val sensitive: Boolean get() = true
+    override fun confirmSummary(args: JSONObject) = "Start a %d-minute timer%s?".format(maxOf(1, args.optInt("seconds") / 60), args.optString("label").let { if (it.isEmpty()) "" else " ($it)" })
     override val uiLabel = "⏱ Timer"
     override val uiExample = "Timer for 5 minutes"
     override val description = "Set a countdown timer for a specified duration in seconds"

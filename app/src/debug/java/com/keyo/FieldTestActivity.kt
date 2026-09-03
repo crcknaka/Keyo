@@ -19,6 +19,9 @@ import android.widget.LinearLayout
  * inputType=number, digits="0123456789", password dots via transformation (NOT numberPassword),
  * imeOptions=NO_EXTRACT_UI|NO_FULLSCREEN, auto-focused in a dialog that force-shows the IME.
  */
+// The literal view ids are on purpose: the fields need STABLE ids so they can be told apart in the
+// keyboard's diagnostics line across launches, and generateViewId() would hand out different ones.
+@android.annotation.SuppressLint("ResourceType")
 class FieldTestActivity : Activity() {
 
     private fun waPinField(): EditText = EditText(this).apply {

@@ -180,7 +180,7 @@ object GroqApi {
 
         client.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
-                onDone(null, null, "Network error: ${e.message}")
+                onDone(null, null, netError(e))
             }
             override fun onResponse(call: Call, response: Response) {
                 val responseBody = response.body?.string()
@@ -324,7 +324,7 @@ Rules:
                         val tool = ToolRegistry.get(toolName)
                         if (tool != null) {
                             // Ask the user to approve any tool flagged sensitive before running it.
-                            val approved = if (tool.sensitive && confirm != null)
+                            val approved = if (tool.needsConfirm(toolArgs) && confirm != null)
                                 confirm(tool.confirmSummary(toolArgs)) else true
                             if (!approved) {
                                 ToolResult(false, "User declined the action; do not retry it.")
@@ -402,7 +402,7 @@ Rules:
             .post(json.toString().toRequestBody("application/json".toMediaType()))
             .build()
         client.newCall(request).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) = callback(null, "Network error: ${e.message}")
+            override fun onFailure(call: Call, e: IOException) = callback(null, netError(e))
             override fun onResponse(call: Call, response: Response) {
                 val body = response.body?.string()
                 when {
@@ -440,12 +440,22 @@ Rules:
                 try { Thread.sleep(1000L * attempt) } catch (_: InterruptedException) {}
                 continue
             }
-            Log.e(TAG, "Groq API error ${response.code}: $body")
+            // Code only. The body of a tool_use_failed error carries the model's output, which by
+            // then can include clipboard text or the spoken transcript — not for logcat.
+            Log.e(TAG, "Groq API error ${response.code}")
             throw IOException(friendlyError(response.code, body))
         }
     }
 
     private const val TAG = "GroqApi"
+
+    /** "Unable to resolve host api.groq.com: No address associated with hostname" is what the
+     *  status line used to show. The user can act on exactly one thing here: the connection. */
+    private fun netError(e: IOException): String = when (e) {
+        is java.net.UnknownHostException, is java.net.ConnectException -> "No connection"
+        is java.net.SocketTimeoutException -> "Connection timed out"
+        else -> "Network error"
+    }
 
     fun cleanupText(rawText: String, callback: (String?, String?) -> Unit) {
         // The transcript is DATA, not a request. Dictating "переведи на английский я тебя люблю"

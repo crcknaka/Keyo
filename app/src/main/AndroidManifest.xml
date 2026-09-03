@@ -23,10 +23,13 @@
     </queries>
 
     <!-- allowBackup is OFF on purpose: the prefs hold the Groq API key and the clipboard history in
-         plaintext, and Auto Backup would ship both to Drive and restore them onto any device. -->
+         plaintext, and Auto Backup would ship both to Drive and restore them onto any device.
+         On Android 12+ that flag no longer covers device-to-device transfer on every OEM, so the
+         extraction rules exclude the two preference files from that path explicitly as well. -->
     <application
         android:name=".KeyoApp"
         android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:label="Keyo"

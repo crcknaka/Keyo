@@ -1290,7 +1290,8 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             when {
                 status.isNotEmpty() -> Text(
                     status, color = accentColor, fontSize = 12.sp,
-                    modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center
+                    modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center,
+                    maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
                 )
                 // Undo outranks suggestions: a rewrite just replaced up to 4000 characters of the
                 // user's text, and the rewritten text itself triggers a suggestion pass — so ranking
@@ -1319,7 +1320,8 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                 fontSize = 15.sp,
                                 fontWeight = if (isPrimary) androidx.compose.ui.text.font.FontWeight.SemiBold
                                              else androidx.compose.ui.text.font.FontWeight.Normal,
-                                maxLines = 1
+                                maxLines = 1, softWrap = false,
+                                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
                             )
                         }
                     }
@@ -1450,13 +1452,16 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             }
             Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
                 androidx.compose.foundation.lazy.grid.LazyVerticalGrid(
-                    columns = androidx.compose.foundation.lazy.grid.GridCells.Fixed(8),
+                    // Fixed-size cells: eight columns of aspectRatio(1f) made each emoji as
+                    // wide as an eighth of the screen — 112dp on a phone in landscape, where the
+                    // panel is 130dp tall and showed less than one row.
+                    columns = androidx.compose.foundation.lazy.grid.GridCells.Adaptive(minSize = 44.dp),
                     modifier = Modifier.fillMaxSize()
                 ) {
                     items(emojis.size) { i ->
                         val e = emojis[i]
                         Box(
-                            modifier = Modifier.aspectRatio(1f)
+                            modifier = Modifier.height(44.dp)
                                 .clickable {
                                     performKeyFeedback(); commitText(e)
                                     KeyboardPrefs.addRecentEmoji(this@KeyoService, e)
@@ -1960,6 +1965,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         if (status.isNotEmpty()) {
             Text(
                 status, color = accentColor, fontSize = 12.sp,
+                maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
                 textAlign = TextAlign.Center,
                 modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp)
             )
@@ -2646,7 +2652,9 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                             ) {
                                 Text(
                                     text = alt,
-                                    color = if (isSelected) Color.Black else Color.White,
+                                    // Theme colours, not white/black: in the Light theme the
+                                    // alternates were white glyphs on a light-grey key.
+                                    color = if (isSelected) Color(currentTheme.bg) else Color(currentTheme.text),
                                     fontSize = 20.sp,
                                     fontWeight = androidx.compose.ui.text.font.FontWeight.Bold
                                 )
@@ -4091,8 +4099,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     /** Best-effort: tell the OS which language we're typing by switching our IME subtype, so the
      *  editor's spell checker can follow it. Searches ALL declared subtypes (not just the *enabled*
      *  list — on an en-US device only English is enabled, so ru/lv would never be found there).
-     *  Note: setCurrentInputMethodSubtype is a no-op on Android 14+ (API 34), so on the newest
-     *  releases the OS-level language can't be changed from here; the on-screen layout still switches. */
+     *  switchInputMethod(id, subtype) is the permission-free way for the current IME to do this
+     *  (API 28+); the older setCurrentInputMethodSubtype needs WRITE_SECURE_SETTINGS and is a
+     *  silent no-op on Android 14+, which is why the spell checker stopped following the language
+     *  on new devices. */
     private fun syncImeSubtype(lang: String) {
         try {
             val imm = getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as? android.view.inputmethod.InputMethodManager ?: return
@@ -4103,8 +4113,15 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 if (subtypeLang(me.getSubtypeAt(i)) == lang) { target = me.getSubtypeAt(i); break }
             }
             val st = target ?: return
-            @Suppress("DEPRECATION")
-            imm.setCurrentInputMethodSubtype(st)
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+                switchInputMethod(me.id, st)
+            } else {
+                // Android 8.x only. Needs WRITE_SECURE_SETTINGS on some builds — a SecurityException
+                // is caught below and the on-screen layout switches regardless; best effort.
+                @Suppress("DEPRECATION")
+                @android.annotation.SuppressLint("MissingPermission")
+                imm.setCurrentInputMethodSubtype(st)
+            }
         } catch (_: Throwable) { /* best-effort: restricted on many OEMs / Android 14+ */ }
     }
 
@@ -4602,7 +4619,9 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             }
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
                 != PackageManager.PERMISSION_GRANTED) {
-                showStatus("⚠ Mic permission needed — open app settings")
+                // An IME cannot show the permission dialog itself; the Setup screen can.
+                showStatus("⚠ Mic permission needed — opening Setup")
+                openSettings("setup")
                 return
             }
 
@@ -4655,7 +4674,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
 
             if (audioRecorder.start()) {
                 isRecording.value = true
-                statusText.value = "🎤 Recording..."
+                statusText.value = "🎤 Recording…"
             } else {
                 showStatus("⚠ Failed to start recording")
             }
@@ -4693,17 +4712,20 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         try {
             if (offlineSession) {
                 // Finish the system-recognizer session; the final text arrives via its onFinal.
-                statusText.value = "⏳ Transcribing..."
+                statusText.value = "⏳ Transcribing…"
                 offlineDictation.stop()
                 return
             }
             if (!audioRecorder.isActive()) return
             finalizeComposing()   // commit any composing word so the transcript appends after it
 
-            val audioFile = File(cacheDir, "voice_input.wav")
+            // A fresh file per recording. With one fixed path, a transcription retried for its
+            // language could upload — and commit — the NEXT dictation's audio, or find the file
+            // already deleted by the previous callback.
+            val audioFile = File.createTempFile("voice_", ".wav", cacheDir)
             if (audioRecorder.stop(audioFile)) {
                 isRecording.value = false
-                statusText.value = "⏳ Transcribing..."
+                statusText.value = "⏳ Transcribing…"
                 val token = fieldToken()
 
                 GroqApi.transcribe(audioFile, dictationLangs(), whisperLangOf(currentLang.value), dictationVocabulary()) { text, error ->
@@ -4749,7 +4771,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                 }
                             }
                         } else if (cleanup) {
-                            handler.post { statusText.value = "🧹 Cleaning up..." }
+                            handler.post { statusText.value = "🧹 Cleaning up…" }
                             GroqApi.cleanupText(text) { cleaned, _ ->
                                 handler.post {
                                     try {
@@ -4790,6 +4812,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     }
                 }
             } else {
+                audioFile.delete()
                 try { currentInputConnection?.finishComposingText() } catch (_: Exception) {}
                 isRecording.value = false
                 showStatus("⚠ Recording too short")
@@ -4816,7 +4839,8 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             return
         }
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            showStatus("⚠ Mic permission needed")
+            showStatus("⚠ Mic permission needed — opening Setup")
+            openSettings("setup")
             return
         }
         if (currentTargetText().isBlank()) {
@@ -4865,12 +4889,13 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             }
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
                 != PackageManager.PERMISSION_GRANTED) {
-                showStatus("⚠ Mic permission needed")
+                showStatus("⚠ Mic permission needed — opening Setup")
+            openSettings("setup")
                 return
             }
             if (aiAudioRecorder.start()) {
                 isRecordingAI.value = true
-                statusText.value = "🤖 Listening for task..."
+                statusText.value = "✨ Listening for task…"
             } else {
                 showStatus("⚠ Failed to start recording")
             }
@@ -4898,13 +4923,13 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             val audioFile = File(cacheDir, "ai_voice_input.wav")
             if (aiAudioRecorder.stop(audioFile)) {
                 isRecordingAI.value = false
-                statusText.value = "🤖 Transcribing task..."
+                statusText.value = "✨ Transcribing task…"
                 val token = fieldToken()
 
                 GroqApi.transcribe(audioFile, dictationLangs(), whisperLangOf(currentLang.value), dictationVocabulary()) { text, error ->
                     audioFile.delete()
                     if (text != null) {
-                        handler.post { statusText.value = "🤖 Executing: $text" }
+                        handler.post { statusText.value = "✨ Working on it…" }
                         GroqApi.executeTask(text, this@KeyoService, confirm = { summary -> requestConfirm(summary) }) { result, taskError ->
                             handler.post {
                                 try {
@@ -4916,8 +4941,8 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                             currentInputConnection?.commitText(formatEmphasis(result), 1)
                                             statusText.value = ""
                                         } else {
-                                            statusText.value = "🤖 Field changed — answer dropped"
-                                            clearStatusLater("🤖 Field changed — answer dropped", 3000)
+                                            statusText.value = "✨ Field changed — answer dropped"
+                                            clearStatusLater("✨ Field changed — answer dropped", 3000)
                                         }
                                     } else {
                                         statusText.value = taskError ?: "Task failed"

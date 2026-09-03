@@ -6,6 +6,8 @@ name: Release
 #   RELEASE_STORE_PASSWORD   — keystore password
 #   RELEASE_KEY_ALIAS        — key alias
 #   RELEASE_KEY_PASSWORD     — key password
+# GROQ_API_KEY is deliberately NOT a secret here: a key baked into a distributed APK is a plaintext
+# string anyone can lift, so public builds ship without one and users add their own.
 on:
   push:
     tags: [ 'v*' ]
@@ -19,38 +21,53 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+
+      # The in-app updater compares against the TAG, the app reports versionName: they must agree,
+      # or a release offers itself again forever (or never).
+      - name: Tag must match versionName
+        run: |
+          V=$(sed -nE 's/.*versionName = "([^"]+)".*/\1/p' app/build.gradle.kts)
+          [ "v$V" = "$GITHUB_REF_NAME" ] || { echo "::error::tag $GITHUB_REF_NAME does not match versionName $V in app/build.gradle.kts"; exit 1; }
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '17'
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
 
       - name: Install SDK packages
         run: sdkmanager "platforms;android-36" "build-tools;36.0.0" "platform-tools"
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
 
       - name: Make gradlew executable
         run: chmod +x gradlew
 
       - name: Restore release signing material
+        env:
+          KEYSTORE_B64: ${{ secrets.RELEASE_KEYSTORE_B64 }}
+          STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
         run: |
-          echo "${{ secrets.RELEASE_KEYSTORE_B64 }}" | base64 -d > keyo-release.jks
+          echo "$KEYSTORE_B64" | base64 -d > keyo-release.jks
           {
             echo "storeFile=keyo-release.jks"
-            echo "storePassword=${{ secrets.RELEASE_STORE_PASSWORD }}"
-            echo "keyAlias=${{ secrets.RELEASE_KEY_ALIAS }}"
-            echo "keyPassword=${{ secrets.RELEASE_KEY_PASSWORD }}"
+            echo "storePassword=$STORE_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=$KEY_PASSWORD"
           } > keystore.properties
 
       - name: Run unit tests
         run: ./gradlew testDebugUnitTest
+
+      - name: Lint
+        run: ./gradlew lintRelease
 
       - name: Build signed release APK
         run: ./gradlew assembleRelease
@@ -60,11 +77,15 @@ jobs:
           BT=$ANDROID_HOME/build-tools/36.0.0
           $BT/apksigner verify --print-certs app/build/outputs/apk/release/Keyo.apk
 
+      # The R8 mapping is attached alongside the APK: without it no stack trace from a shipped
+      # build can ever be read. The updater only picks up assets ending in .apk, so a .gz is safe.
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          cp app/build/outputs/apk/release/Keyo.apk "Keyo-${GITHUB_REF_NAME#v}.apk"
-          gh release create "$GITHUB_REF_NAME" "Keyo-${GITHUB_REF_NAME#v}.apk" \
-            --title "Keyo ${GITHUB_REF_NAME#v}" \
+          V="${GITHUB_REF_NAME#v}"
+          cp app/build/outputs/apk/release/Keyo.apk "Keyo-$V.apk"
+          gzip -c app/build/outputs/mapping/release/mapping.txt > "mapping-$V.txt.gz"
+          gh release create "$GITHUB_REF_NAME" "Keyo-$V.apk" "mapping-$V.txt.gz" \
+            --title "Keyo $V" \
             --generate-notes

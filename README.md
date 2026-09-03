@@ -44,7 +44,7 @@ Alongside a normal multi-language keyboard it adds:
 - Kotlin 2.2 · Jetpack Compose (Material 3)
 - `InputMethodService` keyboard rendered through a `ComposeView`
 - Groq API (Whisper transcription + chat/tool-calling) via OkHttp
-- `minSdk` 26 · `targetSdk` 34 · `compileSdk` 36 · JDK 17
+- `minSdk` 26 · `targetSdk` 35 · `compileSdk` 36 · JDK 17
 - Built with AGP 8.11 · Gradle 8.14 · JUnit unit tests · GitHub Actions CI
 
 ## Getting started
@@ -84,7 +84,7 @@ The key is **not** committed. Supply it in either of these ways:
 
 ```bash
 ./gradlew assembleDebug
-adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb install -r app/build/outputs/apk/debug/Keyo-debug.apk
 ```
 
 (Windows: a convenience script `build-release.ps1` is included.)

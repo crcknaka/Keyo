@@ -28,6 +28,10 @@ class ClipboardTool : Tool {
         }
     """)
 
+    // Overwriting the clipboard is the consequential half; reading it is what the user asked for.
+    override fun needsConfirm(args: JSONObject) = args.optString("action") == "write"
+    override fun confirmSummary(args: JSONObject) = "Replace the clipboard with \"${args.optString("text").take(60)}\"?"
+
     override suspend fun execute(context: Context, args: JSONObject): ToolResult {
         val action = args.getString("action")
         val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
@@ -35,7 +39,14 @@ class ClipboardTool : Tool {
         return when (action) {
             "read" -> {
                 val clip = clipboard.primaryClip
-                if (clip != null && clip.itemCount > 0) {
+                // Password managers and OTP fields flag their copies; the keyboard's own clip
+                // history already refuses those, and what the history won't keep, the model must
+                // not be sent either — this text goes to Groq as the tool result.
+                val sensitive = clip?.description?.extras
+                    ?.getBoolean("android.content.extra.IS_SENSITIVE") == true
+                if (sensitive) {
+                    ToolResult(true, "The clipboard holds sensitive content (a password or code) and was not read.")
+                } else if (clip != null && clip.itemCount > 0) {
                     val text = clip.getItemAt(0).coerceToText(context).toString()
                     ToolResult(true, "Clipboard: $text")
                 } else {

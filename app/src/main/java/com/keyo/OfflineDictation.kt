@@ -22,6 +22,9 @@ class OfflineDictation(private val context: Context) {
 
     private val handler = Handler(Looper.getMainLooper())
     private var watchdog: Runnable? = null
+    // Set by stop(): from then on the result is due, and the RMS ticks a recognizer keeps emitting
+    // for a moment after stopListening() must not re-arm the full session timeout.
+    private var stopping = false
 
     companion object {
         /** Some OEM recognizer services are killed (or simply hang) without ever delivering
@@ -46,6 +49,7 @@ class OfflineDictation(private val context: Context) {
         onFinal: (String?) -> Unit
     ) {
         cancel()
+        stopping = false
         val r = try { SpeechRecognizer.createSpeechRecognizer(context) } catch (_: Throwable) { null }
         if (r == null) { onFinal(null); return }
         recognizer = r
@@ -70,7 +74,11 @@ class OfflineDictation(private val context: Context) {
             }
             override fun onResults(results: Bundle?) =
                 finish(results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull())
-            override fun onError(error: Int) = finish(null)
+            // A recognizer that heard the whole utterance and then failed (a flaky network,
+            // a busy service) still delivered it as interim text; that beats "Didn't catch that".
+            // Only a permission error means there never was any audio to trust.
+            override fun onError(error: Int) =
+                finish(if (error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) null else lastPartial)
             override fun onReadyForSpeech(params: Bundle?) = rearmWatchdog(SESSION_TIMEOUT_MS)
             override fun onBeginningOfSpeech() = rearmWatchdog(SESSION_TIMEOUT_MS)
             // Fires continuously while the mic is live: the clearest "the service is alive and the
@@ -91,6 +99,7 @@ class OfflineDictation(private val context: Context) {
 
     /** Finish listening; the final result still arrives via the session's onFinal. */
     fun stop() {
+        stopping = true
         try { recognizer?.stopListening() } catch (_: Throwable) {}
         // The result is due now, so shorten the watchdog: a recognizer that never answers should
         // not hold "Transcribing…" and the mic for the full session timeout.
@@ -116,7 +125,7 @@ class OfflineDictation(private val context: Context) {
     private fun rearmWatchdog(delay: Long) {
         val r = watchdog ?: return
         handler.removeCallbacks(r)
-        handler.postDelayed(r, delay)
+        handler.postDelayed(r, if (stopping) minOf(delay, FINISH_TIMEOUT_MS) else delay)
     }
 
     private fun cancelWatchdog() {

@@ -28,6 +28,13 @@ class OpenAppTool : Tool {
         val query = args.getString("app_name").lowercase().trim()
 
         val pm = context.packageManager
+        // Tools run on Main; enumerating every launcher activity and loading each one's label is
+        // a resource load from a foreign APK per app — hundreds of ms on a phone with 150 apps,
+        // on the IME's main thread. Do the matching on IO; only the launch needs Main.
+        return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { match(context, pm, query) }
+    }
+
+    private fun match(context: Context, pm: android.content.pm.PackageManager, query: String): ToolResult {
         val launchables = getLaunchableApps(pm)
 
         // 1. Exact match on label

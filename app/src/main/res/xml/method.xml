@@ -14,12 +14,12 @@
         android:isAsciiCapable="true"
         android:imeSubtypeMode="keyboard" />
     <subtype
-        android:label="Russian"
+        android:label="@string/subtype_russian"
         android:languageTag="ru-RU"
         android:imeSubtypeLocale="ru_RU"
         android:imeSubtypeMode="keyboard" />
     <subtype
-        android:label="Latvian"
+        android:label="@string/subtype_latvian"
         android:languageTag="lv-LV"
         android:imeSubtypeLocale="lv_LV"
         android:imeSubtypeMode="keyboard" />

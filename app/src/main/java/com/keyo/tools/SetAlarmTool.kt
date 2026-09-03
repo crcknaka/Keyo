@@ -7,6 +7,10 @@ import org.json.JSONObject
 
 class SetAlarmTool : Tool {
     override val name = "set_alarm"
+    // Skips the clock app's own UI (EXTRA_SKIP_UI), so the keyboard asks instead: the model can
+    // call this on its own initiative, or under a prompt injected through the clipboard.
+    override val sensitive: Boolean get() = true
+    override fun confirmSummary(args: JSONObject) = "Set an alarm for %02d:%02d%s?".format(args.optInt("hour"), args.optInt("minute"), args.optString("label").let { if (it.isEmpty()) "" else " ($it)" })
     override val uiLabel = "⏰ Alarm"
     override val uiExample = "Set an alarm for 7:30"
     override val description = "Set an alarm for a specific time (hours and minutes, 24h format)"

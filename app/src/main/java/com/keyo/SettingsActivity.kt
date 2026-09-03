@@ -51,7 +51,17 @@ class SettingsActivity : ComponentActivity() {
 
     private val requestPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { resumeTick.value++ }
+    ) { granted ->
+        resumeTick.value++
+        // Denied twice (or "don't ask again"): Android will not show the dialog any more, and the
+        // row would just sit there saying "Required". The only way forward is the app's own
+        // settings page, so go there.
+        if (!granted && !shouldShowRequestPermissionRationale(Manifest.permission.RECORD_AUDIO)) openAppSettings()
+    }
+
+    // A downloaded, verified update waiting for the "install unknown apps" permission. Kept on the
+    // activity so it survives the trip to the system settings screen and is installed on return.
+    private var pendingInstall by mutableStateOf<java.io.File?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -326,6 +336,7 @@ class SettingsActivity : ComponentActivity() {
     private fun AppearanceScreen(onBack: () -> Unit) {
         var selectedTheme by remember { mutableStateOf(KeyboardPrefs.getTheme(this@SettingsActivity)) }
         var numberRow by remember { mutableStateOf(KeyboardPrefs.isNumberRowEnabled(this@SettingsActivity)) }
+        var mini by remember { mutableStateOf(KeyboardPrefs.isMiniMode(this@SettingsActivity)) }
         var keyH by remember { mutableStateOf(KeyboardPrefs.getKeyHeight(this@SettingsActivity)) }
         var vGap by remember { mutableStateOf(KeyboardPrefs.getVGap(this@SettingsActivity)) }
         var hGap by remember { mutableStateOf(KeyboardPrefs.getHGap(this@SettingsActivity)) }
@@ -340,6 +351,10 @@ class SettingsActivity : ComponentActivity() {
 
             SectionLabel("Layout")
             Group {
+                ToggleRow("Compact keyboard", "One row — 123, Shift, space, Backspace, Enter. On the keyboard, hold the bottom-left key to toggle it", mini) {
+                    mini = it; KeyboardPrefs.setMiniMode(this@SettingsActivity, it)
+                }
+                Sep()
                 ToggleRow("Number row", "Show the 1–0 row above the letters", numberRow) {
                     numberRow = it; KeyboardPrefs.setNumberRowEnabled(this@SettingsActivity, it)
                 }
@@ -416,10 +431,13 @@ class SettingsActivity : ComponentActivity() {
 
         SubScreen("Voice & AI", onBack) {
             SectionLabel("Models")
-            ModelSelector("Transcription model", "Cleans up dictation", KeyboardPrefs.AVAILABLE_MODELS, selectedModel) { id ->
+            // Named for what they drive: `model` runs dictation cleanup AND every ✨ rewrite;
+            // `aiModel` only the hold-to-speak assistant. The old labels had Rewrite under the
+            // assistant model, so changing that picker did nothing to Rewrite.
+            ModelSelector("Dictation & rewrite model", "Tidies dictation; powers ✨ Rewrite, Translate, Continue", KeyboardPrefs.AVAILABLE_MODELS, selectedModel) { id ->
                 selectedModel = id; KeyboardPrefs.setModel(this@SettingsActivity, id); GroqApi.model = id
             }
-            ModelSelector("AI assistant model", "Powers ✨ Rewrite and hold-to-speak AI tasks", KeyboardPrefs.AVAILABLE_MODELS, selectedAiModel) { id ->
+            ModelSelector("Voice assistant model", "Runs hold-to-speak tasks and their tools (alarm, timer, open app…)", KeyboardPrefs.AVAILABLE_MODELS, selectedAiModel) { id ->
                 selectedAiModel = id; KeyboardPrefs.setAiModel(this@SettingsActivity, id); GroqApi.aiModel = id
             }
             Group {
@@ -633,7 +651,10 @@ class SettingsActivity : ComponentActivity() {
             "Quick settings" to "Long-press the period and pick the ⚙ icon.",
             "Switch language" to "Tap the 🌐 key (right of comma).",
             "Delete" to "Tap backspace for one character, hold to repeat (it speeds up to whole words), or swipe left across it to clear the whole field.",
-            "Emoji · Clipboard" to "Open them from the icons in the top bar.",
+            "Emoji · Clipboard" to "Open them from the icons in the top bar. Long-press a clip to delete it.",
+            "Cancel a recording" to "While dictating or holding ✨, slide your finger to the left and release.",
+            "Undo a glide" to "Backspace right after a glided word removes the whole word.",
+            "More symbols" to "Long-press 0–3 for ° ¹ ² ³ and $ for € £ ¥ ₽ ₹. On the 123 page, space returns to letters.",
             "Compact keyboard" to "Hold the bottom-left key (123 / ABC) to shrink the keyboard to a single row: 123, Shift, space (hold to dictate), backspace and Enter. It stays on — in every app — until you hold that key again.",
             "New line without sending" to "Tap Shift (not hold — holding arms text selection), then Enter. Note that Shift also lights up on its own at the start of a sentence; that one still sends."
         )
@@ -657,11 +678,31 @@ class SettingsActivity : ComponentActivity() {
         // Seeded from the launch check so arriving via the home banner lands straight on the
         // install button rather than making the user check for the same release twice.
         val found = pendingUpdate.value
-        // idle | checking | found | none | downloading | error
+        // idle | checking | found | none | downloading | permission | error
         var state by remember { mutableStateOf(if (found != null) "found" else "idle") }
         var release by remember { mutableStateOf(found) }
         var progress by remember { mutableIntStateOf(-1) }
         var message by remember { mutableStateOf("") }
+
+        fun tryInstall(file: java.io.File) {
+            installApk(file,
+                onNeedPermission = {
+                    pendingInstall = file
+                    state = "permission"
+                    message = "Allow Keyo to install apps on the screen that just opened, then come back here"
+                },
+                onError = { e -> state = "error"; message = e })
+        }
+        // Back from the system screen with the permission granted: finish what was started. This
+        // used to dead-end in "error" with the APK already sitting in the cache.
+        val resumed = resumeTick.value
+        LaunchedEffect(resumed) {
+            val f = pendingInstall ?: return@LaunchedEffect
+            if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.O || packageManager.canRequestPackageInstalls()) {
+                pendingInstall = null
+                tryInstall(f)
+            }
+        }
 
         Group {
             Column(Modifier.padding(16.dp)) {
@@ -672,23 +713,37 @@ class SettingsActivity : ComponentActivity() {
                     "none" -> "You're on the latest version (${BuildConfig.VERSION_NAME})"
                     "found" -> "Version ${release?.version} is available — you have ${BuildConfig.VERSION_NAME}"
                     "downloading" -> if (progress >= 0) "Downloading… $progress%" else "Downloading…"
-                    "error" -> message
+                    "permission", "error" -> message
                     else -> "Installed: ${BuildConfig.VERSION_NAME}"
                 }
                 Text(sub, fontSize = 13.sp, color = if (state == "error") Color(0xFFE57373) else textMuted)
                 Spacer(Modifier.height(12.dp))
 
-                if (state == "found") {
-                    PrimaryButton("Download and install") {
+                if (state == "found" || state == "permission") {
+                    PrimaryButton(if (state == "permission") "Install" else "Download and install") {
                         val r = release ?: return@PrimaryButton
-                        state = "downloading"; progress = -1
                         val dest = java.io.File(cacheDir, "updates/Keyo-${r.version}.apk")
-                        UpdateChecker.download(r.apkUrl, dest, onProgress = { p ->
+                        // Already downloaded and verified (the permission detour, a cancelled
+                        // installer): straight to the installer, no second download.
+                        val ready = pendingInstall?.takeIf { it.exists() } ?: dest.takeIf { it.exists() }
+                        if (ready != null) {
+                            state = "downloading"; progress = -1
+                            Thread {
+                                val problem = try { UpdateChecker.verify(ready, r) } catch (e: Exception) { e.message ?: "unreadable file" }
+                                runOnUiThread {
+                                    if (problem == null) tryInstall(ready)
+                                    else { ready.delete(); pendingInstall = null; state = "error"; message = problem }
+                                }
+                            }.start()
+                            return@PrimaryButton
+                        }
+                        state = "downloading"; progress = -1
+                        UpdateChecker.download(r, dest, onProgress = { p ->
                             runOnUiThread { progress = p }
                         }) { file, err ->
                             runOnUiThread {
                                 if (file == null) { state = "error"; message = err ?: "Download failed" }
-                                else installApk(file) { e -> state = "error"; message = e }
+                                else tryInstall(file)
                             }
                         }
                     }
@@ -710,16 +765,17 @@ class SettingsActivity : ComponentActivity() {
         }
     }
 
-    /** Hand the downloaded APK to the system installer (which asks the user to confirm). */
-    private fun installApk(file: java.io.File, onError: (String) -> Unit) {
+    /** Hand the downloaded APK to the system installer (which asks the user to confirm).
+     *  [onNeedPermission] fires instead when the one-time "install unknown apps" permission is
+     *  missing; the system screen for it has been opened by then. */
+    private fun installApk(file: java.io.File, onNeedPermission: () -> Unit, onError: (String) -> Unit) {
         try {
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O &&
                 !packageManager.canRequestPackageInstalls()) {
-                // One-time permission, granted on a system screen; come back and press again.
                 startActivity(android.content.Intent(
                     android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
                     android.net.Uri.parse("package:$packageName")))
-                onError("Allow Keyo to install apps, then press Download again")
+                onNeedPermission()
                 return
             }
             val uri = androidx.core.content.FileProvider.getUriForFile(
@@ -827,7 +883,11 @@ class SettingsActivity : ComponentActivity() {
                     ) { Text(if (testing) "Testing…" else "Test", color = textPrimary) }
                 }
                 Spacer(Modifier.height(10.dp))
-                Text("Leave empty to use the built-in default.", fontSize = 12.sp, color = textFaint)
+                Text(
+                    if (BuildConfig.GROQ_API_KEY.isNotEmpty()) "Leave empty to use the shared key built into this build."
+                    else "This build ships without a key: cloud dictation and the AI tools need your own.",
+                    fontSize = 12.sp, color = textFaint
+                )
                 Text("Get a free key at console.groq.com/keys ↗", fontSize = 12.sp, color = accent,
                     modifier = Modifier.padding(top = 2.dp).clickable { openUrl("https://console.groq.com/keys") })
             }
@@ -1049,7 +1109,7 @@ class SettingsActivity : ComponentActivity() {
 
     @Composable
     private fun ToggleRow(title: String, description: String, checked: Boolean, onChange: (Boolean) -> Unit) {
-        RowScaffold {
+        RowScaffold(onClick = { onChange(!checked) }) {
             TitleBlock(title, description, Modifier.weight(1f))
             Switch(
                 checked = checked, onCheckedChange = onChange,

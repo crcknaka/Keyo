@@ -18,10 +18,10 @@ Write-Host "Building Keyo v$name..." -ForegroundColor Cyan
 
 if ($Release) {
     & .\gradlew.bat assembleRelease
-    $apk = "app\build\outputs\apk\release\app-release.apk"
+    $apk = "app\build\outputs\apk\release\Keyo.apk"
 } else {
     & .\gradlew.bat assembleDebug
-    $apk = "app\build\outputs\apk\debug\app-debug.apk"
+    $apk = "app\build\outputs\apk\debug\Keyo-debug.apk"
 }
 
 if ($LASTEXITCODE -ne 0) {
