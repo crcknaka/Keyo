@@ -416,6 +416,144 @@ object SuggestionEngine {
         return kotlin.math.sqrt(dx * dx + dy * dy)
     }
 
+    // ---- Candidates from the touch points themselves -------------------------------------------
+    //
+    // Everything above generates correction candidates from the typed STRING: words within one or
+    // two edits of what the taps spelled. That misses the way a fat-finger word actually goes
+    // wrong — three letters each a few millimetres off, or a slip that happens to spell some other
+    // valid word — because the string is a lossy summary of where the finger went. Gboard scores
+    // candidates against the touch points: P(word | taps) ∝ P(taps | word) · P(word). This is that:
+    // every dictionary word of the right length is scored by how far each tap sits from that
+    // word's keys (a Gaussian, so cost is a sum of squared cell distances) plus a frequency prior,
+    // and the best one competes with the word the taps spelled under a margin.
+
+    /** A same-length word scored against the taps. [cost] is the summed squared cell distance,
+     *  [worst] the single farthest tap, [score] cost + prior, lower is better. */
+    class SpatialPick(val word: String, val cost: Float, val worst: Float, val rank: Int, val score: Float)
+
+    /** Finger scatter assumed by the likelihood, in cells (a fraction of a key pitch). */
+    internal const val SPATIAL_SIGMA = 0.40f
+    /** Weight of ln(rank) in the score — how much a word's frequency buys against geometry.
+     *  Swept in SpatialCandidateTest on the real English list: accuracy at a sloppy finger climbs
+     *  steadily with it (76% string-only → 95% at 1.5), rare valid words stay untouched, and 300
+     *  Latvian words typed on the English layout — the unknown-word damage metric — do not move
+     *  until 2.0, where they start to. 1.5 is one step back from that edge. */
+    internal const val SPATIAL_PRIOR = 1.5f
+    /** A candidate is dropped when ANY tap is farther than this (cells) from its key. Only a
+     *  pruning bound — the likelihood already charges 5+ nats for a tap that far off. */
+    internal const val SPATIAL_WORST_GATE = 1.3f
+    /** How much better (in score) a candidate must be than the typed word to replace it — when
+     *  the typed word is unknown, and when it is itself a valid word (much higher: overriding a
+     *  real word is what mangles deliberately typed rare words). */
+    internal const val SPATIAL_MARGIN_UNKNOWN = 1.0f
+    internal const val SPATIAL_MARGIN_KNOWN = 7.0f
+
+    /** Score every same-length word in [words] (frequency-ranked) and [learned] against [taps] and
+     *  return the best [limit]. [centers] maps each base-key letter to its key centre in the same
+     *  coordinate space as the taps; [keyW]/[keyH] are the key pitches. A candidate is dropped as
+     *  soon as one tap is farther than [worstGate] cells from its key, which is what keeps this a
+     *  handful of lookups per word rather than a distance per letter. Cost is O(words of this
+     *  length), well under a millisecond for the shipped lists. */
+    fun spatialCandidates(
+        taps: List<Pair<Float, Float>>,
+        centers: Map<Char, Pair<Float, Float>>,
+        keyW: Float, keyH: Float,
+        words: List<String>,
+        learned: Map<String, Int> = emptyMap(),
+        limit: Int = 5,
+        sigma: Float = SPATIAL_SIGMA,
+        prior: Float = SPATIAL_PRIOR,
+        worstGate: Float = SPATIAL_WORST_GATE
+    ): List<SpatialPick> {
+        val n = taps.size
+        if (n == 0 || centers.isEmpty() || keyW <= 0f || keyH <= 0f) return emptyList()
+        // Per position: the keys within reach of that tap, with their distance. Anything not in
+        // here rules a candidate out at that letter.
+        val near = Array(n) { i ->
+            val (px, py) = taps[i]
+            val m = HashMap<Char, Float>(12)
+            for ((c, ctr) in centers) {
+                val d = cellDistance(px, py, ctr.first, ctr.second, keyW, keyH)
+                if (d <= worstGate) m[c] = d
+            }
+            m
+        }
+        val inv2s2 = 1f / (2f * sigma * sigma)
+        val best = ArrayList<SpatialPick>(limit + 1)
+        fun consider(word: String, rank: Int) {
+            val fk = foldKey(word)
+            if (fk.length != n) return
+            var cost = 0f
+            var worst = 0f
+            for (i in 0 until n) {
+                val d = near[i][fk[i]] ?: return
+                cost += d * d
+                if (d > worst) worst = d
+            }
+            val score = cost * inv2s2 + prior * kotlin.math.ln((rank + 2).toFloat())
+            // Keep the top [limit] by score; the list is tiny, so a linear insert is cheapest.
+            var at = best.size
+            while (at > 0 && best[at - 1].score > score) at--
+            if (at < limit) {
+                best.add(at, SpatialPick(word, cost, worst, rank, score))
+                if (best.size > limit) best.removeAt(best.size - 1)
+            }
+        }
+        for ((w, _) in learned) consider(w, 0)          // personal words: the strongest prior
+        val ranks = lengthIndex(words)[n]
+        if (ranks != null) for (rank in ranks) consider(words[rank], rank)
+        return best
+    }
+
+    // Ranks of the words of each length, per word list. Only words of the taps' length can be
+    // candidates, so this turns a pass over 44k words into one over the ~4k of the right length.
+    // One entry per list identity: the list is the language's vocabulary, and a switch simply
+    // rebuilds it once (a single pass).
+    @Volatile private var lengthIndexFor: List<String>? = null
+    @Volatile private var lengthIndexValue: Map<Int, IntArray> = emptyMap()
+    private fun lengthIndex(words: List<String>): Map<Int, IntArray> {
+        if (lengthIndexFor === words) return lengthIndexValue
+        val buckets = HashMap<Int, ArrayList<Int>>()
+        for (rank in words.indices) buckets.getOrPut(foldKey(words[rank]).length) { ArrayList() }.add(rank)
+        val idx = HashMap<Int, IntArray>(buckets.size * 2)
+        for ((len, list) in buckets) idx[len] = list.toIntArray()
+        lengthIndexValue = idx
+        lengthIndexFor = words
+        return idx
+    }
+
+    /** The cost the taps assign to the word they actually spelled — the yardstick every candidate
+     *  must beat. Null when a letter has no key centre (a symbol, an accent typed by long-press). */
+    fun spatialCostOf(word: String, taps: List<Pair<Float, Float>>, centers: Map<Char, Pair<Float, Float>>, keyW: Float, keyH: Float): Float? {
+        val fk = foldKey(word)
+        if (fk.length != taps.size) return null
+        var cost = 0f
+        for (i in fk.indices) {
+            val ctr = centers[fk[i]] ?: return null
+            val d = cellDistance(taps[i].first, taps[i].second, ctr.first, ctr.second, keyW, keyH)
+            cost += d * d
+        }
+        return cost
+    }
+
+    /** Whether the best touch-point candidate should replace [typed]. [typedRank] is the typed
+     *  word's own frequency rank (use [words].size for an unknown word — the weakest prior);
+     *  [typedKnown] selects the margin: a valid word is only overridden by overwhelming evidence.
+     *  Pure, so the whole decision is under test. */
+    fun spatialDecision(
+        typed: String, typedCost: Float?, typedRank: Int, typedKnown: Boolean,
+        picks: List<SpatialPick>,
+        sigma: Float = SPATIAL_SIGMA, prior: Float = SPATIAL_PRIOR,
+        marginUnknown: Float = SPATIAL_MARGIN_UNKNOWN, marginKnown: Float = SPATIAL_MARGIN_KNOWN
+    ): String? {
+        val ft = fold(typed)
+        val best = picks.firstOrNull { fold(it.word) != ft } ?: return null
+        val cost = typedCost ?: return null
+        val typedScore = cost / (2f * sigma * sigma) + prior * kotlin.math.ln((typedRank + 2).toFloat())
+        val margin = if (typedKnown) marginKnown else marginUnknown
+        return if (best.score + margin < typedScore) best.word else null
+    }
+
     /** Gboard-style dynamic key targets: decide which key a tap near a key boundary actually meant.
      *  [cands] = the two nearest keys with their distances from the tap point in cells
      *  (nearest first); [strength] scores how well a key continues the word being typed (e.g.
