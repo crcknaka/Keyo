@@ -9,7 +9,7 @@ import android.content.Context
  *  - a bundled frequency word list per language (assets/dict/<lang>.txt, most-frequent first), and
  *  - the user's learned vocabulary ([UserDictionary]) which personalises and improves over time.
  *
- * The ranking/matching algorithms ([completeFrom], [correctionsFrom], [nextFrom], [editDistanceAtMost])
+ * The ranking/matching algorithms ([completeFrom], [correctionsFrom], [editDistanceAtMost])
  * are pure functions that take their data as parameters, so they are unit-tested directly without a
  * Context. The public methods just feed them the loaded dictionary + learned maps.
  */
@@ -698,13 +698,6 @@ object SuggestionEngine {
         // it, so и is the fix the finger meant. Frequency order decides only when no candidate is a
         // neighbour (a dropped or doubled letter, a transposition).
         return singles.firstOrNull { isConfidentSlip(typed, it, neighbors) } ?: singles.firstOrNull()
-    }
-
-    /** Top next-word predictions for [prev] from the learned bigram table. */
-    internal fun nextFrom(prev: String, bigrams: Map<String, Map<String, Int>>, limit: Int): List<String> {
-        if (prev.isEmpty() || limit <= 0) return emptyList()
-        val m = bigrams[prev] ?: return emptyList()
-        return m.entries.sortedByDescending { it.value }.take(limit).map { it.key }
     }
 
     /** Damerau-Levenshtein (optimal string alignment) distance between [a] and [b], capped: returns

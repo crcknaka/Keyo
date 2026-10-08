@@ -55,7 +55,6 @@ import androidx.savedstate.SavedStateRegistryOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import kotlinx.coroutines.launch
 import java.io.File
-import kotlin.math.roundToInt
 
 class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwner {
 
@@ -85,7 +84,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private var isRecordingAI = mutableStateOf(false)
     private var statusText = mutableStateOf("")
     private var isShift = mutableStateOf(false)
-    private var keyboardMode = mutableStateOf("abc") // "abc", "123", "symbols", "numpad"
+    private var keyboardMode = mutableStateOf("abc") // "abc", "123", "symbols", "numpad", "mini", "emoji", "clipboard", "rewrite"
     // The focused field's raw imeOptions. Stored whole rather than pre-digested into separate flags:
     // the Enter key's meaning is one decision made from all of them together ([EnterBehavior]), and
     // splitting it up is how the label and the behaviour drifted apart in the first place.
@@ -158,8 +157,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
      *  everywhere and no visible way back. Shown in the mini status line, which costs no width. */
     private fun showMiniExitHint() {
         val msg = "⌨ Hold 123 for the full keyboard"
-        statusText.value = msg
-        clearStatusLater(msg, 3500)
+        showStatus(msg, 3500)
     }
 
     /** Show a message that CLEARS ITSELF. The status line outranks the suggestion strip and the whole
@@ -175,8 +173,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
      *  silently blanking the spinner looks like dictation just failed. */
     private fun showDroppedDictation() {
         val msg = "🎤 Field changed — dictation dropped"
-        statusText.value = msg
-        clearStatusLater(msg, 2500)
+        showStatus(msg, 2500)
     }
 
     private fun isPasswordType(inputType: Int): Boolean {
@@ -260,7 +257,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private var lastClip = mutableStateOf("")
     private val hideClipChip = Runnable { showClipChip.value = false }
 
-    // Track C — live suggestion strip. When the user is typing a word we show suggestions here;
+    // Live suggestion strip. When the user is typing a word we show suggestions here;
     // when idle the same row shows the toolbar menu. `toolbarPinned` lets the user open the menu
     // while typing (via a small chevron) and is auto-reset once the row goes idle.
     private var suggestions = mutableStateOf<List<String>>(emptyList())
@@ -275,7 +272,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     // not on every keypress. Coalesces the commitChar + onUpdateSelection double-call and fast bursts.
     private val updateSuggestionsRunnable = Runnable { runUpdateSuggestions() }
 
-    // Track D — confirmation prompt for consequential AI actions (call / SMS). When set, a bar with
+    // Confirmation prompt for consequential AI actions (timer, alarm, clipboard). When set, a bar with
     // Confirm / Cancel appears; the assistant's tool loop suspends on `confirmDeferred` until tapped.
     private var pendingConfirm = mutableStateOf<String?>(null)
     private var confirmDeferred: kotlinx.coroutines.CompletableDeferred<Boolean>? = null
@@ -353,7 +350,6 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 SuggestionEngine.ensureLoaded(this@KeyoService, langs)
             }
         }
-        KeyboardPrefs.migratePhrasesToPinned(this)   // old quick-phrases -> pinned clips (one-time)
         clipHistory.value = KeyboardPrefs.getClipHistory(this)
         pinnedClips.value = KeyboardPrefs.getPinned(this)
         recentEmoji.value = KeyboardPrefs.getRecentEmoji(this)
@@ -387,6 +383,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         super.onCreate()
         savedStateRegistryController.performRestore(null)
         lifecycleRegistry.currentState = Lifecycle.State.CREATED
+        KeyboardPrefs.migratePhrasesToPinned(this)   // old quick-phrases -> pinned clips (one-time)
         reloadPrefs()
         KeyboardPrefs.registerChangeListener(this, prefListener)
         clipboardManager?.addPrimaryClipChangedListener(clipListener)
@@ -764,9 +761,6 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 .padding(start = 2.dp, end = 2.dp, top = 4.dp,
                          bottom = (4 + if (short) 0 else bottomOffsetDp.intValue).dp)
         ) {
-            // Dynamic top toolbar (Gboard-style). Priority: status > quick-paste chip > icons.
-            // It reads statusText itself, so status changes never recompose the key grid below.
-            // Hidden in mini mode — the whole point there is minimum height.
             // Opt-in one-line readout of what the FIELD is telling us (Settings → About). Built to
             // chase "the caret disappears after rotating in WhatsApp", which cannot be reproduced on
             // a stock EditText: it shows whether the editor still reports a sane collapsed caret
@@ -779,9 +773,12 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 Text(dbg, color = accentColor, fontSize = 9.sp,
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp))
             }
+            // Dynamic top toolbar (Gboard-style). Priority: status > quick-paste chip > icons.
+            // It reads statusText itself, so status changes never recompose the key grid below.
+            // Hidden in mini mode — the whole point there is minimum height.
             if (mode != "mini") TopToolbar(textColor, accentColor)
 
-            // Confirmation bar for consequential AI actions (call / SMS).
+            // Confirmation bar for consequential AI actions (timer, alarm, clipboard).
             val confirmText by pendingConfirm
             confirmText?.let { summary ->
                 Row(
@@ -856,7 +853,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 RewritePanel(keyHeight, keyColor, textColor, accentColor)
             } else {
 
-            // Key content area — fixed height (maxContentRows tall) so switching between
+            // Key content area — fixed height (contentRows() tall) so switching between
             // abc / 123 / symbols / numpad never resizes the keyboard. Rows sit at the
             // bottom, flush against the function row. Wrapped in a Box so one overlay can track
             // glide (swipe) gestures across all letter keys and draw the trail on top. The overlay
@@ -1058,13 +1055,13 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                             KeyButton(e, keyColor, textColor, Modifier.weight(1f)) { commitText(e) }
                         }
                     }
-                    // Row 3 — punctuation/symbols
+                    // Row 2 — punctuation/symbols
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
                         numRows[1].forEach { s ->
                             KeyButton(s, keyColor, textColor, Modifier.weight(1f)) { commitText(s) }
                         }
                     }
-                    // Row 3: =\< symbols backspace
+                    // Row 3: !?# symbols backspace
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
                         KeyButton("!?#", accentColor, Color.Black, Modifier.weight(1.3f), fontSize = modeKeyFont()) {
                             keyboardMode.value = "symbols"
@@ -1240,8 +1237,8 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 // Enter / Submit — Gboard-style: a real Enter (newline) by default, an action
                 // icon only when the field explicitly asks for one (search/send/go/next).
                 val imeOptions by fieldImeOptions
-                val isTextMode = mode == "123" || mode == "symbols" || mode == "numpad"
-                val enterKind = EnterBehavior.labelKind(imeOptions, symbolMode = isTextMode)
+                val inSymbols = mode == "123" || mode == "symbols" || mode == "numpad"
+                val enterKind = EnterBehavior.labelKind(imeOptions, symbolMode = inSymbols)
 
                 EnterKey(enterKind, accentColor, Color.Black, keyHeight, Modifier.weight(1.0f)) {
                     handleEnter()   // Shift+Enter forces a newline (Gboard)
@@ -1376,7 +1373,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                     awaitFirstDown()
                                     var longPressed = false
                                     val job = serviceScope.launch {
-                                        kotlinx.coroutines.delay(400)
+                                        kotlinx.coroutines.delay(LONG_PRESS_MS)
                                         longPressed = true
                                         startCustomRewriteRecording()
                                     }
@@ -1502,8 +1499,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         if (!secureField && !noLearn && t.isNotBlank()) {
                             KeyboardPrefs.addPinned(this@KeyoService, t)
                             pinnedClips.value = KeyboardPrefs.getPinned(this@KeyoService)
-                            statusText.value = "📌 Pinned"
-                            handler.postDelayed({ if (statusText.value.startsWith("📌")) statusText.value = "" }, 1200)
+                            showStatus("📌 Pinned", 1200)
                         }
                     })
                 Text("Edit ›", color = textColor.copy(alpha = 0.7f), fontSize = 13.sp,
@@ -1570,7 +1566,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         }
     }
 
-    // Shared space bar: tap = space, hold still = dictate, swipe = cursor slider (rotating bezel).
+    // Shared space bar: tap = space, hold still = dictate, swipe = cursor slider.
     // Used in the main keyboard and in the emoji/clipboard panels so behaviour is identical.
     @Composable
     fun SpaceKey(
@@ -1614,7 +1610,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         pendingSpaceTap = true   // a space tap is forming; the next char may flush it
 
                         val longPressJob = serviceScope.launch {
-                            kotlinx.coroutines.delay(400)
+                            kotlinx.coroutines.delay(LONG_PRESS_MS)
                             if (!cursorMode) {
                                 longPressed = true
                                 pendingSpaceTap = false   // it's a hold (dictate), not a space tap
@@ -1631,7 +1627,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                 totalDragX = change.position.x - down.position.x
                                 if (longPressed) {
                                     micDragX = totalDragX
-                                    if (micDragX < -cancelThreshold) micCancelled = true
+                                    micCancelled = micDragX < -cancelThreshold
                                 } else {
                                     if (!cursorMode && kotlin.math.abs(totalDragX) > cursorThresholdPx) {
                                         cursorMode = true
@@ -1824,7 +1820,21 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         }
     }
 
-    // Enter key with a drawn icon + press feedback (replaces the plain glyph).
+    /** Follows the pressed finger until it lifts. False when the gesture was torn down instead —
+     *  the key left the composition mid-press because focus moved or the layout changed. The caller
+     *  must then do nothing: acting would hit whatever field is focused now. */
+    private suspend fun androidx.compose.ui.input.pointer.AwaitPointerEventScope.awaitRelease(): Boolean {
+        try {
+            while (true) {
+                val c = awaitPointerEvent().changes.firstOrNull() ?: break
+                if (!c.pressed) { c.consume(); break }
+                c.consume()
+            }
+        } catch (_: kotlinx.coroutines.CancellationException) { return false }
+        return true
+    }
+
+    // Enter key with a drawn icon + press feedback.
     @Composable
     fun EnterKey(
         kind: String,
@@ -1847,14 +1857,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     awaitEachGesture {
                         awaitFirstDown()
                         pressed = true
-                        var cancelled = false
-                        try {
-                            while (true) {
-                                val c = awaitPointerEvent().changes.firstOrNull() ?: break
-                                if (!c.pressed) { c.consume(); break }
-                                c.consume()
-                            }
-                        } catch (_: kotlinx.coroutines.CancellationException) { cancelled = true }
+                        val cancelled = !awaitRelease()
                         pressed = false
                         // Only on a real finger-up. The catch swallows cancellation, so without this
                         // a key disposed mid-press — the app moves focus and the layout changes under
@@ -1906,17 +1909,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         awaitFirstDown()
                         pressed = true
                         val job = serviceScope.launch {
-                            kotlinx.coroutines.delay(400)
+                            kotlinx.coroutines.delay(LONG_PRESS_MS)
                             if (pressed) { showHint = true; performKeyFeedback() }
                         }
-                        var cancelled = false
-                        try {
-                            while (true) {
-                                val c = awaitPointerEvent().changes.firstOrNull() ?: break
-                                if (!c.pressed) { c.consume(); break }
-                                c.consume()
-                            }
-                        } catch (_: kotlinx.coroutines.CancellationException) { cancelled = true }
+                        val cancelled = !awaitRelease()
                         job.cancel()
                         pressed = false
                         val toggle = showHint
@@ -2041,21 +2037,14 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         // reached the tap handler, so trying to switch Shift OFF force-armed it ON
                         // instead — the one key where a hold does the opposite of the tap.
                         val job = serviceScope.launch {
-                            kotlinx.coroutines.delay(400)
+                            kotlinx.coroutines.delay(LONG_PRESS_MS)
                             longPressed = true
                             armSelection()
                         }
-                        try {
-                            while (true) {
-                                val e = awaitPointerEvent()
-                                val c = e.changes.firstOrNull() ?: break
-                                if (!c.pressed) { c.consume(); break }
-                                c.consume()
-                            }
-                        } catch (_: kotlinx.coroutines.CancellationException) {}
+                        val cancelled = !awaitRelease()
                         job.cancel()
                         pressed = false
-                        if (!longPressed) onClick()
+                        if (!longPressed && !cancelled) onClick()
                     }
                 }
                 .padding(horizontal = keyHGapDp.intValue.dp, vertical = gapV())
@@ -2117,7 +2106,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         // Background job for repeat delete
                         val startTime = System.currentTimeMillis()
                         val job = serviceScope.launch {
-                            kotlinx.coroutines.delay(400)
+                            kotlinx.coroutines.delay(LONG_PRESS_MS)
                             while (isPressed && !didSwipeClear) {
                                 val elapsed = System.currentTimeMillis() - startTime
                                 val byWord = elapsed > 2000
@@ -2148,7 +2137,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                 swipedClear = armed
                                 change.consume()
                             }
-                        } catch (_: kotlinx.coroutines.CancellationException) {}
+                        } catch (_: kotlinx.coroutines.CancellationException) { didSwipeClear = false }
 
                         job.cancel()
                         isPressed = false
@@ -2179,79 +2168,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         }
     }
 
-    // Alt characters map
-    private val altChars = mapOf(
-        // Russian
-        "е" to listOf("ё"), "Е" to listOf("Ё"),
-        "ь" to listOf("ъ"), "Ь" to listOf("Ъ"),
-        "и" to listOf("й"), "И" to listOf("Й"),
-        // English → accented
-        "a" to listOf("ä","à","á","â","ã","å","æ","ā"), "A" to listOf("Ä","À","Á","Â","Ã","Å","Æ","Ā"),
-        "e" to listOf("ē","è","é","ê","ë","ė","ę"), "E" to listOf("Ē","È","É","Ê","Ë","Ė","Ę"),
-        "i" to listOf("ī","ì","í","î","ï","į"), "I" to listOf("Ī","Ì","Í","Î","Ï","Į"),
-        "o" to listOf("ö","ò","ó","ô","õ","ø","ō"), "O" to listOf("Ö","Ò","Ó","Ô","Õ","Ø","Ō"),
-        "u" to listOf("ü","ù","ú","û","ū","ų"), "U" to listOf("Ü","Ù","Ú","Û","Ū","Ų"),
-        "s" to listOf("š","ś","ß"), "S" to listOf("Š","Ś"),
-        "c" to listOf("č","ç","ć"), "C" to listOf("Č","Ç","Ć"),
-        "n" to listOf("ņ","ñ","ń"), "N" to listOf("Ņ","Ñ","Ń"),
-        "z" to listOf("ž","ź","ż"), "Z" to listOf("Ž","Ź","Ż"),
-        "g" to listOf("ģ","ğ"), "G" to listOf("Ģ","Ğ"),
-        "k" to listOf("ķ"), "K" to listOf("Ķ"),
-        "l" to listOf("ļ","ł"), "L" to listOf("Ļ","Ł"),
-        "r" to listOf("ŗ"), "R" to listOf("Ŗ"),
-        "y" to listOf("ý","ÿ"), "Y" to listOf("Ý","Ÿ"),
-        "d" to listOf("đ"), "D" to listOf("Đ"),
-        // Symbols. ⚙ on the period opens Keyo settings (handled specially in KeyButton).
-        "." to listOf("?",",","!","-","⚙"),
-        "," to listOf(";","‚","„"),
-        "?" to listOf("¿","‽"),
-        "!" to listOf("¡"),
-        "'" to listOf("'","'","‛","\""),
-        "-" to listOf("–","—","_"),
-        "0" to listOf("°","∅"),
-        "1" to listOf("¹","½","⅓"),
-        "2" to listOf("²","⅔"),
-        "3" to listOf("³","¾"),
-        "$" to listOf("€","£","¥","₽","₹")
-    )
-
-    // Long-press digits for the top letter row when the dedicated number row is hidden, with a
-    // small corner hint on the key (Gboard behaviour). Looked up by lowercase key label.
-    private val topRowDigits = mapOf(
-        "q" to "1", "w" to "2", "e" to "3", "r" to "4", "t" to "5",
-        "y" to "6", "u" to "7", "i" to "8", "o" to "9", "p" to "0",
-        "й" to "1", "ц" to "2", "у" to "3", "к" to "4", "е" to "5",
-        "н" to "6", "г" to "7", "ш" to "8", "щ" to "9", "з" to "0"
-    )
-
-    // Emoji panel categories. Tab 0 = recently used; 1..n map to EMOJI_GROUPS.
-    private val EMOJI_TABS = listOf("🕘", "😀", "🐶", "🍕", "❤️", "✋")
     private var recentEmoji = mutableStateOf<List<String>>(emptyList())
-    private val EMOJI_GROUPS = listOf(
-        // Smileys
-        listOf("😀","😃","😄","😁","😆","😅","😂","🤣","😊","🙂","🙃","😉","😌","😍","🥰","😘",
-               "😋","😛","😜","🤪","😝","🤗","🤔","😐","😶","😏","😒","🙄","😬","😴","😎","🥳",
-               "😢","😭","😤","😠","😡","🤯","😱","😳","🥺","😇","🤤","😞","😔","🤥","🤧","🤒"),
-        // Animals
-        listOf("🐶","🐱","🐭","🐹","🐰","🦊","🐻","🐼","🐨","🐯","🦁","🐮","🐷","🐸","🐵","🐔",
-               "🐧","🐦","🐤","🦆","🦅","🦉","🐺","🐗","🐴","🦄","🐝","🐛","🦋","🐌","🐞","🐢",
-               "🐍","🐙","🐠","🐬","🐳","🦈","🐊","🐅","🦓","🦍","🐘","🐫","🦒","🦘","🐓","🦌"),
-        // Food
-        listOf("🍏","🍎","🍐","🍊","🍋","🍌","🍉","🍇","🍓","🍈","🍒","🍑","🥭","🍍","🥥","🥝",
-               "🍅","🥑","🍆","🥔","🥕","🌽","🌶","🥒","🥬","🥦","🧄","🧅","🍄","🥜","🍞","🥐",
-               "🧀","🍕","🍔","🍟","🌭","🌮","🌯","🍣","🍦","🍩","🍪","🎂","🍰","☕","🍺","🍷"),
-        // Hearts & symbols
-        listOf("❤️","🧡","💛","💚","💙","💜","🖤","🤍","🤎","💔","❣️","💕","💞","💓","💗","💖",
-               "💘","💝","✨","⭐","🌟","💫","⚡","🔥","💯","✅","❌","❓","❗","💤","🎉","🎊",
-               "🎁","🏆","🎯","🔔","💡","💰","📌","🔒","🔑","⏰","📅","📈","🌈","☀️","🌙","⛄"),
-        // Gestures
-        listOf("👋","🤚","✋","🖐","🖖","👌","🤌","🤏","✌️","🤞","🤟","🤘","🤙","👈","👉","👆",
-               "👇","☝️","👍","👎","✊","👊","🤛","🤜","👏","🙌","👐","🤲","🙏","💪","🦵","🦶",
-               "👂","👃","👀","🧠","👶","🧒","👦","👧","🧑","👨","👩","🧓","👴","👵","🙋","🤷")
-    )
 
-    // Spoken label for TalkBack / accessibility services. Only reached from KeyButton, i.e. for the
-    // labels a generic key can carry — every dedicated key (Enter, Backspace, Shift, Space, the
+    // Spoken label for TalkBack / accessibility services. Used for the labels a generic key
+    // (or the mode key) can carry — every other dedicated key (Enter, Backspace, Shift, Space, the
     // toolbar icons) sets its own contentDescription.
     private fun keyDescription(label: String): String = when (label) {
         "123" -> "Numbers and symbols"
@@ -2268,15 +2188,12 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
 
     // ---- AI output sanitizer -------------------------------------------------------------------
     // AI text is inserted as PLAIN TEXT, period. No italic, no bold, no markdown, no marker
-    // symbols — in ANY app (the earlier WhatsApp *…*/_…_ special case made answers italic there;
-    // before that, Unicode math glyphs looked like a font change — both removed for good).
+    // symbols — in ANY app, with no per-app exceptions.
     // The prompts already demand plain text; this strips whatever emphasis the model emits anyway:
-    // legacy ⟦b⟧/⟦i⟧ markers, markdown **bold** / *italic* / __bold__ / _italic_ / `code`,
+    // markdown **bold** / *italic* / __bold__ / _italic_ / `code`,
     // heading/quote prefixes, and a quote wrapped around the entire answer.
     private fun formatEmphasis(text: String): String {
         var t = text
-            .replace("⟦b⟧", "").replace("⟦/b⟧", "")
-            .replace("⟦i⟧", "").replace("⟦/i⟧", "")
         t = Regex("\\*\\*\\*(.+?)\\*\\*\\*", RegexOption.DOT_MATCHES_ALL).replace(t) { it.groupValues[1] }
         t = Regex("\\*\\*(.+?)\\*\\*", RegexOption.DOT_MATCHES_ALL).replace(t) { it.groupValues[1] }
         t = Regex("__(.+?)__", RegexOption.DOT_MATCHES_ALL).replace(t) { it.groupValues[1] }
@@ -2310,8 +2227,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     // ---- AI rewrite of the selected text (or the text before the cursor) ----
     private fun runRewrite(instruction: String) {
         if (secureField) {
-            statusText.value = "🔒 AI is off in password fields"
-            handler.postDelayed({ if (statusText.value.startsWith("🔒")) statusText.value = "" }, 1500)
+            showStatus("🔒 AI is off in password fields", 1500)
             return
         }
         finalizeComposing()
@@ -2320,8 +2236,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         val hadSelection = !sel.isNullOrEmpty()
         val target = if (hadSelection) sel.toString() else (ic?.getTextBeforeCursor(4000, 0)?.toString() ?: "")
         if (target.isBlank()) {
-            statusText.value = "✨ Nothing to rewrite"
-            handler.postDelayed({ if (statusText.value.startsWith("✨")) statusText.value = "" }, 1500)
+            showStatus("✨ Nothing to rewrite", 1500)
             return
         }
         keyboardMode.value = letterMode()
@@ -2343,8 +2258,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         (if (hadSelection) c.getSelectedText(0)?.toString() == target
                          else c.getTextBeforeCursor(tail.length, 0)?.toString() == tail)
                     if (!stillHere) {
-                        statusText.value = "✨ Text changed — rewrite dropped"
-                        handler.postDelayed({ if (statusText.value.startsWith("✨")) statusText.value = "" }, 2500)
+                        showStatus("✨ Text changed — rewrite dropped", 2500)
                         return@post
                     }
                     c!!.beginBatchEdit()
@@ -2360,8 +2274,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     handler.removeCallbacks(hideUndoRewrite)
                     handler.postDelayed(hideUndoRewrite, 8000)
                 } else {
-                    statusText.value = err ?: "Rewrite failed"
-                    clearStatusLater(err ?: "Rewrite failed", 2500)
+                    showStatus(err ?: "Rewrite failed", 2500)
                 }
             }
         }
@@ -2370,15 +2283,13 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     // Continue writing: append an AI-generated continuation at the cursor (does not replace).
     private fun runContinue() {
         if (secureField) {
-            statusText.value = "🔒 AI is off in password fields"
-            handler.postDelayed({ if (statusText.value.startsWith("🔒")) statusText.value = "" }, 1500)
+            showStatus("🔒 AI is off in password fields", 1500)
             return
         }
         finalizeComposing()
         val before = currentInputConnection?.getTextBeforeCursor(4000, 0)?.toString() ?: ""
         if (before.isBlank()) {
-            statusText.value = "✨ Nothing to continue"
-            handler.postDelayed({ if (statusText.value.startsWith("✨")) statusText.value = "" }, 1500)
+            showStatus("✨ Nothing to continue", 1500)
             return
         }
         keyboardMode.value = letterMode()
@@ -2388,8 +2299,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             handler.post {
                 if (res != null) {
                     if (!canCommitTo(token)) {
-                        statusText.value = "✨ Field changed — result dropped"
-                        clearStatusLater("✨ Field changed — result dropped", 2500)
+                        showStatus("✨ Field changed — result dropped", 2500)
                         return@post
                     }
                     val out = formatEmphasis(res)
@@ -2401,8 +2311,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     currentInputConnection?.commitText(sep + out, 1)
                     statusText.value = ""
                 } else {
-                    statusText.value = err ?: "Failed"
-                    clearStatusLater(err ?: "Failed", 2500)
+                    showStatus(err ?: "Failed", 2500)
                 }
             }
         }
@@ -2491,7 +2400,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         // these fields (the ✨ rewrite, the emoji and symbol pages, pasting): those
                         // are the user's explicit choice, not a slip of the thumb.
                         val longPressJob = serviceScope.launch {
-                            kotlinx.coroutines.delay(400)
+                            kotlinx.coroutines.delay(LONG_PRESS_MS)
                             val a = pressAlts
                             if (pressed && pressHasAlts && a != null && a.isNotEmpty() &&
                                 !glideActive.value && !rawKeyField()) {
@@ -2530,7 +2439,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                 }
                                 change.consume()
                             }
-                        } catch (_: kotlinx.coroutines.CancellationException) {}
+                        } catch (_: kotlinx.coroutines.CancellationException) { selectedAlt = null }
 
                         longPressJob.cancel()
                         pressed = false
@@ -2677,28 +2586,6 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
 
     /** Characters that belong to a word and so stay in the composing region. */
     private fun isWordChar(c: Char): Boolean = c.isLetter() || c == '\'' || c == '-'
-
-    // English contractions typed without the apostrophe -> canonical form (correct caps for the "I"
-    // ones). Forms that are themselves valid words (its, were, well, lets, id, ill, shed, …) are
-    // deliberately left out so a correct word is never "fixed".
-    private val enContractions = mapOf(
-        "im" to "I'm", "ive" to "I've",
-        "dont" to "don't", "cant" to "can't", "wont" to "won't",
-        "isnt" to "isn't", "arent" to "aren't", "wasnt" to "wasn't", "werent" to "weren't",
-        "havent" to "haven't", "hasnt" to "hasn't", "hadnt" to "hadn't",
-        "doesnt" to "doesn't", "didnt" to "didn't",
-        "couldnt" to "couldn't", "wouldnt" to "wouldn't", "shouldnt" to "shouldn't",
-        "mustnt" to "mustn't", "neednt" to "needn't", "aint" to "ain't",
-        "youre" to "you're", "youve" to "you've", "youll" to "you'll", "youd" to "you'd",
-        "hes" to "he's", "shes" to "she's", "hed" to "he'd",
-        "theyre" to "they're", "theyve" to "they've", "theyll" to "they'll", "theyd" to "they'd",
-        "weve" to "we've",
-        "thats" to "that's", "theres" to "there's", "whats" to "what's", "whos" to "who's",
-        "whod" to "who'd", "wheres" to "where's", "whens" to "when's", "hows" to "how's",
-        "couldve" to "could've", "shouldve" to "should've", "wouldve" to "would've",
-        "mustve" to "must've", "mightve" to "might've",
-        "yall" to "y'all", "oclock" to "o'clock"
-    )
 
     /** Commit the active composing word (if any) so the following edit starts on clean text. */
     private fun finalizeComposing() {
@@ -2892,19 +2779,11 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         return (s / keyBounds.size).coerceAtLeast(1f)
     }
 
+    /** How long a key is held before it counts as a long-press. One value for every key. */
+    private val LONG_PRESS_MS = 400L
+
     /** How far the letter hit-grid sits BELOW the keys as drawn, as a fraction of a key's height. */
     private val hitBiasY = 0.15f
-
-    // The letter rows and their side allowances, as constants: built with listOf() inside the
-    // layout they were fresh (unstable) instances on every pass, which defeated the memoization
-    // of the BoxWithConstraints content lambda and re-ran all three letter rows on every root
-    // recomposition.
-    private companion object {
-        val RU_ROWS = listOf("йцукенгшщзх", "фывапролджэ", "ячсмитьбю")
-        val EN_ROWS = listOf("qwertyuiop", "asdfghjkl", "zxcvbnm")
-        val RU_SIDES = listOf(0f, 0f, 1.3f)
-        val EN_SIDES = listOf(0f, 0.5f, 1.5f)
-    }
 
     /** The letter a touch was aiming at, correcting for the fact that a finger lands lower than the
      *  point it is aiming at (the contact patch sits behind the fingertip).
@@ -3034,144 +2913,6 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             out.add(p)
         }
         return out
-    }
-
-    /** Physical plausibility of [cand] as a SUBSTITUTION slip of [typed]: the WORST distance (in
-     *  cells — see SuggestionEngine.cellDistance) between the finger's tap and [cand]'s key, over only the positions where they
-     *  differ. Small = the finger really hovered near the other key at every differing spot.
-     *  Judged on the worst position, never the average — an average dilutes over the matching
-     *  letters and would favour a wrong substitution over a true transposition (device-verified:
-     *  "teh" was "corrected" to "ten" instead of "the"). Null when not a same-length substitution
-     *  pattern or any tap/key is missing. */
-    private fun spatialSlipCost(typed: String, cand: String, points: List<Offset>, bounds: Map<Char, Rect>): Float? {
-        if (cand.length != typed.length || typed.length != points.size || bounds.isEmpty()) return null
-        val ft = SuggestionEngine.foldKey(typed)
-        val fc = SuggestionEngine.foldKey(cand)
-        if (ft.length != fc.length) return null
-        var kwSum = 0f
-        var khSum = 0f
-        for (r in bounds.values) { kwSum += r.width; khSum += r.height }
-        val kw = (kwSum / bounds.size).coerceAtLeast(1f)
-        val kh = (khSum / bounds.size).coerceAtLeast(1f)
-        var worst = -1f
-        for (i in fc.indices) {
-            if (ft[i] == fc[i]) continue
-            val ctr = bounds[cand[i]]?.center ?: bounds[fc[i]]?.center ?: return null
-            val d = SuggestionEngine.cellDistance(points[i].x, points[i].y, ctr.x, ctr.y, kw, kh)
-            if (d > worst) worst = d
-        }
-        return if (worst < 0f) null else worst
-    }
-
-    /** Resample a polyline to exactly [n] points spaced evenly along its length (a $1-recognizer step). */
-    private fun resample(pts: List<Offset>, n: Int): List<Offset> {
-        if (pts.isEmpty()) return emptyList()
-        if (pts.size == 1) return List(n) { pts[0] }
-        var total = 0f
-        for (i in 1 until pts.size) total += (pts[i] - pts[i - 1]).getDistance()
-        if (total <= 0f) return List(n) { pts[0] }
-        val interval = total / (n - 1)
-        val out = ArrayList<Offset>(n)
-        out.add(pts[0])
-        var prev = pts[0]; var acc = 0f; var i = 1
-        while (i < pts.size && out.size < n) {
-            val curr = pts[i]; val seg = (curr - prev).getDistance()
-            if (acc + seg >= interval && seg > 0f) {
-                val t = (interval - acc) / seg
-                val np = Offset(prev.x + t * (curr.x - prev.x), prev.y + t * (curr.y - prev.y))
-                out.add(np); prev = np; acc = 0f
-            } else { acc += seg; prev = curr; i++ }
-        }
-        while (out.size < n) out.add(pts.last())
-        return out
-    }
-
-    /** Decode a glide path (window coords) into up to 3 candidate words, best first. Two channels:
-     *  a LOCATION score (the path must pass near each of the word's keys, in order) and a SHAPE score
-     *  (overall stroke similarity), with a light frequency prior. Endpoints are matched loosely
-     *  (nearest 2 keys) since the finger can land slightly off the intended first/last letter. */
-    private fun decodeGlide(
-        path: List<Offset>,
-        followers: Map<String, Int>?,
-        bounds: Map<Char, Rect>,
-        langs: List<String>
-    ): List<String> {
-        if (path.size < 2 || bounds.isEmpty() || !SuggestionEngine.isReady()) return emptyList()
-        // Self-contained over the snapshotted [bounds] so it can run on a background dispatcher
-        // while the live keyBounds keep mutating with the layout.
-        fun nearestIn(p: Offset, k: Int): List<Char> =
-            bounds.entries.sortedBy { (it.value.center - p).getDistanceSquared() }.take(k).map { it.key }
-        val firstFolds = nearestIn(path.first(), 2).map { SuggestionEngine.foldKey(it.toString())[0] }.toHashSet()
-        val lastFolds = nearestIn(path.last(), 2).map { SuggestionEngine.foldKey(it.toString())[0] }.toHashSet()
-        if (firstFolds.isEmpty() || lastFolds.isEmpty()) return emptyList()
-        val n = 32
-        val swipeR = resample(path, n)
-        var kwSum = 0f
-        for (r in bounds.values) kwSum += r.width
-        val keyW = (kwSum / bounds.size).coerceAtLeast(1f)
-        // Total finger-travel length: a long swipe means a long word. Candidates whose ideal
-        // key-to-key polyline is much shorter (or longer) than the actual path get penalised, so
-        // a deliberate long glide no longer loses to a short word sharing its first/last key.
-        var pathLen = 0f
-        for (i in 1 until path.size) pathLen += (path[i] - path[i - 1]).getDistance()
-        val words = SuggestionEngine.wordList(langs)
-        val scored = ArrayList<Pair<String, Float>>()
-        var matched = 0
-        for (rank in words.indices) {
-            val w = words[rank]
-            if (w.length < 2) continue
-            // Match on the base-key skeleton: a glide crosses base letters only, so diacritic words
-            // ("ēst", "viņš") are decoded by their e-s-t / v-i-n-s path; the dict supplies the accents.
-            val fw = SuggestionEngine.foldKey(w)
-            if (fw[0] !in firstFolds || fw[fw.length - 1] !in lastFolds) continue
-            var ok = true
-            val ideal = ArrayList<Offset>(fw.length)
-            // Collapse consecutive duplicate keys: a glide crosses a repeated letter once ("hello" is
-            // swiped h-e-l-o), so match the de-duplicated key skeleton and let the dictionary pick
-            // between e.g. "hello" and a single-l word by frequency/context.
-            var lastC = ' '
-            for (c in fw) {
-                if (c == lastC) continue
-                lastC = c
-                val ctr = bounds[c]?.center
-                if (ctr == null) { ok = false; break }
-                ideal.add(ctr)
-            }
-            if (!ok || ideal.size < 2) continue
-            val idealR = resample(ideal, n)
-            // Shape: average per-point offset between the two normalized-length strokes.
-            var shape = 0f
-            for (k in 0 until n) shape += (swipeR[k] - idealR[k]).getDistance()
-            // Location: each word key's nearest swipe point, constrained to move forward (in order).
-            var loc = 0f; var idx = 0
-            for (ctr in ideal) {
-                var best = Float.MAX_VALUE; var bi = idx
-                for (j in idx until swipeR.size) {
-                    val dd = (swipeR[j] - ctr).getDistanceSquared()
-                    if (dd < best) { best = dd; bi = j }
-                }
-                loc += kotlin.math.sqrt(best); idx = bi
-            }
-            loc /= ideal.size
-            val freq = kotlin.math.ln(1f + rank) * keyW * 0.06f   // gentle bias toward common words
-            // Path-length agreement: |actual swipe length − candidate's ideal polyline length|,
-            // normalised by the swipe length. The correct word wiggles ~20% over its ideal line
-            // (small penalty); a short word matched against a long deliberate swipe is off by
-            // 60-80% (large penalty) — this resolves the short-vs-long hesitation.
-            var idealLen = 0f
-            for (k in 1 until ideal.size) idealLen += (ideal[k] - ideal[k - 1]).getDistance()
-            val lenMismatch = keyW * 1.2f *
-                kotlin.math.abs(pathLen - idealLen) / kotlin.math.max(pathLen, 1f)
-            // loc (did the path pass near each key, in order) leads; shape (overall stroke similarity)
-            // gets a bit more weight than before to better separate same-key-set words; freq breaks ties.
-            var score = loc + 0.22f * (shape / n) + freq + lenMismatch
-            val bg = followers?.get(w) ?: 0
-            if (bg > 0) score -= keyW * (0.2f + 0.08f * minOf(bg, 5))   // learned-context boost
-            scored.add(w to score)
-            if (++matched >= 1500) break
-        }
-        if (scored.isEmpty()) return emptyList()
-        return scored.sortedBy { it.second }.map { it.first }.take(3)
     }
 
     /** Throttled live decode while the finger is still swiping: at most one decode in flight, and
@@ -3406,7 +3147,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         updateSuggestions()
     }
 
-    // ---- Track C: word suggestions / learning -------------------------------------------------
+    // ---- Word suggestions / learning ----------------------------------------------------------
 
     /** The run of word characters immediately before the cursor (the word being typed). */
     private fun currentWordBeforeCursor(): String {
@@ -4096,11 +3837,6 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         updateSuggestions()
     }
 
-    /**
-     * Tell the system which language we're typing in by switching our IME subtype. The editor's
-     * spell checker follows the active subtype's locale — without this it checks (e.g.) Russian text
-     * against English and red-underlines correct words. Best-effort; guarded for OEM quirks.
-     */
     /** Best-effort: tell the OS which language we're typing by switching our IME subtype, so the
      *  editor's spell checker can follow it. Searches ALL declared subtypes (not just the *enabled*
      *  list — on an en-US device only English is enabled, so ru/lv would never be found there).
@@ -4162,20 +3898,20 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         }
     }
 
+    private fun symbolMode(): Boolean = keyboardMode.value.let {
+        // The mini row is a letter layout, so Enter keeps the field's action there.
+        it == "123" || it == "symbols" || it == "numpad"
+    }
+
     // Enter behaviour shared by the main and mini layouts (Gboard semantics): a plain field gets a
     // newline; a field with an IME action fires it — UNLESS Shift is on, which forces a line break
     // instead (Shift+Enter). The forced break is sent as a real Shift+Enter key event, the combo
     // chat editors map to "new line, don't send" (a committed "\n" gets swallowed by such fields).
     /** True when Enter should fire the field's action (Send/Search/Go/Next) rather than break a line.
      *  Read from live state at PRESS time, never captured when the key was drawn: the key's gesture
-     *  handler outlives recomposition, so a value baked in at composition kept applying the PREVIOUS
-     *  field's rule — in a messenger that meant Enter fired the old field's action (which usually
+     *  handler outlives recomposition, so a value baked in at composition would keep applying the
+     *  PREVIOUS field's rule — in a messenger, Enter fires the old field's action (which usually
      *  just closes the keyboard) instead of sending. */
-    private fun symbolMode(): Boolean = keyboardMode.value.let {
-        // The mini row is a letter layout, so Enter keeps the field's action there.
-        it == "123" || it == "symbols" || it == "numpad"
-    }
-
     private fun enterFiresAction(): Boolean =
         EnterBehavior.firesAction(fieldImeOptions.intValue, symbolMode())
 
@@ -4261,7 +3997,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private var lastSelStart = -1
     private var lastSelEnd = -1
 
-    // ---- Debug-build field diagnostics (see the readout above the toolbar) --------------------
+    // ---- Opt-in field diagnostics (see the readout above the toolbar) --------------------
     private val debugFieldInfo = mutableStateOf("")
     private val fieldDiagOn = mutableStateOf(false)
     private var dbgStarts = 0     // how many times this field started/restarted
@@ -4321,7 +4057,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         }
     }
 
-    /** One line describing what the focused field is telling us. Debug builds only. */
+    /** One line describing what the focused field is telling us. Shown only while the Settings switch is on. */
     private fun refreshDebugInfo(tag: String) {
         if (!fieldDiagOn.value) return
         val ic = currentInputConnection
@@ -4440,8 +4176,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         isShift.value = true
         shiftIsAuto = false
         performKeyFeedback()
-        statusText.value = "⇧ Swipe space to select"
-        handler.postDelayed({ if (statusText.value.startsWith("⇧")) statusText.value = "" }, 1500)
+        showStatus("⇧ Swipe space to select", 1500)
     }
 
     private fun performUndoRewrite() {
@@ -4489,7 +4224,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private fun deleteAll() {
         finalizeComposing()
         val ic = currentInputConnection ?: return
-        // Select all (Ctrl+A) then delete
+        // Select all, then delete
         ic.performContextMenuAction(android.R.id.selectAll)
         ic.sendKeyEvent(android.view.KeyEvent(android.view.KeyEvent.ACTION_DOWN, android.view.KeyEvent.KEYCODE_DEL))
         ic.sendKeyEvent(android.view.KeyEvent(android.view.KeyEvent.ACTION_UP, android.view.KeyEvent.KEYCODE_DEL))
@@ -4618,8 +4353,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private fun startVoiceRecording() {
         try {
             if (secureField) {
-                statusText.value = "🔒 Voice is off in password fields"
-                handler.postDelayed({ if (statusText.value.startsWith("🔒")) statusText.value = "" }, 1500)
+                showStatus("🔒 Voice is off in password fields", 1500)
                 return
             }
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
@@ -4665,11 +4399,9 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                 }
                             } catch (_: Exception) {}
                             if (!ok) {
-                                statusText.value = "🎤 Field changed — dictation dropped"
-                                clearStatusLater("🎤 Field changed — dictation dropped", 2000)
+                                showStatus("🎤 Field changed — dictation dropped", 2000)
                             } else if (t.isNullOrBlank()) {
-                                statusText.value = "Didn't catch that"
-                                clearStatusLater("Didn't catch that", 2000)
+                                showStatus("Didn't catch that", 2000)
                             } else statusText.value = ""
                         }
                     }
@@ -4699,18 +4431,17 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             } catch (_: Exception) {}
             isRecording.value = false
             if (!silent) {
-                statusText.value = "✕ Cancelled"
-                handler.postDelayed({ if (statusText.value == "✕ Cancelled") statusText.value = "" }, 1500)
+                showStatus("✕ Cancelled", 1500)
             }
             return
         }
         try {
             audioRecorder.discard()   // cancelled: throw the audio away, don't write it to the cache
         } catch (_: Exception) {}
-        try { currentInputConnection?.finishComposingText() } catch (_: Exception) {}
+        finalizeComposing()
         isRecording.value = false
-        statusText.value = "✕ Cancelled"
-        handler.postDelayed({ if (statusText.value == "✕ Cancelled") statusText.value = "" }, 1500)
+        if (silent) { if (statusText.value == "🎤 Recording…") statusText.value = "" }
+        else showStatus("✕ Cancelled", 1500)
     }
 
     private fun stopVoiceRecording() {
@@ -4811,8 +4542,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                             // opened a composing region, so a finishComposingText() here could only
                             // ever close the USER's — the word they were typing while the request
                             // ran — after which the next letter re-inserted it ("helhell").
-                            statusText.value = error ?: "Transcription failed"
-                            clearStatusLater(error ?: "Transcription failed", 3000)
+                            showStatus(error ?: "Transcription failed", 3000)
                         }
                     }
                 }
@@ -4820,8 +4550,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 audioFile.delete()
                 try { currentInputConnection?.finishComposingText() } catch (_: Exception) {}
                 isRecording.value = false
-                showStatus("⚠ Recording too short")
-                clearStatusLater("⚠ Recording too short", 2000)
+                showStatus("⚠ Recording too short", 2000)
             }
         } catch (e: Exception) {
             isRecording.value = false
@@ -4839,8 +4568,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
 
     private fun startCustomRewriteRecording() {
         if (secureField) {
-            statusText.value = "🔒 AI is off in password fields"
-            handler.postDelayed({ if (statusText.value.startsWith("🔒")) statusText.value = "" }, 1500)
+            showStatus("🔒 AI is off in password fields", 1500)
             return
         }
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
@@ -4849,23 +4577,21 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             return
         }
         if (currentTargetText().isBlank()) {
-            statusText.value = "✨ Type or select text first"
-            handler.postDelayed({ if (statusText.value.startsWith("✨")) statusText.value = "" }, 1500)
+            showStatus("✨ Type or select text first", 1500)
             return
         }
         if (rewriteRecorder.start()) {
             customRecording = true
             statusText.value = "🎤 Say how to change the text…"
         } else {
-            showStatus("⚠ Failed to start recording")
-            clearStatusLater("⚠ Failed to start recording", 2000)
+            showStatus("⚠ Failed to start recording", 2000)
         }
     }
 
     private fun stopCustomRewriteRecording() {
         if (!customRecording) return
         customRecording = false
-        val f = File(cacheDir, "rewrite_voice.wav")
+        val f = File.createTempFile("rewrite_", ".wav", cacheDir)
         if (rewriteRecorder.stop(f)) {
             statusText.value = "⏳ Transcribing…"
             GroqApi.transcribe(f, dictationLangs(), whisperLangOf(currentLang.value), dictationVocabulary()) { instr, err ->
@@ -4873,23 +4599,21 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 handler.post {
                     if (!instr.isNullOrBlank()) runRewrite(instr.trim())
                     else {
-                        statusText.value = err ?: "Couldn't hear that"
-                        clearStatusLater(err ?: "Couldn't hear that", 2000)
+                        showStatus(err ?: "Couldn't hear that", 2000)
                     }
                 }
             }
         } else {
+            f.delete()
             // Too short to transcribe — don't leave "🎤 Say how to change the text…" hanging.
-            showStatus("⚠ Recording too short")
-            clearStatusLater("⚠ Recording too short", 2000)
+            showStatus("⚠ Recording too short", 2000)
         }
     }
 
     private fun startAIRecording() {
         try {
             if (secureField) {
-                statusText.value = "🔒 AI is off in password fields"
-                handler.postDelayed({ if (statusText.value.startsWith("🔒")) statusText.value = "" }, 1500)
+                showStatus("🔒 AI is off in password fields", 1500)
                 return
             }
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
@@ -4900,7 +4624,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             }
             if (aiAudioRecorder.start()) {
                 isRecordingAI.value = true
-                statusText.value = "✨ Listening for task…"
+                statusText.value = AI_LISTENING
             } else {
                 showStatus("⚠ Failed to start recording")
             }
@@ -4911,12 +4635,14 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
 
     /** [silent] for a recording the user never knowingly started (a comma pressed a shade too long):
      *  announcing "Cancelled" would report an action they didn't take, and cover the toolbar. */
+    private val AI_LISTENING = "✨ Listening for task…"
+
     private fun cancelAIRecording(silent: Boolean = false) {
         try {
             aiAudioRecorder.discard()
         } catch (_: Exception) {}
         isRecordingAI.value = false
-        if (silent) { if (statusText.value.startsWith("🤖")) statusText.value = "" }
+        if (silent) { if (statusText.value == AI_LISTENING) statusText.value = "" }
         else showStatus("✕ Cancelled", 1500)
     }
 
@@ -4925,7 +4651,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             if (!aiAudioRecorder.isActive()) return
             finalizeComposing()
 
-            val audioFile = File(cacheDir, "ai_voice_input.wav")
+            val audioFile = File.createTempFile("ai_", ".wav", cacheDir)
             if (aiAudioRecorder.stop(audioFile)) {
                 isRecordingAI.value = false
                 statusText.value = "✨ Transcribing task…"
@@ -4946,12 +4672,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                             currentInputConnection?.commitText(formatEmphasis(result), 1)
                                             statusText.value = ""
                                         } else {
-                                            statusText.value = "✨ Field changed — answer dropped"
-                                            clearStatusLater("✨ Field changed — answer dropped", 3000)
+                                            showStatus("✨ Field changed — answer dropped", 3000)
                                         }
                                     } else {
-                                        statusText.value = taskError ?: "Task failed"
-                                        clearStatusLater(taskError ?: "Task failed", 3000)
+                                        showStatus(taskError ?: "Task failed", 3000)
                                     }
                                 } catch (e: Exception) {
                                     showStatus("⚠ ${e.message}")
@@ -4960,12 +4684,12 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         }
                     } else {
                         handler.post {
-                            statusText.value = error ?: "Transcription failed"
-                            clearStatusLater(error ?: "Transcription failed", 3000)
+                            showStatus(error ?: "Transcription failed", 3000)
                         }
                     }
                 }
             } else {
+                audioFile.delete()
                 isRecordingAI.value = false
                 showStatus("⚠ Recording too short", 2000)
             }

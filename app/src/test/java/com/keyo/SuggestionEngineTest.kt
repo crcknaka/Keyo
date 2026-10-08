@@ -193,18 +193,6 @@ class SuggestionEngineTest {
         assertNull(SuggestionEngine.pickAutocorrect("tezr", listOf("test"), nb))
     }
 
-    // --- nextFrom (bigram prediction) ---
-
-    private val bigrams = mapOf("good" to mapOf("morning" to 5, "night" to 3, "luck" to 1))
-
-    @Test fun next_returnsTopFollowersByCount() {
-        assertEquals(listOf("morning", "night"), SuggestionEngine.nextFrom("good", bigrams, 2))
-    }
-
-    @Test fun next_returnsEmptyForUnknownPrev() {
-        assertTrue(SuggestionEngine.nextFrom("bad", bigrams, 3).isEmpty())
-    }
-
     // --- foldKey (glide skeleton: diacritics collapse to base keys) ---
 
     @Test fun foldKey_collapsesAllLatvianDiacritics() {

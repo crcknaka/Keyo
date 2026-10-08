@@ -12,14 +12,14 @@ interface Tool {
     val description: String
     val parameters: JSONObject  // JSON Schema for parameters
 
-    /** Short label for settings UI, e.g. "📞 Call" */
+    /** Short label for settings UI, e.g. "⏱ Timer" */
     val uiLabel: String get() = name
 
-    /** Example phrase for settings UI, e.g. "Call Mom" */
+    /** Example phrase for settings UI, e.g. "Timer for 5 minutes" */
     val uiExample: String get() = ""
 
     /**
-     * True for consequential actions (calling, texting) that should be confirmed by the user
+     * True for consequential actions (starting a timer, setting an alarm) that should be confirmed by the user
      * before they run. The keyboard shows [confirmSummary] and only executes on approval.
      */
     val sensitive: Boolean get() = false

@@ -73,11 +73,18 @@ class AudioRecorder {
             }.also { it.start() }
 
             return true
-        } catch (e: SecurityException) {
-            try { audioRecord?.release() } catch (_: Exception) {}
-            audioRecord = null
-            return false
+        } catch (_: SecurityException) {
+            return releaseFailed()
+        } catch (_: RuntimeException) {   // startRecording() refusing a busy mic
+            return releaseFailed()
         }
+    }
+
+    private fun releaseFailed(): Boolean {
+        try { audioRecord?.release() } catch (_: Exception) {}
+        audioRecord = null
+        isRecording = false
+        return false
     }
 
     /** Writes the captured audio as a WAV. False when there is nothing worth transcribing — the

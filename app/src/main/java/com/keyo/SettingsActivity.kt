@@ -275,10 +275,10 @@ class SettingsActivity : ComponentActivity() {
 
             SectionLabel("AI features — optional")
             ApiKeyGroup()
-            Hint("A free Groq key (console.groq.com/keys) unlocks fast, accurate dictation in any " +
-                "language plus the AI assistant: rewrite, translate, fix grammar and voice commands. " +
+            Hint("A free Groq key (console.groq.com/keys) unlocks fast, accurate dictation in your " +
+                "keyboard languages plus the AI assistant: rewrite, translate, fix grammar and voice commands. " +
                 "Without a key Keyo still types fine — dictation falls back to your device's " +
-                "built-in recognition and the AI tools stay off. The key never leaves this device.")
+                "built-in recognition and the AI tools stay off. The key is stored only on this device and sent only to Groq.")
         }
     }
 
@@ -651,7 +651,7 @@ class SettingsActivity : ComponentActivity() {
             "Quick settings" to "Long-press the period and pick the ⚙ icon.",
             "Switch language" to "Tap the 🌐 key (right of comma).",
             "Delete" to "Tap backspace for one character, hold to repeat (it speeds up to whole words), or swipe left across it to clear the whole field.",
-            "Emoji · Clipboard" to "Open them from the icons in the top bar. Long-press a clip to delete it.",
+            "Emoji · Clipboard" to "Open them from the icons in the top bar. Long-press a clip to delete it (unpin it first if it is pinned).",
             "Cancel a recording" to "While dictating or holding ✨, slide your finger to the left and release.",
             "Undo a glide" to "Backspace right after a glided word removes the whole word.",
             "More symbols" to "Long-press 0–3 for ° ¹ ² ³ and $ for € £ ¥ ₽ ₹. On the 123 page, space returns to letters.",

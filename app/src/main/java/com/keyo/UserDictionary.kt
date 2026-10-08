@@ -65,6 +65,7 @@ object UserDictionary {
             }
             unigram = u
             bigram = b
+            uniSnapshot = null   // a keystroke that raced the load cached the empty map
             loaded = true
         }
     }

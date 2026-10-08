@@ -74,7 +74,9 @@ object GroqApi {
         client.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) = callback(false, e.message ?: "Network error")
             override fun onResponse(call: Call, response: Response) {
-                val b = response.body?.string()
+                // A body that dies mid-read throws here, and OkHttp does not route that to onFailure.
+                val b = try { response.use { it.body?.string() } }
+                        catch (e: IOException) { callback(false, e.message ?: "Network error"); return }
                 if (response.isSuccessful) callback(true, null)
                 else callback(false, friendlyError(response.code, b))
             }
@@ -183,7 +185,8 @@ object GroqApi {
                 onDone(null, null, netError(e))
             }
             override fun onResponse(call: Call, response: Response) {
-                val responseBody = response.body?.string()
+                val responseBody = try { response.use { it.body?.string() } }
+                                   catch (e: IOException) { onDone(null, null, netError(e)); return }
                 if (response.isSuccessful && responseBody != null) {
                     try {
                         val obj = JSONObject(responseBody)
@@ -377,7 +380,8 @@ Rules:
             return content
         }
 
-        return "Too many execution steps"
+        // Thrown, not returned: a returned string is the answer, and the answer is typed into the field.
+        throw IOException("Too many steps — task stopped")
     }
 
     // Shared chat-completion call with automatic retry/back-off on 429 (rate limit) and 5xx.
@@ -404,7 +408,8 @@ Rules:
         client.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) = callback(null, netError(e))
             override fun onResponse(call: Call, response: Response) {
-                val body = response.body?.string()
+                val body = try { response.use { it.body?.string() } }
+                           catch (e: IOException) { callback(null, netError(e)); return }
                 when {
                     response.isSuccessful && body != null -> {
                         try {

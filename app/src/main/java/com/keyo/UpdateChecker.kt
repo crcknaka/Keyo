@@ -25,7 +25,7 @@ object UpdateChecker {
     }
 
     /** [sha256] is the hex digest GitHub publishes for the asset, when it does; null otherwise. */
-    data class Release(val version: String, val apkUrl: String, val notes: String, val sizeBytes: Long, val sha256: String? = null)
+    data class Release(val version: String, val apkUrl: String, val sizeBytes: Long, val sha256: String? = null)
 
     /** Compare dotted versions ("1.10" is newer than "1.9"), tolerating a leading "v" and extra parts. */
     internal fun isNewer(candidate: String, current: String): Boolean {
@@ -75,16 +75,16 @@ object UpdateChecker {
                                 }
                             }
                         }
-                        // Only ever install what GitHub serves over TLS; a redirect elsewhere is refused.
-                        if (url.isNotEmpty() && !url.startsWith("https://github.com/") &&
-                            !url.startsWith("https://objects.githubusercontent.com/")) {
+                        // The link must be GitHub's own. It redirects to GitHub's asset host, which is
+                        // not checked here — TLS, the digest and Android's signature check cover that.
+                        if (url.isNotEmpty() && !url.startsWith("https://github.com/")) {
                             callback(null, "unexpected download location"); return
                         }
                         when {
                             tag.isEmpty() || url.isEmpty() -> callback(null, "no APK in the latest release")
                             !isNewer(tag, currentVersion) -> callback(null, null)   // already up to date
                             else -> callback(
-                                Release(tag.removePrefix("v"), url, json.optString("body"), size, sha), null)
+                                Release(tag.removePrefix("v"), url, size, sha), null)
                         }
                     }
                 } catch (e: Exception) {
@@ -125,7 +125,7 @@ object UpdateChecker {
                 try {
                     response.use { r ->
                         val body = r.body
-                        if (!r.isSuccessful || body == null) { done(null, "server returned ${r.code}"); return }
+                        if (!r.isSuccessful || body == null) { dest.delete(); done(null, "server returned ${r.code}"); return }
                         val total = body.contentLength()
                         dest.parentFile?.mkdirs()
                         body.byteStream().use { input ->
@@ -147,6 +147,7 @@ object UpdateChecker {
                         if (problem != null) { dest.delete(); done(null, problem) } else done(dest, null)
                     }
                 } catch (e: Exception) {
+                    dest.delete()   // a partial file would be taken for a finished download next time
                     done(null, e.message ?: "download failed")
                 }
             }

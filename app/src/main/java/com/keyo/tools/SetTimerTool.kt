@@ -10,7 +10,12 @@ class SetTimerTool : Tool {
     // Skips the clock app's own UI (EXTRA_SKIP_UI), so the keyboard asks instead: the model can
     // call this on its own initiative, or under a prompt injected through the clipboard.
     override val sensitive: Boolean get() = true
-    override fun confirmSummary(args: JSONObject) = "Start a %d-minute timer%s?".format(maxOf(1, args.optInt("seconds") / 60), args.optString("label").let { if (it.isEmpty()) "" else " ($it)" })
+    override fun confirmSummary(args: JSONObject) = "Start a ${duration(args.optInt("seconds"))} timer%s?".format(args.optString("label").let { if (it.isEmpty()) "" else " ($it)" })
+    private fun duration(seconds: Int): String {
+        val min = seconds / 60
+        val sec = seconds % 60
+        return when { min > 0 && sec > 0 -> "${min}m ${sec}s"; min > 0 -> "${min}m"; else -> "${sec}s" }
+    }
     override val uiLabel = "⏱ Timer"
     override val uiExample = "Timer for 5 minutes"
     override val description = "Set a countdown timer for a specified duration in seconds"
@@ -37,10 +42,7 @@ class SetTimerTool : Tool {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
             context.startActivity(intent)
-            val min = seconds / 60
-            val sec = seconds % 60
-            val timeStr = if (min > 0) "${min}m ${sec}s" else "${sec}s"
-            ToolResult(true, "Timer set for $timeStr")
+            ToolResult(true, "Timer set for ${duration(seconds)}")
         } catch (e: Exception) {
             ToolResult(false, "Couldn't start timer: ${e.message}")
         }

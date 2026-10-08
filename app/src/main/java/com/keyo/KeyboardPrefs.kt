@@ -357,8 +357,6 @@ object KeyboardPrefs {
         return list.ifEmpty { listOf("en") }
     }
 
-    fun isLanguageEnabled(context: Context, code: String): Boolean = getEnabledLanguages(context).contains(code)
-
     fun setLanguageEnabled(context: Context, code: String, enabled: Boolean) {
         val current = getEnabledLanguages(context).toMutableList()
         if (enabled) {
@@ -422,11 +420,6 @@ object KeyboardPrefs {
             bg = 0xFFE8E8E8, key = 0xFFFFFFFF, accent = 0xFF6750A4, text = 0xFF1C1B1F,
             record = 0xFFB3261E, altPopupBg = 0xFFE0E0E0, altPopupKey = 0xFFD0D0D0)
     )
-
-    fun getThemeData(context: Context): KeyboardTheme {
-        val id = getTheme(context)
-        return THEMES.find { it.id == id } ?: THEMES[0]
-    }
 
     val AVAILABLE_MODELS = listOf(
         "llama-3.3-70b-versatile" to "Llama 3.3 70B (quality)",
