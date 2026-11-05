@@ -20,15 +20,23 @@ class AudioRecorder {
     // PCM is collected on a background thread while recording, then written as a WAV file.
     private var pcmData = ByteArrayOutputStream()
 
-    private companion object {
+    // While set, every captured buffer also goes straight to this file, so a process killed in the
+    // middle of a dictation still leaves the audio on disk (see SavedDictations.housekeeping).
+    private var spool: File? = null
+
+    companion object {
         /** Shortest clip worth sending: 0.25s of 16kHz 16-bit mono. A brush against the mic button
          *  used to be uploaded like any other recording, and a fraction of a second of room noise is
          *  exactly what makes a speech model invent a sentence — in whatever language it guessed.
          *  Short real words ("да", "ok") run past this comfortably. */
         const val MIN_BYTES = 16000 * 2 / 4
+
+        /** Wraps a raw PCM spool in a WAV header. */
+        fun pcmFileToWav(pcm: File, wav: File) = AudioRecorder().writeWav(wav, pcm.readBytes())
     }
 
-    fun start(): Boolean {
+    fun start(spoolTo: File? = null): Boolean {
+        spool = spoolTo
         val bufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
         if (bufferSize <= 0) return false
 
@@ -42,6 +50,7 @@ class AudioRecorder {
             if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
                 try { audioRecord?.release() } catch (_: Exception) {}
                 audioRecord = null
+                spool = null
                 return false
             }
 
@@ -50,6 +59,7 @@ class AudioRecorder {
             isRecording = true
 
             val rec = audioRecord
+            val spoolOut = try { spoolTo?.let { FileOutputStream(it) } } catch (_: Exception) { null }
             recordingThread = Thread {
                 try {
                     val buffer = ByteArray(bufferSize)
@@ -61,6 +71,7 @@ class AudioRecorder {
                             synchronized(pcmData) {
                                 pcmData.write(buffer, 0, read)
                             }
+                            try { spoolOut?.write(buffer, 0, read) } catch (_: Exception) {}
                         } else if (read < 0) break
                     }
                 } finally {
@@ -69,6 +80,7 @@ class AudioRecorder {
                     // the join (the join is a safety net, not a guarantee).
                     try { rec?.stop() } catch (_: Exception) {}
                     try { rec?.release() } catch (_: Exception) {}
+                    try { spoolOut?.close() } catch (_: Exception) {}
                 }
             }.also { it.start() }
 
@@ -84,20 +96,35 @@ class AudioRecorder {
         try { audioRecord?.release() } catch (_: Exception) {}
         audioRecord = null
         isRecording = false
+        spool?.delete()
+        spool = null
         return false
     }
 
     /** Writes the captured audio as a WAV. False when there is nothing worth transcribing — the
      *  caller shows "Recording too short" and skips the upload. */
     fun stop(outputFile: File): Boolean {
-        val pcmBytes = stopAndDrain() ?: return false
-        if (pcmBytes.size < MIN_BYTES) return false
-        return try { writeWav(outputFile, pcmBytes); true } catch (e: Exception) { false }
+        val pcmBytes = stopAndDrain()
+        val s = spool
+        spool = null
+        if (pcmBytes == null || pcmBytes.size < MIN_BYTES) { s?.delete(); return false }
+        return try {
+            writeWav(outputFile, pcmBytes)
+            s?.delete()   // only now: the WAV holds everything the spool did
+            true
+        } catch (e: Exception) { false }
     }
 
     /** Stop recording and DISCARD the audio — nothing is written to disk. Used when the user
      *  cancels a dictation: audio they asked to throw away must not linger in the cache. */
-    fun discard() { stopAndDrain() }
+    fun discard() {
+        stopAndDrain()
+        spool?.delete()
+        spool = null
+    }
+
+    /** The spool of the recording in progress, so housekeeping leaves it alone. */
+    fun activeSpool(): File? = if (isRecording) spool else null
 
     /** Stops the capture thread and returns the captured PCM (null on error). The recorder itself is
      *  stopped and released by that thread as it exits. */

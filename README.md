@@ -31,6 +31,9 @@ Typing works fully offline; the voice and AI features use the Groq API with your
 - **3 languages** — English, Russian, Latvian, each its own keyboard with its own dictionary.
   Enable the ones you want in Settings; switch with the 🌐 globe key. Latvian diacritics
   (ā č ē ģ ī ķ ļ ņ š ū ž) are on long-press and are restored by autocorrect.
+- **Offline Russian dictation** (optional) — download GigaAM v3 once (326 MB, Voice & AI settings)
+  and Russian dictation keeps working when Groq fails, is slow or there is no connection. Every
+  dictation stays on disk until it has become text, so nothing has to be said twice.
 - **Glide typing** (optional) — slide across the letters to type a word.
 - **Cursor control** — swipe the space bar to move the caret; hold Shift first to select.
 - **Clipboard history** with pinned clips, and an **emoji panel** ordered by how often you use each.
@@ -119,7 +122,7 @@ A Groq API key can be added on the same screen; typing works without it.
 | Run an AI task | Hold the comma key, speak a task, release |
 | Move the cursor | Swipe the space bar (hold Shift first to select) |
 | Delete | Tap backspace, hold to repeat, swipe left across it to clear the field |
-| Switch language | Tap the 🌐 globe |
+| Switch language | Tap the 🌐 globe, or swipe the space bar if "Swipe space to switch language" is on in Typing |
 | Numbers / symbols / emoji | Tap `123` |
 | New line in a chat | Shift + Enter |
 | Open settings | Long-press the period, pick ⚙ |
@@ -171,3 +174,7 @@ What stays on the device:
 ## License
 
 Released under the [MIT License](LICENSE).
+
+`app/libs/sherpa-onnx-2.0.1.aar` is the official
+[sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) release (Apache-2.0), sha256
+`a8d09d1d32f3eb8520482c6d3d43fae674681c5b050385967c70a3c2c9bf0ee7`.

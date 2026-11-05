@@ -47,3 +47,6 @@ keystore.properties
 # Local comparison screenshots / scratch images (not part of the project)
 orig.jpg
 keyo.jpg
+
+# The speech runtime is a vendored release AAR; everything else stays ignored.
+!app/libs/*.aar

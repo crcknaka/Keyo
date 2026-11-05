@@ -26,6 +26,7 @@ object KeyboardPrefs {
     private const val KEY_PHRASES = "quick_phrases"
     private const val KEY_RECENT_EMOJI = "recent_emoji"
     private const val KEY_DOUBLE_SPACE = "double_space_period"
+    private const val KEY_SPACE_LANG_SWIPE = "space_language_swipe"
     private const val KEY_AUTO_CAP = "auto_capitalize"
     private const val KEY_SUGGESTIONS = "suggestions_enabled"
     private const val KEY_AUTOCORRECT_TYPING = "autocorrect_typing"
@@ -60,6 +61,10 @@ object KeyboardPrefs {
 
     fun unregisterChangeListener(context: Context, l: android.content.SharedPreferences.OnSharedPreferenceChangeListener) =
         prefs(context).unregisterOnSharedPreferenceChangeListener(l)
+
+    /** Recognise Russian dictation on the device even when the cloud is reachable. */
+    fun isAlwaysLocalStt(context: Context) = prefs(context).getBoolean("always_local_stt", false)
+    fun setAlwaysLocalStt(context: Context, v: Boolean) = prefs(context).edit().putBoolean("always_local_stt", v).apply()
 
     /** Model for dictation cleanup and Rewrite. */
     fun getTextModel(context: Context): String {
@@ -297,6 +302,10 @@ object KeyboardPrefs {
     // Typing helpers
     fun isDoubleSpacePeriod(context: Context) = prefs(context).getBoolean(KEY_DOUBLE_SPACE, true)
     fun setDoubleSpacePeriod(context: Context, v: Boolean) = prefs(context).edit().putBoolean(KEY_DOUBLE_SPACE, v).apply()
+
+    /** Swiping the space bar changes language instead of moving the cursor; the globe key goes away. */
+    fun isSpaceLanguageSwipe(context: Context) = prefs(context).getBoolean(KEY_SPACE_LANG_SWIPE, false)
+    fun setSpaceLanguageSwipe(context: Context, v: Boolean) = prefs(context).edit().putBoolean(KEY_SPACE_LANG_SWIPE, v).apply()
     fun isAutoCap(context: Context) = prefs(context).getBoolean(KEY_AUTO_CAP, true)
     fun setAutoCap(context: Context, v: Boolean) = prefs(context).edit().putBoolean(KEY_AUTO_CAP, v).apply()
 
@@ -385,6 +394,13 @@ object KeyboardPrefs {
         val enabled = getEnabledLanguages(context)
         val cur = prefs(context).getString(KEY_CUR_LANG, enabled.first()) ?: enabled.first()
         return if (enabled.contains(cur)) cur else enabled.first()
+    }
+
+    /** The language [direction] steps away from [current], wrapping around (+1 next, -1 previous). */
+    fun stepLanguage(cycle: List<String>, current: String, direction: Int): String {
+        val idx = cycle.indexOf(current)
+        if (idx < 0) return cycle.first()
+        return cycle[(idx + direction).mod(cycle.size)]
     }
 
     fun setCurrentLanguage(context: Context, code: String) {

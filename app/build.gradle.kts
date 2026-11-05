@@ -35,6 +35,9 @@ android {
         versionCode = 22
         versionName = "1.9.12"
 
+        // Only arm64 phones: the other ABIs of the speech runtime would add over 100 MB.
+        ndk { abiFilters += "arm64-v8a" }
+
         buildConfigField("String", "GROQ_API_KEY", "\"$groqApiKey\"")
     }
 
@@ -101,6 +104,8 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     // Styles the inline autofill chips (Bitwarden, Google Password Manager) above the keys.
     implementation("androidx.autofill:autofill:1.3.0")
+    // On-device speech recognition (sherpa-onnx 2.0.1, official release AAR, checksum in README).
+    implementation(files("libs/sherpa-onnx-2.0.1.aar"))
 
     // org.json is part of Android. This artifact exists ONLY so the JVM unit tests can run the
     // code that uses JSONArray/JSONObject; as `implementation` it was bundled into the APK, where

@@ -3,3 +3,5 @@
 -dontwarn okhttp3.**
 -dontwarn okio.**
 -dontwarn javax.annotation.**
+# sherpa-onnx reads its config objects' fields by name from JNI.
+-keep class com.k2fsa.sherpa.onnx.** { *; }

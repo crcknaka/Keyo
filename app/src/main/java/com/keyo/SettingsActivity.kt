@@ -116,7 +116,7 @@ class SettingsActivity : ComponentActivity() {
     private val updateRecheckMs = 6L * 60 * 60 * 1000
 
     /**
-     * Asks GitHub for a newer release as soon as the app opens, so a side-loaded build announces
+     * Asks the update server for a newer release as soon as the app opens, so a side-loaded build announces
      * itself instead of waiting for someone to go digging in About.
      *
      * The throttle deliberately covers only the quiet answers: a check that found nothing is not
@@ -296,6 +296,7 @@ class SettingsActivity : ComponentActivity() {
         var autoCorrectTyping by remember { mutableStateOf(KeyboardPrefs.isAutocorrectTyping(this@SettingsActivity)) }
         var autoCap by remember { mutableStateOf(KeyboardPrefs.isAutoCap(this@SettingsActivity)) }
         var dblSpace by remember { mutableStateOf(KeyboardPrefs.isDoubleSpacePeriod(this@SettingsActivity)) }
+        var spaceLangSwipe by remember { mutableStateOf(KeyboardPrefs.isSpaceLanguageSwipe(this@SettingsActivity)) }
         var haptic by remember { mutableStateOf(KeyboardPrefs.getHapticStrength(this@SettingsActivity)) }
         var sound by remember { mutableStateOf(KeyboardPrefs.isSoundEnabled(this@SettingsActivity)) }
 
@@ -323,6 +324,10 @@ class SettingsActivity : ComponentActivity() {
                 Sep()
                 ToggleRow("Double-space → period", "Two spaces insert \". \"", dblSpace) {
                     dblSpace = it; KeyboardPrefs.setDoubleSpacePeriod(this@SettingsActivity, it)
+                }
+                Sep()
+                ToggleRow("Swipe space to switch language", "Swipe the space bar left or right; the 🌐 key goes away. Move the cursor from the 123 page; Shift + swipe still selects", spaceLangSwipe) {
+                    spaceLangSwipe = it; KeyboardPrefs.setSpaceLanguageSwipe(this@SettingsActivity, it)
                 }
             }
 
@@ -432,7 +437,7 @@ class SettingsActivity : ComponentActivity() {
                     }
                 }
             }
-            Hint("Each language is a separate keyboard with its own dictionary, so suggestions and autocorrect stay clean per language (e.g. Latvian \"cau\" → \"čau\"). Switch between enabled languages with the 🌐 key. English and Latvian share the same QWERTY layout; Latvian diacritics (ā č ē ī š ž…) are on long-press.")
+            Hint("Each language is a separate keyboard with its own dictionary, so suggestions and autocorrect stay clean per language (e.g. Latvian \"cau\" → \"čau\"). Switch between enabled languages with the 🌐 key, or by swiping the space bar if that is on in Typing. English and Latvian share the same QWERTY layout; Latvian diacritics (ā č ē ī š ž…) are on long-press.")
         }
     }
 
@@ -444,6 +449,8 @@ class SettingsActivity : ComponentActivity() {
         var instantDictation by remember { mutableStateOf(KeyboardPrefs.isInstantDictation(this@SettingsActivity)) }
 
         SubScreen("Voice & AI", onBack) {
+            SectionLabel("On-device recognition (Russian)")
+            LocalSttGroup()
             SectionLabel("Models")
             // Named for what they drive: `model` runs dictation cleanup AND every ✨ rewrite;
             // `aiModel` only the hold-to-speak assistant. The old labels had Rewrite under the
@@ -655,7 +662,7 @@ class SettingsActivity : ComponentActivity() {
     private fun HelpScreen(onBack: () -> Unit) {
         val items = listOf(
             "Dictate" to "Long-press the space bar and speak; release to insert.",
-            "Move cursor" to "Swipe left/right on the space bar.",
+            "Move cursor" to "Swipe left/right on the space bar. With \"Swipe space to switch language\" on, do this from the 123 page.",
             "Select text" to "Hold Shift, then swipe the space bar.",
             "AI task (voice)" to "Hold the comma/✨ key (left of space) and speak a command — alarm, timer, open app, search, write a message, etc.",
             "Improve text" to "Tap ✨ in the top bar: fix grammar, shorten, change tone, translate, continue writing. Works on selected text (or the whole message).",
@@ -663,7 +670,7 @@ class SettingsActivity : ComponentActivity() {
             "Caps Lock" to "Double-tap Shift; tap again to release.",
             "Accents & extra symbols" to "Long-press a letter and slide to the variant.",
             "Quick settings" to "Long-press the period and pick the ⚙ icon.",
-            "Switch language" to "Tap the 🌐 key (right of comma).",
+            "Switch language" to "Tap the 🌐 key (right of comma). With \"Swipe space to switch language\" on in Typing, swipe the space bar left or right instead.",
             "Delete" to "Tap backspace for one character, hold to repeat (it speeds up to whole words), or swipe left across it to clear the whole field.",
             "Emoji · Clipboard" to "Open them from the icons in the top bar. Long-press a clip to delete it (unpin it first if it is pinned).",
             "Cancel a recording" to "While dictating or holding ✨, slide your finger to the left and release.",
@@ -685,7 +692,7 @@ class SettingsActivity : ComponentActivity() {
         }
     }
 
-    /** Checks GitHub for a newer release and, if the user wants it, downloads and installs it.
+    /** Checks the update server for a newer release and, if the user wants it, downloads and installs it.
      *  Keyo is side-loaded, so without this there is nothing to tell anyone an update exists. */
     private fun tryInstall(file: java.io.File) {
         installApk(file,
@@ -919,6 +926,70 @@ class SettingsActivity : ComponentActivity() {
                 )
                 Text("Get a free key at console.groq.com/keys ↗", fontSize = 12.sp, color = accent,
                     modifier = Modifier.padding(top = 2.dp).clickable { openUrl("https://console.groq.com/keys") })
+            }
+        }
+    }
+
+    /** Download and control of the GigaAM model, and the recordings still waiting for text. */
+    @Composable
+    private fun LocalSttGroup() {
+        var installed by remember { mutableStateOf(LocalStt.isInstalled(this@SettingsActivity)) }
+        var alwaysLocal by remember { mutableStateOf(KeyboardPrefs.isAlwaysLocalStt(this@SettingsActivity)) }
+        var saved by remember { mutableStateOf(SavedDictations.pending(this@SettingsActivity).size) }
+        val progress by LocalSttDownload.progress
+        val failure by LocalSttDownload.error
+        val downloading = progress >= 0
+        LaunchedEffect(downloading) { installed = LocalStt.isInstalled(this@SettingsActivity) }
+        Group {
+            Column(Modifier.padding(16.dp)) {
+                Text(
+                    if (installed) "GigaAM v3 is ready. Russian dictation works without internet."
+                    else "Downloads GigaAM v3 once (${LocalStt.totalBytes / 1_000_000} MB, Wi-Fi recommended). " +
+                        "After that, Russian dictation works without internet.",
+                    fontSize = 13.sp, color = textPrimary
+                )
+                failure?.let {
+                    Text("Download stopped: $it", fontSize = 12.sp, color = textMuted, modifier = Modifier.padding(top = 6.dp))
+                }
+                Spacer(Modifier.height(10.dp))
+                when {
+                    downloading -> Text("Downloading… $progress%", color = textMuted, fontSize = 13.sp)
+                    installed -> OutlinedButton(
+                        onClick = { LocalStt.deleteModel(this@SettingsActivity); installed = false },
+                        shape = RoundedCornerShape(10.dp),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, border)
+                    ) { Text("Delete model", color = textPrimary) }
+                    else -> Button(
+                        onClick = { LocalSttDownload.start(applicationContext) },
+                        shape = RoundedCornerShape(10.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = accent)
+                    ) { Text("Download model", color = Color.White, fontWeight = FontWeight.SemiBold) }
+                }
+            }
+            if (installed) {
+                Sep()
+                ToggleRow("Always on device", "Never send Russian dictation to Groq", alwaysLocal) {
+                    alwaysLocal = it; KeyboardPrefs.setAlwaysLocalStt(this@SettingsActivity, it)
+                }
+            }
+            if (saved > 0) {
+                Sep()
+                Column(Modifier.padding(16.dp)) {
+                    Text(
+                        "Saved recordings: $saved. They are recognised automatically when the keyboard next opens, " +
+                            "and the text appears in clipboard history. Kept for 7 days.",
+                        fontSize = 13.sp, color = textPrimary
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    OutlinedButton(
+                        onClick = {
+                            SavedDictations.pending(this@SettingsActivity).forEach { it.delete() }
+                            saved = 0
+                        },
+                        shape = RoundedCornerShape(10.dp),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, border)
+                    ) { Text("Delete saved recordings", color = textPrimary) }
+                }
             }
         }
     }
@@ -1307,6 +1378,26 @@ class SettingsActivity : ComponentActivity() {
                 color = if (selected) Color.White else textMuted,
                 fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal)
         }
+    }
+}
+
+/** Lives outside the activity, so leaving Settings neither stops the download nor starts a second one. */
+private object LocalSttDownload {
+    val progress = mutableIntStateOf(-1)
+    val error = mutableStateOf<String?>(null)
+    private val main = android.os.Handler(android.os.Looper.getMainLooper())
+
+    fun start(context: android.content.Context) {
+        if (progress.intValue >= 0) return
+        progress.intValue = 0
+        error.value = null
+        Thread({
+            val problem = LocalStt.download(context) { p -> main.post { progress.intValue = p } }
+            main.post {
+                error.value = problem
+                progress.intValue = -1
+            }
+        }, "keyo-model-download").start()
     }
 }
 
