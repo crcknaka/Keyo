@@ -30,7 +30,29 @@ object SuggestionEngine {
     // lazily per language. Finds the word no matter how rare it is — NOT limited to top candidates.
     private val diacriticByLang = java.util.concurrent.ConcurrentHashMap<String, Map<String, String>>()
 
+    // Proper nouns per language: folded lowercase word -> the way it is written ("москва" ->
+    // "Москва", "сша" -> "США", "iphone" -> "iPhone"), from assets/dict/caps_<lang>.txt (built by
+    // tools/gen_caps.py). The word lists themselves are all lowercase, so without this every name,
+    // city and weekday was suggested, glided and autocorrected in lowercase.
+    private val properByLang = java.util.concurrent.ConcurrentHashMap<String, Map<String, String>>()
+
     fun isReady(): Boolean = byLang.isNotEmpty()
+
+    /** How [wordLower] is properly written when it is a name ("рига" -> "Рига"), else null. */
+    fun properCase(wordLower: String, langs: List<String>): String? {
+        val lang = langs.firstOrNull() ?: return null
+        return properByLang[lang]?.get(fold(wordLower))
+    }
+
+    /** [cand] (a lowercase dictionary word) in the case it should be shown and inserted in, given
+     *  what was [typed] in its place: SHOUTED if the user is shouting, its [proper] form if it has
+     *  one, otherwise following the typed word's capital. */
+    internal fun casedLike(typed: String, cand: String, proper: String?): String = when {
+        typed.length > 1 && typed.any { it.isUpperCase() } && typed.none { it.isLowerCase() } -> cand.uppercase()
+        proper != null -> proper
+        typed.isNotEmpty() && typed[0].isUpperCase() -> cand.replaceFirstChar { it.uppercase() }
+        else -> cand
+    }
 
     /** True once [lang]'s own dictionary is parsed. While false, vocab(lang) silently falls back to
      *  English — callers gating on this avoid English suggestions/autocorrect on e.g. a Latvian
@@ -48,6 +70,7 @@ object SuggestionEngine {
             val gone = byLang.keys.filter { it !in keepSet }
             for (lang in gone) {
                 byLang.remove(lang)
+                properByLang.remove(lang)
                 bundledBigrams.remove(lang)
                 diacriticByLang.remove(lang)
             }
@@ -85,6 +108,16 @@ object SuggestionEngine {
                     }
                 } catch (_: Exception) { /* missing model -> no bundled context for this language */ }
                 bundledBigrams[lang] = bg
+                val proper = HashMap<String, String>()
+                try {
+                    context.assets.open("dict/caps_$lang.txt").bufferedReader().useLines { seq ->
+                        seq.forEach { line ->
+                            val w = line.trim()
+                            if (w.isNotEmpty()) proper[fold(w.lowercase())] = w
+                        }
+                    }
+                } catch (_: Exception) { /* missing list -> nothing is capitalized for this language */ }
+                properByLang[lang] = proper
                 byLang[lang] = Vocab(words, folded)   // publish last: isReady/vocab see a complete pair
                 diacriticIndex(lang)   // pre-build here on the IO thread — the first word boundary
                                        // shouldn't pay a full-dict fold scan on the main thread
@@ -106,6 +139,12 @@ object SuggestionEngine {
     fun complete(prefixLower: String, langs: List<String>, learnedUni: Map<String, Int>, limit: Int = 3): List<String> {
         val v = vocab(langs) ?: return emptyList()
         return completeFrom(prefixLower, v.words, learnedUni, limit)
+    }
+
+    /** Completions of a prefix that has a slip in it — see [fuzzyCompleteFrom]. */
+    fun fuzzyComplete(prefixLower: String, langs: List<String>, learnedUni: Map<String, Int>, limit: Int = 3): List<String> {
+        val v = vocab(langs) ?: return emptyList()
+        return fuzzyCompleteFrom(prefixLower, v.words, learnedUni, limit)
     }
 
     /** Up to [limit] closest known words to [wordLower] (typo candidates), best first; empty if the
@@ -285,6 +324,53 @@ object SuggestionEngine {
             }
         }
         return out
+    }
+
+    /** Words that [prefix] ALMOST starts: longer than it, and one edit (a wrong, missing, extra or
+     *  swapped letter) away from beginning with it — "програмир" → "программировать". Learned
+     *  words first, then by frequency. For when the exact-prefix [completeFrom] comes back empty.
+     *
+     *  Only from four letters on (three letters with one of them wrong match half the dictionary),
+     *  and only words that share the first letter: a slip on the very first key is rare, and the
+     *  rule cuts the scan to the few hundred words worth an edit-distance each. */
+    internal fun fuzzyCompleteFrom(
+        prefix: String,
+        words: List<String>,
+        learnedUni: Map<String, Int>,
+        limit: Int,
+        scanLimit: Int = 20000
+    ): List<String> {
+        if (prefix.length < 4 || limit <= 0) return emptyList()
+        val fp = fold(prefix)
+        val first = fp[0]
+        val seen = HashSet<String>()
+        val out = ArrayList<String>(limit)
+        fun consider(w: String): Boolean {
+            if (w.length <= prefix.length) return false
+            val fw = fold(w)
+            if (fw[0] != first || fw.startsWith(fp)) return false
+            if (!almostStartsWith(fw, fp)) return false
+            if (seen.add(fw)) out.add(w)
+            return out.size >= limit
+        }
+        val hits = ArrayList<Map.Entry<String, Int>>(4)
+        for (e in learnedUni.entries) if (e.key.length > prefix.length && fold(e.key)[0] == first) hits.add(e)
+        if (hits.size > 1) hits.sortByDescending { it.value }
+        for (e in hits) if (consider(e.key)) return out
+        val n = minOf(scanLimit, words.size)
+        for (rank in 0 until n) if (consider(words[rank])) return out
+        return out
+    }
+
+    /** True when some prefix of [word] is exactly one edit (optimal string alignment, so a swap
+     *  of neighbours counts once) from [typed]. Such a prefix is [typed]'s length or one off it. */
+    internal fun almostStartsWith(word: String, typed: String): Boolean {
+        val n = typed.length
+        for (len in intArrayOf(n, n + 1, n - 1)) {
+            if (len < 1 || len > word.length) continue
+            if (editDistanceAtMost(typed, word.substring(0, len), 1) == 1) return true
+        }
+        return false
     }
 
     /** How deep the rank lookup below is willing to look. Rank is only ever used to compare two
@@ -656,6 +742,32 @@ object SuggestionEngine {
     internal const val SHORT_WORD_MAX_LEN = 5
     internal const val SHORT_WORD_RANK_CAP = 4000
     private const val VOWELS = "aeiouyаеёиоуыэюяāēīūàáâäèéêëìíîïòóôöùúûü"
+
+    /** What the way a word was typed says about touching it — see [typedShape]. */
+    class TypedShape(val glued: Boolean, val asTyped: Boolean, val nameLike: Boolean)
+
+    /** Reads [word] (ending at the caret, [head] being the text in front of it, null when the
+     *  editor won't say) for the signs that it must be left exactly as typed — none of this is
+     *  prose, and "fixing" it is the autocorrect damage people remember:
+     *   - a piece of something longer ([TypedShape.glued]): "sitespro.org", "@crcknaka", "#keyo",
+     *     "win10pro", "snake_case", a path. Word characters stop at the dot/digit/underscore, so
+     *     each fragment used to be judged as a word of its own;
+     *   - capitals typed past the first letter: an acronym or a brand ("НДС", "SIA", "iPhone").
+     *     A whole sentence in caps lock still gets its long words fixed — only short ones are
+     *     acronym-shaped. Together with the above: [TypedShape.asTyped];
+     *   - a short word capitalized in the MIDDLE of a sentence ([TypedShape.nameLike]): nobody
+     *     presses Shift there by accident, it is a name ("Riga", "Ilja", "Keyo"). It may still gain
+     *     its diacritics. */
+    fun typedShape(word: String, head: String?): TypedShape {
+        if (word.isEmpty()) return TypedShape(false, false, false)
+        val glue = head?.lastOrNull()
+        val glued = glue != null && (glue.isDigit() || glue in "@./\\_:#&=+~")
+        val innerCaps = word.length >= 2 && word.substring(1).any { it.isUpperCase() }
+        val shouted = innerCaps && word.length > SHORT_WORD_MAX_LEN && word.none { it.isLowerCase() }
+        val sentenceStart = head == null || head.trimEnd(' ').let { it.isEmpty() || it.last() in ".!?…\n" }
+        val nameLike = word[0].isUpperCase() && !innerCaps && !sentenceStart && word.length <= SHORT_WORD_MAX_LEN
+        return TypedShape(glued, glued || (innerCaps && !shouted), nameLike)
+    }
 
     /** Choose a correction to auto-apply for [typed] on a word boundary, or null to leave it as-is.
      *  [cands] is ranked best-first (as from [corrections]). Accepts the top single-edit candidate

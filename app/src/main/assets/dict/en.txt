@@ -37981,6 +37981,7 @@ arse
 bandstand
 betrays
 criminology
+narva
 dawns
 decade's
 doggie
@@ -39786,6 +39787,7 @@ imitated
 innermost
 insignia
 nines
+baltics
 overseer
 photoshopped
 pining
@@ -41347,6 +41349,7 @@ axs
 adityanath
 altshuler
 begum
+riga
 cavite
 chiltern
 choudhary
@@ -43130,6 +43133,7 @@ imbue
 immaculately
 immigrate
 immortalized
+klaipeda
 inconspicuous
 injunctive
 interplanetary
@@ -43905,6 +43909,8 @@ foi
 gallego
 glenda
 gopal
+sigulda
+kaunas
 heywood
 kodiak
 kunal
@@ -44235,6 +44241,15 @@ sandford
 shapiro's
 tsm
 venkatesh
+jurmala
+daugavpils
+liepaja
+ventspils
+jelgava
+valmiera
+cesis
+jugla
+latvians
 wrc
 weiser
 yew

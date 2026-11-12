@@ -1,0 +1,4 @@
+# See names_extra_ru.txt. The Baltics in English.
+Riga Jurmala Daugavpils Liepaja Ventspils Jelgava Sigulda Valmiera Cesis Jugla
+Latvia Latvian Latvians Lithuania Lithuanian Estonia Estonian Baltic Baltics
+Tallinn Vilnius Kaunas Klaipeda Narva Tartu Helsinki Stockholm

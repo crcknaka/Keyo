@@ -203,13 +203,7 @@ object KeyboardPrefs {
     }
 
     // --- Clipboard history (most-recent first) ---
-    fun getClipHistory(context: Context): List<String> {
-        val raw = prefs(context).getString(KEY_CLIPS, "[]") ?: "[]"
-        return try {
-            val arr = JSONArray(raw)
-            List(arr.length()) { arr.getString(it) }
-        } catch (_: Exception) { emptyList() }
-    }
+    fun getClipHistory(context: Context): List<String> = getList(context, KEY_CLIPS)
 
     fun addClip(context: Context, text: String) {
         if (text.isBlank()) return
@@ -229,9 +223,21 @@ object KeyboardPrefs {
     fun clearClips(context: Context) = prefs(context).edit().remove(KEY_CLIPS).apply()
 
     // --- Generic JSON string-list storage (phrases, recents, pins) ---
+    // Parsed once per stored value. The keyboard re-reads every one of these lists each time it
+    // opens AND on every preference write (the change listener reloads everything) — and the
+    // clipboard history holds whole copied texts, so that was a JSON parse of everything the user
+    // had copied lately, on the main thread, in the middle of the keyboard sliding in.
+    // SharedPreferences hands back the same String until the value is rewritten, so comparing it
+    // with the one parsed last time is an identity check in the common case.
+    private class ParsedList(val raw: String, val list: List<String>)
+    private val parsedLists = java.util.concurrent.ConcurrentHashMap<String, ParsedList>()
+
     private fun getList(context: Context, key: String): List<String> {
         val raw = prefs(context).getString(key, "[]") ?: "[]"
-        return try { val a = JSONArray(raw); List(a.length()) { a.getString(it) } } catch (_: Exception) { emptyList() }
+        parsedLists[key]?.let { if (it.raw == raw) return it.list }
+        val list = try { val a = JSONArray(raw); List(a.length()) { a.getString(it) } } catch (_: Exception) { emptyList() }
+        parsedLists[key] = ParsedList(raw, list)
+        return list
     }
     private fun putList(context: Context, key: String, list: List<String>) {
         val a = JSONArray(); list.forEach { a.put(it) }
@@ -275,11 +281,19 @@ object KeyboardPrefs {
         try { org.json.JSONObject(prefs(context).getString(KEY_EMOJI_COUNTS, "{}") ?: "{}") }
         catch (_: Exception) { org.json.JSONObject() }
 
+    private class SortedEmoji(val recency: List<String>, val countsRaw: String, val sorted: List<String>)
+    @Volatile private var sortedEmoji: SortedEmoji? = null
+
     fun getRecentEmoji(context: Context): List<String> {
         val recency = getList(context, KEY_RECENT_EMOJI)   // most-recent first
         if (recency.size < 2) return recency
+        // Same reason as [getList]: read on every keyboard open, changed only by an emoji tap.
+        val countsRaw = prefs(context).getString(KEY_EMOJI_COUNTS, "{}") ?: "{}"
+        sortedEmoji?.let { if (it.recency === recency && it.countsRaw == countsRaw) return it.sorted }
         val counts = emojiCounts(context)
-        return recency.sortedByDescending { counts.optInt(it, 0) }   // stable: ties keep recency
+        val sorted = recency.sortedByDescending { counts.optInt(it, 0) }   // stable: ties keep recency
+        sortedEmoji = SortedEmoji(recency, countsRaw, sorted)
+        return sorted
     }
 
     fun addRecentEmoji(context: Context, e: String) {

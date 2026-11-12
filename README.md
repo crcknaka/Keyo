@@ -15,8 +15,10 @@ Typing works fully offline; the voice and AI features use the Groq API with your
 
 - ⌨️ **Suggestions and autocorrect, offline** — bundled frequency dictionaries and bigram models
   for English, Russian and Latvian drive completions, next-word predictions and typo correction.
-  Corrections use where the finger actually landed, not only the letters it spelled. Backspace
-  right after a correction reverts it. Keyo learns your own words and phrases on the device.
+  Corrections use where the finger actually landed, not only the letters it spelled. Names,
+  cities and acronyms come out capitalized (Riga, Monday, США); acronyms, mid-sentence names and
+  pieces of addresses you typed on purpose are left alone. Backspace right after a correction
+  reverts it. Keyo learns your own words and phrases on the device.
 - 🎤 **Voice dictation** — hold the space bar, speak, release. Speech is transcribed by Groq
   Whisper and optionally tidied by an LLM. Without a key or a network it falls back to the
   device's built-in speech recognition.

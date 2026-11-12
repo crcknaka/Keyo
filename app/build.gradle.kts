@@ -32,8 +32,8 @@ android {
         applicationId = "com.keyo"
         minSdk = 26
         targetSdk = 35
-        versionCode = 22
-        versionName = "1.9.12"
+        versionCode = 23
+        versionName = "1.9.13"
 
         buildConfigField("String", "GROQ_API_KEY", "\"$groqApiKey\"")
     }

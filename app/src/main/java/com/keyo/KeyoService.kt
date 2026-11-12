@@ -35,6 +35,7 @@ import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.semantics.contentDescription
@@ -209,6 +210,9 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     // [glideAlts] so a wrong guess is one tap away, Backspace undoes the whole glide, and the next
     // sentence punctuation pulls back onto the word. Cleared as soon as you type past it / move away.
     private var glideWord: String? = null
+    // The glide also put a space IN FRONT of its word (it followed tapped letters directly);
+    // undoing the glide takes that space back with it.
+    private var glideAddedSpace = false
     private var glideAlts: List<String> = emptyList()
     // Set when we auto-insert a trailing space (after a suggestion tap). The next sentence
     // punctuation pulls that space back so it attaches to the word ("word " + "." -> "word.").
@@ -234,12 +238,35 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     /** Stamp "the keyboard just edited the field". onUpdateSelection uses this to tell our own
      *  callbacks from a caret move the USER made — so every path that writes to the
      *  InputConnection must call it, not just the plain keystroke ones. */
-    private fun markSelfEdit() { lastSelfEditMs = android.os.SystemClock.uptimeMillis() }
+    private fun markSelfEdit() {
+        lastSelfEditMs = android.os.SystemClock.uptimeMillis()
+        startInfoStale = true
+    }
+
+    // The EditorInfo a field sends when input STARTS carries a copy of the text around its cursor.
+    // That copy is only true until something changes: the framework hands the same cached object
+    // back when the keyboard is merely hidden and shown again, or the screen rotates — by then the
+    // user may have typed a whole message. So it is trusted only for the object a real start
+    // delivered, and only until the first edit of ours or selection change of the field's.
+    private var startInfo: android.view.inputmethod.EditorInfo? = null
+    private var startInfoStale = true
+
+    override fun onStartInput(attribute: android.view.inputmethod.EditorInfo?, restarting: Boolean) {
+        super.onStartInput(attribute, restarting)
+        if (attribute !== startInfo) { startInfo = attribute; startInfoStale = false }
+    }
     // Live glide preview: the current best guess shown above the keys while the finger is still
     // swiping (Gboard-style). Throttled: one background decode in flight, every ~6 new points.
     private val glidePreview = mutableStateOf<String?>(null)
     private var glidePreviewBusy = false
     private var glidePreviewAt = 0
+    // What the sentence expects after the word before this glide — looked up once per stroke (it
+    // costs an InputConnection read) and shared by the live preview and the final decode, so the
+    // chip above the keys shows the word that will actually be inserted.
+    private var glideContext: Map<String, Int>? = null
+    private var glideContextReady = false
+    // True while a key's long-press accent row is open; a slide along it is not a glide.
+    private var altPopupShowing = false
 
     private val clipHistory = mutableStateOf<List<String>>(emptyList())
     private val pinnedClips = mutableStateOf<List<String>>(emptyList())
@@ -247,6 +274,12 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private val isCapsLock = mutableStateOf(false)
     private var lastShiftTapMs = 0L
     private var shiftIsAuto = false   // true when Shift was turned on by auto-capitalize (not the user)
+    // Whether the capital that opens the word being composed came from auto-capitalize rather than
+    // the user's own Shift. Only a deliberate capital in mid-sentence marks a name (see
+    // SuggestionEngine.typedShape) — in a field that capitalizes every word, or after a closing
+    // quote, the keyboard itself put it there and the word is as correctable as any other.
+    private var wordCapWasAuto = false
+    private var nextCapIsAuto = false
     // Undo last AI rewrite
     private val showUndoRewrite = mutableStateOf(false)
     private var rewriteBackup = ""
@@ -515,6 +548,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     }
 
     override fun onStartInputView(info: android.view.inputmethod.EditorInfo?, restarting: Boolean) {
+        val showT0 = android.os.SystemClock.uptimeMillis()
         super.onStartInputView(info, restarting)
         lifecycleRegistry.currentState = Lifecycle.State.RESUMED
         // Load user preferences
@@ -560,7 +594,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         // revertedWords deliberately NOT cleared here: "never re-correct what I reverted" must
         // outlive the field. Some apps restart input on every keystroke, and even a plain tap into
         // the next field turned the promise into "until you look away" — "Riga" → "Rita", revert,
-        // switch field, "Riga" → "Rita" again. Reset only on a language switch (cycleLanguage).
+        // switch field, "Riga" → "Rita" again. It lives as long as the keyboard process does.
         glideWord = null
         glideAlts = emptyList()
         pendingAutoSpace = false
@@ -568,6 +602,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         pendingSpaceTap = false
         plainLetterCommitted = false
         previewKey.value = null   // a key held while the field changed must not leave its preview up
+        altPopupShowing = false
         lastSelStart = -1; lastSelEnd = -1   // caret position belongs to the field we just left
         // Cursor-update subscription — ONLY while the diagnostics switch is on. It was added to find
         // out whether an editor considers its caret visible, it did not fix anything, and it is an
@@ -604,12 +639,24 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             else -> letterMode()
         }
         syncImeSubtype(currentLang.value)   // best-effort: keep the OS subtype on our language
-        maybeAutoCapitalize()
+        maybeAutoCapitalize(if (info != null && info === startInfo && !startInfoStale) info else null)
         // Some opens land before the window insets reach our (pre-warmed) view — the keyboard
         // briefly renders squashed/clipped until they arrive. Re-request insets + a layout pass on
-        // the next frame so the correct size applies from the start.
-        window?.window?.decorView?.let { dv ->
+        // the next frame so the correct size applies from the start. Not on a RESTART: the view is
+        // already on screen with its insets, and fields that restart input on every keystroke
+        // were buying a full layout request of the keyboard per letter.
+        if (!restarting) window?.window?.decorView?.let { dv ->
             dv.post { try { dv.requestApplyInsets(); dv.requestLayout() } catch (_: Exception) {} }
+        }
+        if (!restarting && fieldDiagOn.value) {
+            // How long the keyboard itself takes to open, for the diagnostics line: the work in
+            // this callback, then the time until its next frame is on its way to the screen.
+            dbgShowWork = android.os.SystemClock.uptimeMillis() - showT0
+            dbgShowFrame = -1; dbgShowResizes = 0; dbgShowAt = showT0
+            android.view.Choreographer.getInstance().postFrameCallback {
+                dbgShowFrame = android.os.SystemClock.uptimeMillis() - showT0
+                refreshDebugInfo("shown")
+            }
         }
     }
 
@@ -620,6 +667,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     /** True while the window really blurs the app behind it — decides how opaque the sheet must be. */
     private val blurring = mutableStateOf(false)
     private var blurListener: java.util.function.Consumer<Boolean>? = null
+    private var glassBackgroundFor: android.view.Window? = null
 
     /** A key's face in the current style; accent-coloured keys stay strong in glass. */
     @Composable
@@ -637,7 +685,12 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
      */
     private fun applyWindowGlass() {
         val w = window?.window ?: return
-        if (transparency.value) w.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(android.graphics.Color.TRANSPARENT))
+        // Once per window: this runs every time the keyboard is shown, and a fresh drawable each
+        // time re-invalidated the whole decor view right as the keyboard slid in.
+        if (transparency.value && glassBackgroundFor !== w) {
+            w.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(android.graphics.Color.TRANSPARENT))
+            glassBackgroundFor = w
+        }
         if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.S) { blurring.value = false; return }
         val wm = getSystemService(android.view.WindowManager::class.java)
         val keyboardOnly = w.attributes.height != android.view.WindowManager.LayoutParams.MATCH_PARENT
@@ -835,7 +888,15 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         // Gboard genuinely does span the full width (measured 862dp of 914), and capping it left the
         // keyboard a narrow block floating mid-screen.
         val wideScreen = cfg.screenWidthDp >= 600 && !short
-        Box(modifier = Modifier.fillMaxWidth().keyboardSheet(bgColor, transparency.value, blurring.value)) {
+        Box(modifier = Modifier.fillMaxWidth()
+            .onSizeChanged { size ->
+                // Diagnostics only: count height changes right after an open (see dbgShowResizes).
+                if (size.height != dbgRootHeight) {
+                    if (dbgRootHeight != 0 && android.os.SystemClock.uptimeMillis() - dbgShowAt < 600) dbgShowResizes++
+                    dbgRootHeight = size.height
+                }
+            }
+            .keyboardSheet(bgColor, transparency.value, blurring.value)) {
         Column(
             modifier = Modifier
                 .then(if (wideScreen) Modifier.width(560.dp) else Modifier.fillMaxWidth())
@@ -1016,12 +1077,24 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                     val ch = ev.changes.firstOrNull() ?: break
                                     if (ch.id != down.id) { aborted = true; break }
                                     if (!ch.pressed) break
+                                    // The samples the system batched between two frames belong
+                                    // to the stroke too: on a 60Hz screen a fast swipe is only a
+                                    // handful of frame-rate points, and the turn at a key can
+                                    // fall between two of them.
+                                    for (h in ch.historical) points.add(h.position)
                                     points.add(ch.position)
                                     nearestKey(ch.position + glideOrigin)?.let { crossed.add(it) }
                                     if (!glide) {
-                                        if ((ch.position - down.position).getDistance() > threshold && crossed.size >= 2) {
+                                        // Not while a long-press accent row is open: sliding along
+                                        // it is choosing an accent, not gliding a word.
+                                        if (!altPopupShowing &&
+                                            (ch.position - down.position).getDistance() > threshold && crossed.size >= 2) {
                                             glide = true; glideActive.value = true
                                             pendingTapPos = null   // a glide, not a tap — drop the captured point
+                                            glideContextReady = false; glideContext = null   // fresh stroke, fresh context
+                                            // The start key's press preview would otherwise hang
+                                            // over the keyboard for the whole stroke.
+                                            previewKey.value = null
                                             glideTrail.clear(); glideTrail.addAll(points)
                                         }
                                     } else {
@@ -1034,6 +1107,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                 if (glideTrail.isNotEmpty()) glideTrail.clear()   // a snapshot write, skip it when nothing is drawn
                                 glidePreview.value = null
                                 glidePreviewAt = 0
+                                glideContextReady = false; glideContext = null
                             }
                         }
                     }
@@ -1226,13 +1300,27 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             Canvas(Modifier.matchParentSize()) {
                 val t = glideTrail
                 if (t.size > 1) {
-                    val p = Path()
-                    p.moveTo(t[0].x, t[0].y)
-                    for (i in 1 until t.size) p.lineTo(t[i].x, t[i].y)
-                    drawPath(
-                        p, color = accentColor.copy(alpha = 0.5f),
-                        style = Stroke(width = 12f, cap = StrokeCap.Round, join = StrokeJoin.Round)
-                    )
+                    // A comet tail, not the whole stroke: only the last stretch is drawn, thinning
+                    // and fading toward its old end. The full path used to stay on screen for the
+                    // length of the word, a scribble over the very keys being aimed at — and the
+                    // whole of it was rebuilt and re-stroked on every pointer event.
+                    // Measured in distance, not samples, so it is the same length at 60 and 120Hz.
+                    val tail = 150.dp.toPx()
+                    val w = 5.dp.toPx()
+                    var behind = 0f
+                    var i = t.size - 1
+                    while (i >= 1 && behind < tail) {
+                        val a = t[i - 1]; val b = t[i]
+                        val fresh = 1f - behind / tail          // 1 at the finger … 0 at the old end
+                        drawLine(
+                            color = accentColor.copy(alpha = 0.55f * fresh),
+                            start = a, end = b,
+                            strokeWidth = w * (0.35f + 0.65f * fresh),
+                            cap = StrokeCap.Round
+                        )
+                        behind += (b - a).getDistance()
+                        i--
+                    }
                 }
             }
             // Key preview — the enlarged glyph above the pressed key. Drawn HERE, inside the
@@ -2521,6 +2609,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                 !glideActive.value && !rawKeyField()) {
                                 longPressed = true
                                 showAlts = true
+                                altPopupShowing = true
                                 previewKey.value = null    // the alt row replaces the plain preview
                                 shownAlts = a              // popup shows the same list the gesture uses
                                 shownFromRight = fromRight
@@ -2540,6 +2629,9 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                                     change.consume()
                                     break
                                 }
+                                // The press became a glide: this key is no longer "held", it is
+                                // just where the stroke began — let go of the pressed look.
+                                if (pressed && glideActive.value) pressed = false
                                 // If alts are showing, detect which one the finger is on. The row is
                                 // anchored so the primary item starts above the key; near the right
                                 // edge it is reversed and extends left instead.
@@ -2559,6 +2651,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         longPressJob.cancel()
                         pressed = false
                         showAlts = false
+                        if (longPressed) altPopupShowing = false
                         shownAlts = null
                         selectedAltIdx = -1
                         previewKey.value = null
@@ -2718,6 +2811,13 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private class AutocorrectUndo(val corrected: String, val original: String, val prev: String?)
     private var autocorrectUndo: AutocorrectUndo? = null
     private val revertedWords = HashSet<String>()
+    // Keyed by language: a revert is a decision about a word IN a language ("cau" is a typo in
+    // English and a greeting in Latvian). The set used to be wiped on every language switch
+    // instead — so for anyone who types in two languages the promise lasted until the next press
+    // of the globe key: revert "Vadi", answer someone in Russian, come back, "Vadi" is "corrected"
+    // again.
+    private fun revertedKey(wordLower: String) = currentLang.value + ":" + SuggestionEngine.fold(wordLower)
+    private fun wasReverted(wordLower: String) = revertedWords.contains(revertedKey(wordLower))
 
     /**
      * The comma key that doubles as the AI button on a long press. Its own composable for the same
@@ -3039,9 +3139,10 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         val path = points.map { it + glideOrigin }   // copies the live list (still on main thread)
         val bounds = HashMap(keyBounds)
         val langs = dictLangs()
+        val followers = glideFollowers().second
         serviceScope.launch(kotlinx.coroutines.Dispatchers.Default) {
             val best = try {
-                decodeGlide(path, null, bounds, langs).firstOrNull()
+                decodeGlide(path, followers, bounds, langs).firstOrNull()
             } catch (_: Throwable) { null }
             kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
                 glidePreviewBusy = false
@@ -3050,21 +3151,46 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         }
     }
 
+    /** The word the glide follows, and what the sentence expects after it. The start key has already
+     *  dropped its letter on touch-down, so the run of letters before the caret is that letter —
+     *  plus, when the glide began right after tapped letters with no space, the tapped word itself:
+     *  then THAT is the previous word. Read once per stroke (see [glideContext]). */
+    private var glidePrev: String? = null
+    private var glideAttached = false
+    private fun glideFollowers(): Pair<String?, Map<String, Int>?> {
+        if (!glideContextReady) {
+            val run = currentWordBeforeCursor()
+            // The composing buffer says the same thing when the editor won't answer the read.
+            glideAttached = run.length > 1 || composing.length > 1
+            glidePrev = when {
+                run.length > 1 -> run.dropLast(1)
+                composing.length > 1 -> composing.substring(0, composing.length - 1)
+                else -> wordBefore(run)
+            }
+            glideContext = glidePrev?.lowercase()?.let {
+                SuggestionEngine.followerWeights(it, dictLangs(), UserDictionary.bigrams())
+            }
+            glideContextReady = true
+        }
+        return glidePrev to glideContext
+    }
+
     /** Finish a glide: insert the decoded word + an auto-space (Gboard-style) and offer the alternates
      *  in the suggestion strip so a wrong guess is one tap away. [localPath] is key-grid-local coords. */
     private fun commitGlide(localPath: List<Offset>) {
         if (secureField || fieldNoSuggestions) return
-        val prev = wordBefore(currentWordBeforeCursor())   // word before the start key's dropped letter
-        // Snapshot main-thread state, then decode on a background dispatcher — the decoder resamples
-        // hundreds of candidate polylines and would jank the UI right at finger-up.
+        // Context: words that tend to follow [prev] (bundled model + what the user has typed after
+        // it) get a boost, so common phrases win over equally-shaped but unrelated words.
+        val (prev, followers) = glideFollowers()
+        // Tapped letters, then a glide with no space between: the glide is a NEW word (as in
+        // Gboard), so a space goes in front of it. It used to replace the tapped letters outright —
+        // "не" + glide "знаю" left just "знаю".
+        val attached = glideAttached
+        // Snapshot main-thread state, then decode on a background dispatcher — the decoder scores
+        // hundreds of candidate words and would jank the UI right at finger-up.
         val path = localPath.map { it + glideOrigin }
         val bounds = HashMap(keyBounds)
         val langs = dictLangs()
-        // Context: words the user has actually typed/glided after [prev] get a boost, so common
-        // phrases win over equally-shaped but unrelated words.
-        val followers = prev?.lowercase()?.let {
-            SuggestionEngine.followerWeights(it, langs, UserDictionary.bigrams())
-        }
         val composingBefore = composing.toString()
         // Did the start key's letter land as plain committed text (mid-word) instead of in the
         // composing region? Then it isn't covered by the setComposingText replace below.
@@ -3081,9 +3207,19 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 // The user typed/deleted while we were decoding — don't splice a stale word in.
                 if (composing.toString() != composingBefore) return@withContext
                 val ic = currentInputConnection ?: return@withContext
-                val cap = composing.isNotEmpty() && composing[0].isUpperCase()
-                fun cased(s: String) = if (cap) s.replaceFirstChar { it.uppercaseChar() } else s
+                // The start key's letter carries the case the word should have (auto-capitalize
+                // or a manual Shift was applied to it on touch-down).
+                val cap = composing.isNotEmpty() && composing[composing.length - 1].isUpperCase()
+                val allCaps = isCapsLock.value
+                fun cased(s: String): String {
+                    if (allCaps) return s.uppercase()
+                    val w = SuggestionEngine.properCase(s, langs) ?: s      // "рига" -> "Рига"
+                    return if (cap) w.replaceFirstChar { it.uppercaseChar() } else w
+                }
                 val word = cased(cands[0])
+                // Whatever was tapped before the start letter stays, as its own word.
+                val lead = if (composing.length > 1) composing.substring(0, composing.length - 1) else ""
+                val sep = if (attached) " " else ""
                 composing.setLength(0)
                 // The glide's own edits are ours: without this stamp the selection updates they
                 // produce look like a user caret move (the last keystroke was the start key, one
@@ -3095,7 +3231,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     // region and setComposingText replaces it; when it was committed plainly (glide
                     // started with the caret right before a word) it has to be deleted by hand.
                     if (dropStartLetter) ic.deleteSurroundingText(1, 0)
-                    ic.setComposingText(word, 1)
+                    ic.setComposingText(lead + sep + word, 1)
                     ic.finishComposingText()
                     composing.clear()
                     plainLetterCommitted = false
@@ -3105,6 +3241,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 isShift.value = false; shiftIsAuto = false
                 autocorrectUndo = null
                 glideWord = word
+                glideAddedSpace = attached
                 glideAlts = cands.map { cased(it) }.distinct()
                 // Learn the phrase (prev -> word) so context re-ranking improves over time. Like
                 // typing, a glide doesn't add the word itself to the dictionary (bumpUnigram =
@@ -3159,6 +3296,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             maybeAutoCapitalize()
             if (isShift.value && shiftIsAuto) {
                 isShift.value = false; shiftIsAuto = false
+                nextCapIsAuto = true
                 commitChar(char.uppercaseChar())
                 return
             }
@@ -3225,6 +3363,8 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             // re-add it — which, racing a just-committed space during fast typing, ate the space
             // ("чау как" -> "чаукак"). Continuing a word just appends a new composing run; finishWord
             // still autocorrects the whole word on the next boundary via currentWordBeforeCursor.
+            if (composing.isEmpty()) wordCapWasAuto = ch.isUpperCase() && (shiftIsAuto || nextCapIsAuto)
+            nextCapIsAuto = false
             composing.append(ch)
             recordTap(ch)   // remember where the finger landed, for coordinate spatial autocorrect
             ic?.setComposingText(composing.toString(), 1)
@@ -3285,11 +3425,16 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     }
 
     /** The word preceding [currentWord] (text before the cursor still ends with currentWord). */
-    private fun wordBefore(currentWord: String): String? {
+    private fun wordBefore(currentWord: String): String? =
+        textBeforeWord(currentWord)?.let { trailingWord(it.trimEnd()) }
+
+    /** Everything (up to ~a line) in front of [currentWord], which must end at the caret; null when
+     *  the editor won't say. One read answers three questions about a word: what word came before
+     *  it, what character it is glued to, and whether it opens a sentence. */
+    private fun textBeforeWord(currentWord: String): String? {
         val before = currentInputConnection?.getTextBeforeCursor(96, 0)?.toString() ?: return null
         if (!before.endsWith(currentWord)) return null
-        val head = before.dropLast(currentWord.length).trimEnd()
-        return trailingWord(head)
+        return before.dropLast(currentWord.length)
     }
 
     /** When the text before the cursor ends with "<word> " (single space), returns that word. */
@@ -3368,6 +3513,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             val prev = wordBeforeTrailingSpace()
             val nexts = if (prev != null)
                 SuggestionEngine.nextWords(prev.lowercase(), langs, UserDictionary.bigrams(), 3)
+                    .map { SuggestionEngine.properCase(it, langs) ?: it }
             else emptyList()
             // Right after an autocorrect: surface the original word as a one-tap revert (Gboard
             // underlines the corrected word; a strip chip is deterministic in every editor).
@@ -3388,7 +3534,15 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         // Snapshot everything the background pass needs: the learned maps are mutated on the main
         // thread, and the tap points / key bounds change with the layout — copies keep it race-free.
         val uni = UserDictionary.unigrams()   // an immutable snapshot — see UserDictionary.unigrams
-        val prevW = wordBefore(word)
+        val head = textBeforeWord(word)
+        val prevW = head?.let { trailingWord(it.trimEnd()) }
+        // The bold chip promises what Space will do. Where Space will leave the word alone
+        // (autocorrect off, or a word typed the way names, acronyms and addresses are), the typed
+        // word stays the default and the fixes are just taps on offer.
+        val autoCapped = wordCapWasAuto && composing.length == word.length
+        val keepTyped = !autocorrectTypingOn ||
+            SuggestionEngine.typedShape(word, head).let { it.asTyped || (it.nameLike && !autoCapped) } ||
+            wasReverted(word.lowercase())
         val prefer = if (prevW != null)
             SuggestionEngine.followerWeights(prevW.lowercase(), langs, UserDictionary.bigrams()).keys.toSet()
         else emptySet()
@@ -3397,7 +3551,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         val prevLower = prevW?.lowercase()
         serviceScope.launch(kotlinx.coroutines.Dispatchers.Default) {
             val result = try {
-                computeSuggestions(word, langs, uni, prefer, prevLower, pts, bounds)
+                computeSuggestions(word, langs, uni, prefer, prevLower, pts, bounds, keepTyped)
             } catch (e: Throwable) {
                 android.util.Log.e("Keyo", "computeSuggestions failed", e)
                 emptyList<String>() to null
@@ -3423,10 +3577,17 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         prefer: Set<String>,
         prevLower: String?,
         pts: List<Offset>?,
-        bounds: Map<Char, Rect>?
+        bounds: Map<Char, Rect>?,
+        keepTyped: Boolean = false
     ): Pair<List<String>, String?> {
         val lower = word.lowercase()
         val known = SuggestionEngine.isKnown(lower, langs, uni)
+        // Every candidate is a lowercase dictionary word; show it the way it is written.
+        fun shown(cand: String) =
+            SuggestionEngine.casedLike(word, cand, SuggestionEngine.properCase(cand.lowercase(), langs))
+        // The typed word is itself a name in lowercase ("рига"): Space will capitalize it, so the
+        // strip says so.
+        val properSelf = if (!keepTyped && word.length >= 3) shown(lower).takeIf { it != word } else null
         // Fetch a few extra completions, then let sentence context pick the top ones: bigram
         // followers of the previous word first, plus the Russian number-agreement nudge
         // ("какие иде…" -> "идеи", not the globally-more-frequent "идея").
@@ -3436,6 +3597,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         val list = LinkedHashSet<String>()
         list.add(word)
         var primary: String? = null
+        if (properSelf != null) { list.add(properSelf); primary = properSelf }
         if (comp.isNotEmpty()) {
             // Valid prefix -> mid-typing: offer completions; default to the top one unless the word
             // is already a complete known word (then leave what you typed as the default).
@@ -3456,11 +3618,12 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 }
             }
             if (corrPrimary != null) {
-                primary = matchCase(word, corrPrimary)
-                list.add(primary)
+                val fix = shown(corrPrimary)
+                list.add(fix)
+                if (!keepTyped) primary = fix
             }
-            comp.forEach { list.add(matchCase(word, it)) }
-            if (primary == null) primary = if (known) word else matchCase(word, comp[0])
+            comp.forEach { list.add(shown(it)) }
+            if (primary == null) primary = if (known) word else shown(comp[0])
         } else if (!known) {
             // No completions and not a known word -> likely a typo. Offer corrections like Gboard:
             // [typed | best correction (bold) | a longer form of it]. Space applies the best one.
@@ -3476,11 +3639,25 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 }.sortedBy { it.second }.map { it.first }
             }
             if (corr.isNotEmpty()) {
-                primary = matchCase(word, corr[0])
-                list.add(primary)
+                val fix = shown(corr[0])
+                list.add(fix)
+                primary = if (keepTyped) word else fix
                 SuggestionEngine.complete(corr[0], langs, uni, 2).firstOrNull { it != corr[0] }
-                    ?.let { list.add(matchCase(word, it)) }
-                corr.drop(1).forEach { list.add(matchCase(word, it)) }
+                    ?.let { list.add(shown(it)) }
+                corr.drop(1).forEach { list.add(shown(it)) }
+            }
+            // Still room: the letters so far are not a word, start no word and are near no word —
+            // which is simply what a LONG word looks like a few letters after a slip
+            // ("програмир", on the way to "программировать"). The strip used to go blank from the
+            // slip until the word was nearly finished. Offer the words these letters almost start.
+            if (list.size < 3) {
+                val fuzzy = SuggestionEngine.rankCompletions(
+                    SuggestionEngine.fuzzyComplete(lower, langs, uni, 6), prevLower, prefer)
+                for (f in fuzzy) {
+                    if (list.size >= 3) break
+                    val shown = shown(f)
+                    if (list.add(shown) && primary == null && !keepTyped) primary = shown
+                }
             }
         }
         return list.take(3) to (primary ?: word)
@@ -3506,7 +3683,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         val n = undo.corrected.length + 1
         val before = ic.getTextBeforeCursor(n, 0)?.toString() ?: return
         if (before.length == n && before.startsWith(undo.corrected)) {
-            revertedWords.add(SuggestionEngine.fold(undo.original.lowercase()))
+            revertedWords.add(revertedKey(undo.original.lowercase()))
             ic.deleteSurroundingText(n, 0)
             ic.commitText(undo.original + before.last(), 1)
             unlearnCorrection(undo)
@@ -3616,9 +3793,15 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         val composingWord = composing.isNotEmpty()
         val word = if (composingWord) composing.toString() else currentWordBeforeCursor()
         if (word.isEmpty()) return
-        val prev = wordBefore(word)
+        val head = textBeforeWord(word)
+        val prev = head?.let { trailingWord(it.trimEnd()) }
         var learned = word.lowercase()
         var finalWord = word
+        val shape = SuggestionEngine.typedShape(word, head)
+        val glued = shape.glued
+        val asTyped = shape.asTyped
+        // composingWord: only then is the flag known to be about THIS word.
+        val nameLike = shape.nameLike && !(composingWord && wordCapWasAuto)
         // English niceties applied FIRST (so autocorrect can't mangle "dont" -> "done"): a standalone
         // "i"/"i'..." -> "I...", and apostrophe-less contractions (dont -> don't, im -> I'm, youre ->
         // you're, ...). Only when English is the active keyboard, independent of the autocorrect
@@ -3626,7 +3809,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         // frequent tokens — the contraction fix deliberately overrides isKnown for them; a revert
         // (Backspace / ↩ chip) whitelists the raw form for the session via revertedWords.
         var enFixed = false
-        if ("en" in dictLangs() && !revertedWords.contains(SuggestionEngine.fold(learned))) {
+        if (!glued && "en" in dictLangs() && !wasReverted(learned)) {
             val c = enContractions[finalWord.lowercase()]
             if (c != null) { finalWord = matchCase(finalWord, c); enFixed = true }
             else if (finalWord == "i" || finalWord.startsWith("i'")) { finalWord = "I" + finalWord.substring(1); enFixed = true }
@@ -3636,9 +3819,9 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         // so valid short words like "как"/"что" are never touched — only unknown typos (e.g. "кае").
         // We only auto-apply single-edit fixes — without word context, 2-edit guesses miss too often
         // (and stay available as tap suggestions). Words the user reverted this session are left alone.
-        if (!enFixed && autocorrectTypingOn && SuggestionEngine.isReady() && word.length >= 3 &&
+        if (!enFixed && !asTyped && autocorrectTypingOn && SuggestionEngine.isReady() && word.length >= 3 &&
             SuggestionEngine.isLangLoaded(currentLang.value) &&   // never autocorrect against the English fallback vocab
-            !revertedWords.contains(SuggestionEngine.fold(learned))) {
+            !wasReverted(learned)) {
             try {
                 // Spatial-aware: among ranked corrections, apply the top single-edit fix (as before),
                 // or a confident double fat-finger (two adjacent-key substitutions) the old rule missed.
@@ -3646,7 +3829,8 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 // that actually fits the sentence.
                 val prefer = if (prev != null)
                     SuggestionEngine.followerWeights(prev.lowercase(), dictLangs(), UserDictionary.bigrams()).keys else emptySet()
-                val cands = SuggestionEngine.corrections(learned, dictLangs(), UserDictionary.unigrams(), 12, maxEdits = 2, prefer = prefer)
+                val cands = if (nameLike) emptyList()
+                    else SuggestionEngine.corrections(learned, dictLangs(), UserDictionary.unigrams(), 12, maxEdits = 2, prefer = prefer)
                 // How much evidence a candidate brings: none needed for a personal word or one the
                 // sentence expects; otherwise its frequency rank, which gates short words (see
                 // SuggestionEngine.SHORT_WORD_RANK_CAP — "riga" must not become "rita").
@@ -3667,7 +3851,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 // Measured on the real English list with synthetic taps: 92% → 97.5% at a normal
                 // finger, 76% → 95% at a sloppy one, unknown words untouched. Replaces the earlier
                 // re-pick, which only reordered the string path's own twelve candidates.
-                val pts = tapsFor(learned)
+                val pts = if (nameLike) null else tapsFor(learned)
                 if (pts != null && keyBounds.size >= 2) {
                     val kw = avgKeyWidth(); val kh = avgKeyHeight()
                     if (kw > 1f && kh > 1f) {
@@ -3679,7 +3863,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                         val typedRank = if (known) SuggestionEngine.rankIn(learned, wordListNow) else wordListNow.size
                         val typedCost = SuggestionEngine.spatialCostOf(learned, taps, centers, kw, kh)
                         val sp = SuggestionEngine.spatialDecision(learned, typedCost, typedRank, known, picks)
-                        if (sp != null && !revertedWords.contains(SuggestionEngine.fold(sp))) corr = sp
+                        if (sp != null && !wasReverted(sp)) corr = sp
                     }
                 }
                 // Diacritic restoration (Latvian etc.): typing the base letters where a diacritic
@@ -3697,7 +3881,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                 // another word (top bundled follower / well-learned pair), the typed word is not
                 // itself an expected follower, and the fix is a single adjacent-key substitution
                 // or transposition. Backspace-revert applies as usual.
-                if (corr == null && prev != null &&
+                if (corr == null && prev != null && !nameLike &&
                     SuggestionEngine.isKnown(learned, dictLangs(), UserDictionary.unigrams())) {
                     val fw = SuggestionEngine.followerWeights(prev.lowercase(), dictLangs(), UserDictionary.bigrams())
                     if (fw.isNotEmpty() && (fw[learned] ?: 0) == 0 && (fw[SuggestionEngine.fold(learned)] ?: 0) == 0) {
@@ -3715,6 +3899,12 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
                     learned = corr
                 }
             } catch (e: Throwable) { android.util.Log.e("Keyo", "autocorrect failed", e) }
+        }
+        // A name gets its capital — whether it was typed right in lowercase ("рига") or is what a
+        // typo was just corrected to. Revertable like any other fix, and a revert is remembered.
+        if (autocorrectTypingOn && !asTyped && word.length >= 3 && !wasReverted(word.lowercase())) {
+            val proper = SuggestionEngine.properCase(learned, dictLangs())
+            if (proper != null) finalWord = SuggestionEngine.casedLike(word, learned, proper)
         }
         val corrected = finalWord != word
         if (composingWord) {
@@ -3758,6 +3948,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         // by selection there instead of by DPAD key events (see moveCursor).
         lastSelStart = newSelStart
         lastSelEnd = newSelEnd
+        startInfoStale = true   // the field has moved on from the text its EditorInfo carried
         dbgUpdates++; refreshDebugInfo("upd")
         if (composing.isNotEmpty()) {
             // Our own setComposingText(...,1) always leaves the caret collapsed exactly at the end of
@@ -3831,7 +4022,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     // getCursorCapsMode (handles cap-words/cap-characters fields, quotes, locale rules); otherwise
     // fall back to a local sentence heuristic. Also DISARMS a stale auto-shift when the cursor ends
     // up mid-sentence (e.g. after tapping into existing text) — a deliberate Shift is never touched.
-    private fun maybeAutoCapitalize() {
+    private fun maybeAutoCapitalize(starting: android.view.inputmethod.EditorInfo? = null) {
         if (!autoCapOn || secureField) return
         val cls = fieldInputType and android.text.InputType.TYPE_MASK_CLASS
         if (cls != android.text.InputType.TYPE_CLASS_TEXT || fieldNoSuggestions) return
@@ -3846,10 +4037,22 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             android.text.InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS or
             android.text.InputType.TYPE_TEXT_FLAG_CAP_WORDS or
             android.text.InputType.TYPE_TEXT_FLAG_CAP_SENTENCES)
+        // At field start the editor has ALREADY sent the text around its cursor, inside the
+        // EditorInfo (Android 11+) — exactly so a keyboard need not ask. Asking is a blocking call
+        // into the app's main thread, and at this moment that thread is at its busiest: it is
+        // laying itself out for the keyboard that is waiting on this very answer to draw its first
+        // frame. So a field start reads the copy it was handed, and computes the caps mode from it
+        // with the same framework routine the editor's own getCursorCapsMode uses.
+        val initial: CharSequence? =
+            if (starting != null && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R)
+                try { starting.getInitialTextBeforeCursor(64, 0) } catch (_: Exception) { null }
+            else null
         val should = if (capFlags != 0) {
-            ((currentInputConnection?.getCursorCapsMode(fieldInputType) ?: 0) != 0)
+            if (initial != null) android.text.TextUtils.getCapsMode(initial, initial.length, fieldInputType) != 0
+            else ((currentInputConnection?.getCursorCapsMode(fieldInputType) ?: 0) != 0)
         } else {
-            val before = currentInputConnection?.getTextBeforeCursor(3, 0)?.toString() ?: ""
+            val before = initial?.let { it.subSequence(maxOf(0, it.length - 3), it.length).toString() }
+                ?: currentInputConnection?.getTextBeforeCursor(3, 0)?.toString() ?: ""
             val trimmed = before.trimEnd(' ')
             before.isEmpty() || before.last() == '\n' ||
                 (before.last() == ' ' && trimmed.isNotEmpty() && trimmed.last() in ".!?")
@@ -3955,7 +4158,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             keyNeighbors = emptyMap()   // recomputed lazily for the new layout; en<->lv share positions
         }
         recentTaps.clear()          // tap points belong to the previous language
-        revertedWords.clear()       // reverts are per-language decisions (e.g. "cau" EN vs LV)
+        // revertedWords is NOT cleared: its entries are keyed by language (see revertedKey).
     }
 
     /** Best-effort: tell the OS which language we're typing by switching our IME subtype, so the
@@ -3966,6 +4169,12 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
      *  silent no-op on Android 14+, which is why the spell checker stopped following the language
      *  on new devices. */
     private fun syncImeSubtype(lang: String) {
+        // Once per language, not once per field: the checks below are two binder round-trips to the
+        // system server (one of them returns every installed keyboard with all its subtypes), and
+        // this runs on the main thread while the keyboard is being shown. When the OS changes the
+        // subtype on its own it says so — see onCurrentInputMethodSubtypeChanged.
+        if (lang == subtypeSyncedFor) return
+        subtypeSyncedFor = lang
         try {
             val imm = getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as? android.view.inputmethod.InputMethodManager ?: return
             val me = imm.enabledInputMethodList.firstOrNull { it.packageName == packageName } ?: return
@@ -3987,6 +4196,8 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
         } catch (_: Throwable) { /* best-effort: restricted on many OEMs / Android 14+ */ }
     }
 
+    private var subtypeSyncedFor: String? = null
+
     /** Map an IME subtype to our internal language code, or null if it isn't one of ours. */
     private fun subtypeLang(st: android.view.inputmethod.InputMethodSubtype): String? {
         val tag = try { st.languageTag } catch (_: Throwable) { "" }
@@ -4004,6 +4215,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     override fun onCurrentInputMethodSubtypeChanged(newSubtype: android.view.inputmethod.InputMethodSubtype) {
         super.onCurrentInputMethodSubtypeChanged(newSubtype)
         val lang = subtypeLang(newSubtype) ?: return
+        subtypeSyncedFor = lang   // the OS is on this language now, whoever switched it
         if (lang != currentLang.value) {
             switchLanguage(lang)
             // The OS can hand us a language that isn't in enabledLangs — its dictionary was never
@@ -4117,6 +4329,14 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     // ---- Opt-in field diagnostics (see the readout above the toolbar) --------------------
     private val debugFieldInfo = mutableStateOf("")
     private val fieldDiagOn = mutableStateOf(false)
+    // Opening the keyboard, in ms: our own work in onStartInputView, the time until the next frame
+    // after it, and how many times the keyboard changed HEIGHT in the half second after — a resize
+    // while the system is still sliding the keyboard in is what a stutter on open looks like.
+    private var dbgShowWork = 0L
+    private var dbgShowFrame = -1L
+    private var dbgShowResizes = 0
+    private var dbgShowAt = 0L
+    private var dbgRootHeight = 0
     private var dbgStarts = 0     // how many times this field started/restarted
     private var dbgUpdates = 0    // how many selection updates the editor has sent
     private var dbgAnchors = 0    // how many cursor-anchor reports the editor has sent
@@ -4200,7 +4420,8 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             " opt:0x${Integer.toHexString(fieldImeOptions.intValue)}${if (multi) " multi" else ""}"
         debugFieldInfo.value =
             "$tag $pkg caret:$caret $etTxt comp:${composing.length} $enter " +
-            "starts:$dbgStarts upd:$dbgUpdates anch:$dbgAnchors $dbgAnchorInfo"
+            "starts:$dbgStarts upd:$dbgUpdates anch:$dbgAnchors $dbgAnchorInfo " +
+            "open:${dbgShowWork}+${if (dbgShowFrame < 0) "?" else (dbgShowFrame - dbgShowWork).toString()}ms resize:$dbgShowResizes"
     }
 
     /** Move the text cursor one position left/right (space-bar swipe). Operates directly on the
@@ -4363,7 +4584,9 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             val n = gw.length + 1
             val before = ic.getTextBeforeCursor(n, 0)?.toString()
             if (before != null && before.length == n && before.startsWith(gw) && before.last() == ' ') {
-                ic.deleteSurroundingText(n, 0)
+                val lead = if (glideAddedSpace && ic.getTextBeforeCursor(n + 1, 0)?.firstOrNull() == ' ') 1 else 0
+                glideAddedSpace = false
+                ic.deleteSurroundingText(n + lead, 0)
                 updateSuggestions()
                 return
             }
@@ -4378,7 +4601,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
             val n = undo.corrected.length + 1
             val before = ic.getTextBeforeCursor(n, 0)?.toString() ?: ""
             if (before.length == n && before.startsWith(undo.corrected)) {
-                revertedWords.add(SuggestionEngine.fold(undo.original.lowercase()))
+                revertedWords.add(revertedKey(undo.original.lowercase()))
                 ic.deleteSurroundingText(n, 0)
                 ic.commitText(undo.original, 1)
                 unlearnCorrection(undo)

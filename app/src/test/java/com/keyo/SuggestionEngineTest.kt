@@ -238,4 +238,62 @@ class SuggestionEngineTest {
         assertTrue(SuggestionEngine.isKnown("семенов", listOf("ru"), mapOf("семёнов" to 3)))
         assertTrue(SuggestionEngine.isKnown("семёнов", listOf("ru"), mapOf("семёнов" to 3)))
     }
+
+    // ---- a prefix with a slip in it ----
+
+    @Test fun fuzzyComplete_findsTheWordAPrefixAlmostStarts() {
+        val words = listOf("программа", "программировать", "прогресс", "проблема", "привет")
+        // one "м" short — no word starts with it, and it is nowhere near a whole word yet
+        assertEquals(listOf("программировать"),
+            SuggestionEngine.fuzzyCompleteFrom("програмир", words, emptyMap(), 3))
+        // a swapped pair and a wrong letter
+        assertEquals(listOf("привет"), SuggestionEngine.fuzzyCompleteFrom("пирв", words, emptyMap(), 3))
+        assertTrue("проблема" in SuggestionEngine.fuzzyCompleteFrom("прабле", words, emptyMap(), 3))
+    }
+
+    @Test fun fuzzyComplete_leavesExactPrefixesAndShortOnesAlone() {
+        val words = listOf("привет", "приветик", "при")
+        // an exact prefix is completeFrom's job; three letters with one wrong match everything
+        assertTrue(SuggestionEngine.fuzzyCompleteFrom("прив", words, emptyMap(), 3).isEmpty())
+        assertTrue(SuggestionEngine.fuzzyCompleteFrom("пни", words, emptyMap(), 3).isEmpty())
+    }
+
+    @Test fun fuzzyComplete_putsLearnedWordsFirst() {
+        val words = listOf("кристалл", "кристаллы")
+        assertEquals("кристина",
+            SuggestionEngine.fuzzyCompleteFrom("крмсти", words, mapOf("кристина" to 2), 3).first())
+    }
+
+    // ---- what must be left as typed ----
+
+    @Test fun typedShape_fragmentsOfAddressesAndHandles() {
+        assertTrue(SuggestionEngine.typedShape("org", "see sitespro.").glued)
+        assertTrue(SuggestionEngine.typedShape("crcknaka", "ping @").glued)
+        assertTrue(SuggestionEngine.typedShape("pro", "win10").glued)
+        assertTrue(SuggestionEngine.typedShape("case", "snake_").glued)
+        assertFalse(SuggestionEngine.typedShape("word", "a normal ").glued)
+        assertFalse(SuggestionEngine.typedShape("word", "").glued)
+        assertFalse(SuggestionEngine.typedShape("word", null).glued)
+    }
+
+    @Test fun typedShape_acronymsAndBrands() {
+        assertTrue(SuggestionEngine.typedShape("НДС", "без ").asTyped)
+        assertTrue(SuggestionEngine.typedShape("SIA", "").asTyped)
+        assertTrue(SuggestionEngine.typedShape("iPhone", "my ").asTyped)
+        // a sentence shouted in caps lock still gets its long words fixed
+        assertFalse(SuggestionEngine.typedShape("ПРИВТЕ", "").asTyped)
+        assertFalse(SuggestionEngine.typedShape("Привет", "").asTyped)
+    }
+
+    @Test fun typedShape_aCapitalInMidSentenceIsAName() {
+        assertTrue(SuggestionEngine.typedShape("Riga", "going to ").nameLike)
+        assertTrue(SuggestionEngine.typedShape("Vadi", "для ").nameLike)
+        // at the start of a sentence the capital is the keyboard's, not the user's
+        assertFalse(SuggestionEngine.typedShape("Teh", "").nameLike)
+        assertFalse(SuggestionEngine.typedShape("Teh", "Done. ").nameLike)
+        assertFalse(SuggestionEngine.typedShape("Teh", "line\n").nameLike)
+        // long enough that one edit from a dictionary word is real evidence
+        assertFalse(SuggestionEngine.typedShape("Петербугр", "в ").nameLike)
+        assertFalse(SuggestionEngine.typedShape("riga", "going to ").nameLike)
+    }
 }

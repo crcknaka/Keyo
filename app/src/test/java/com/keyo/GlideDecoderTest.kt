@@ -50,6 +50,28 @@ class GlideDecoderTest {
         assertEquals("tie", decodeGlideOver(mid, mapOf("tie" to 5), bounds, words).first())
     }
 
+    @Test fun aKeyVisitedTwice_isMatchedInOrder() {
+        // "data" goes d-a-t-a: the first "a" must take the stroke's first visit to that key, not
+        // its last (the lift-off), or "t" is left with nowhere to go. The greedy matcher sent this
+        // to "sets"; same story for "there" (two e's) against "the".
+        val vocab = listOf("the", "sets", "data", "there", "dad", "three")
+        assertEquals("data", decodeGlideOver(swipe("data"), null, bounds, vocab).first())
+        assertEquals("there", decodeGlideOver(swipe("there"), null, bounds, vocab).first())
+    }
+
+    @Test fun aLongWord_isNotExplainedAwayByAShortOneOnItsPath() {
+        // Every key of "in" lies on the stroke for "information"; most of the stroke does not lie
+        // on "in".
+        val vocab = listOf("in", "on", "information", "inn")
+        assertEquals("information", decodeGlideOver(swipe("information"), null, bounds, vocab).first())
+    }
+
+    @Test fun aFastStroke_ofAHandfulOfSamples_stillDecodes() {
+        // 60Hz and a quick finger: only the corners arrive.
+        val corners = "world".map { bounds.getValue(it).center }
+        assertEquals("world", decodeGlideOver(corners, null, bounds, words).first())
+    }
+
     @Test fun noPath_noGuess() {
         assertTrue(decodeGlideOver(emptyList(), null, bounds, words).isEmpty())
         assertTrue(decodeGlideOver(swipe("the"), null, emptyMap(), words).isEmpty())
