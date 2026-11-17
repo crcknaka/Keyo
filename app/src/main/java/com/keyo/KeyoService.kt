@@ -4620,8 +4620,14 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
 
     // ---- Dictation: cloud first, then the on-device model, and the recording is kept until one works ----
 
-    /** GigaAM only understands Russian, so on other keyboards it must not guess. */
-    private fun localSttUsable() = currentLang.value == "ru" && LocalStt.isInstalled(this)
+    /**
+     * GigaAM only understands Russian, so on other keyboards it does not guess on its own. With «Always on device»
+     * it takes every dictation in every language: the owner wants nothing sent to Groq then.
+     */
+    private fun localSttUsable() = localSttFor(currentLang.value)
+
+    private fun localSttFor(lang: String?) =
+        LocalStt.isInstalled(this) && (lang == "ru" || KeyboardPrefs.isAlwaysLocalStt(this))
 
     private fun recognizeDictation(audio: File, token: String) {
         val local = localSttUsable()
@@ -4722,7 +4728,7 @@ class KeyoService : InputMethodService(), LifecycleOwner, SavedStateRegistryOwne
     private fun recoverNext() {
         val file = SavedDictations.pending(this).firstOrNull { it !in recoveryBusy }
         val lang = file?.let { SavedDictations.languageOf(it) }
-        val useLocal = lang == "ru" && LocalStt.isInstalled(this)
+        val useLocal = localSttFor(lang)
         if (file == null || (!useLocal && (GroqApi.apiKey.isBlank() || !networkAvailable()))) {
             recovering = false
             return

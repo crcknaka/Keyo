@@ -968,7 +968,7 @@ class SettingsActivity : ComponentActivity() {
             }
             if (installed) {
                 Sep()
-                ToggleRow("Always on device", "Never send Russian dictation to Groq", alwaysLocal) {
+                ToggleRow("Always on device", "Never send dictation to Groq, on any keyboard language. GigaAM hears Russian only.", alwaysLocal) {
                     alwaysLocal = it; KeyboardPrefs.setAlwaysLocalStt(this@SettingsActivity, it)
                 }
             }
